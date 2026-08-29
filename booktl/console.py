@@ -40,6 +40,9 @@ def banner(title: str, subtitle: str = "") -> None:
         text += f"\n[dim]{subtitle}[/dim]"
     with _lock:
         console.print(Panel(text, border_style="blue"))
+def dim(message: str) -> None:
+    with _lock:
+        console.print(f"[dim]{message}[/dim]")
 
 
 def panel(message: str, title: str = "", style: str = "green") -> None:

@@ -29,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("-k", "--api-key", help="Bearer authorization token")
         p.add_argument("-s", "--batch-size", type=int, help="Number of pages per translation batch (default: 10)")
         p.add_argument("-c", "--concurrency", type=int, help="Number of worker threads (default: 1)")
+        p.add_argument("-g", "--goal", help="Stop goal chapter number or relative offset (e.g. 3000 or +50)")
         p.add_argument("--json-mode", choices=["auto", "on", "off"], help="JSON mode parameter behavior")
         p.add_argument("--temperature", type=float, help="Sampling temperature (default: 0.3)")
         p.add_argument("--max-tokens", type=int, help="Max completion tokens")
@@ -158,9 +159,12 @@ def main():
             return
     else:
         con.ok(f"Using model: [bold green]{cfg.model}[/bold green]")
-
     # 3. Pipeline & Workers Initialization
     pipeline = Pipeline(cfg, client)
+    goal_arg = getattr(args, "goal", None)
+    if goal_arg:
+        msg = pipeline.tracker.set_goal(goal_arg)
+        con.ok(msg)
     pipeline.start()
 
     if sub == "retry":
@@ -190,10 +194,15 @@ def main():
         run_repl(ctx)
     finally:
         con.rule("Shutting Down")
-        pipeline.shutdown()
+        pipeline.shutdown(drain=True)
         stats = pipeline.stats()
         cnt = stats["counters"]
+        tr = stats.get("tracker", {})
+        curr_ch = tr.get("current_chapter")
+        goal_ch = tr.get("goal_chapter")
         con.panel(
+            f"Final Chapter: [bold green]{curr_ch if curr_ch is not None else 'N/A'}[/bold green]\n"
+            f"Goal Chapter: {goal_ch if goal_ch is not None else '(None)'}\n"
             f"Total Chapters Saved: [bold green]{cnt['chapters_saved']}[/bold green]\n"
             f"Pages Processed: {cnt['pages_seen']}\n"
             f"Failed Batches: {cnt['failures']}\n"

@@ -1,14 +1,22 @@
 """Interactive REPL command handlers."""
-
+import time
 from rich.table import Table
 from . import console as con
 from .config import Config, ConfigError
 from .library import select_book
 from .pipeline import Pipeline, HAS_CLIPBOARD
+from .progressbar import render_bars
 from .client import ApiClient
 
 if HAS_CLIPBOARD:
     import pyperclip
+
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.patch_stdout import patch_stdout
+    HAS_PROMPT_TOOLKIT = True
+except ImportError:
+    HAS_PROMPT_TOOLKIT = False
 
 
 class ReplContext:
@@ -33,6 +41,8 @@ def print_help() -> None:
     table.add_row("/maxtokens <n|none>", "Set or clear maximum response tokens.")
     table.add_row("/jsonmode <auto|on|off>", "Configure JSON formatting parameter handling.")
     table.add_row("/book", "Switch target book directory.")
+    table.add_row("/goal <n|+n|none>", "Set or clear stop target chapter (e.g. /goal 3000 or /goal +50).")
+    table.add_row("/progress", "Display current scraping and translation progress bars.")
     table.add_row("/buffer", "View buffered page count and character sizes.")
     table.add_row("/flush", "Immediately dispatch all currently buffered pages.")
     table.add_row("/auto <on|off>", "Toggle auto-dispatching (turn off to accumulate for /manual).")
@@ -45,17 +55,33 @@ def print_help() -> None:
     table.add_row("/quit", "Gracefully shut down workers and exit.")
 
     con.console.print(table)
-
-
 def print_status(ctx: ReplContext) -> None:
     s = ctx.pipeline.stats()
     c = s["counters"]
+    tr = s.get("tracker", {})
 
     table = Table(title="Pipeline Status", border_style="cyan")
     table.add_column("Setting / Metric", style="bold white")
     table.add_column("Value", style="green")
 
     table.add_row("Target Book", s["book"] or "(None)")
+    curr_ch = tr.get("current_chapter")
+    is_inf = tr.get("is_inferred", False)
+    curr_str = f"Chapter {'~' if is_inf else ''}{curr_ch}" if curr_ch else "(None yet)"
+    table.add_row("Current Chapter", curr_str)
+
+    goal_ch = tr.get("goal_chapter")
+    pending = tr.get("pending_goal_offset")
+    if goal_ch:
+        rem = (goal_ch - curr_ch) if curr_ch is not None else 0
+        rem_str = f" ({max(0, rem)} remaining)" if rem >= 0 else " (Goal passed)"
+        goal_str = f"[bold green]Chapter {goal_ch}[/bold green]{rem_str}"
+    elif pending:
+        goal_str = f"[bold yellow]+{pending} chapters (pending first page)[/bold yellow]"
+    else:
+        goal_str = "(None set)"
+    table.add_row("Stop Goal", goal_str)
+
     table.add_row("Endpoint", s["endpoint"])
     table.add_row("Model", s["model"] or "(None)")
     table.add_row("Batch Size", str(s["batch_size"]))
@@ -73,6 +99,7 @@ def print_status(ctx: ReplContext) -> None:
     table.add_row("Total Tokens Reported", f"{c['tokens']:,}")
 
     con.console.print(table)
+    con.console.print("\n" + render_bars(tr) + "\n")
 
 
 def handle_command(ctx: ReplContext, line: str) -> bool:
@@ -93,9 +120,29 @@ def handle_command(ctx: ReplContext, line: str) -> bool:
     if cmd == "/clear":
         con.console.clear()
         return True
-
     if cmd == "/status":
         print_status(ctx)
+        return True
+
+    if cmd == "/goal":
+        if not args:
+            tr = ctx.pipeline.tracker.snapshot()
+            goal = tr.get("goal_chapter")
+            pending = tr.get("pending_goal_offset")
+            if goal:
+                con.info(f"Current stop goal: [bold green]Chapter {goal}[/bold green]")
+            elif pending:
+                con.info(f"Pending relative stop goal: [bold yellow]+{pending} chapters[/bold yellow]")
+            else:
+                con.info("No stop goal currently set. Usage: /goal <chapter_number> or /goal +<offset>")
+            return True
+        msg = ctx.pipeline.tracker.set_goal(args[0])
+        con.ok(msg)
+        return True
+
+    if cmd == "/progress":
+        tr = ctx.pipeline.tracker.snapshot()
+        con.console.print("\n" + render_bars(tr) + "\n")
         return True
 
     if cmd == "/model":
@@ -188,12 +235,12 @@ def handle_command(ctx: ReplContext, line: str) -> bool:
         except ConfigError as e:
             con.fail(str(e))
         return True
-
     if cmd == "/book":
         res = select_book(ctx.cfg.library_dir)
         if res:
             bpath, bname = res
             ctx.cfg.set_book(bpath, bname)
+            ctx.pipeline.tracker.reset()
             con.ok(f"Switched target novel to [bold green]{bname}[/bold green]")
         return True
 
@@ -264,24 +311,50 @@ def handle_command(ctx: ReplContext, line: str) -> bool:
 
     con.warn(f"Unknown command '{cmd}'. Type /help for available commands.")
     return True
-
-
 def run_repl(ctx: ReplContext) -> None:
     con.rule("Translation Console Active")
     con.info("Type [bold cyan]/help[/bold cyan] for commands, [bold cyan]/quit[/bold cyan] to exit.\n")
 
-    while True:
-        try:
-            line = con.console.input("[bold cyan]booktl> [/bold cyan]").strip()
-        except (KeyboardInterrupt, EOFError):
-            break
+    if HAS_PROMPT_TOOLKIT:
+        session = PromptSession()
 
-        if not line:
-            continue
+        def get_prompt_message():
+            tr = ctx.pipeline.tracker.snapshot()
+            bars = render_bars(tr)
+            return [
+                ("class:bars", f"\n{bars}\n"),
+                ("class:prompt", "booktl> ")
+            ]
 
-        if not line.startswith("/"):
-            con.warn("Commands must start with '/'. Type /help for a list of commands.")
-            continue
+        while True:
+            try:
+                with patch_stdout(raw=True):
+                    line = session.prompt(get_prompt_message, refresh_interval=0.5).strip()
+            except (KeyboardInterrupt, EOFError):
+                break
 
-        if not handle_command(ctx, line):
-            break
+            if not line:
+                continue
+
+            if not line.startswith("/"):
+                con.warn("Commands must start with '/'. Type /help for a list of commands.")
+                continue
+
+            if not handle_command(ctx, line):
+                break
+    else:
+        while True:
+            try:
+                line = con.console.input("[bold cyan]booktl> [/bold cyan]").strip()
+            except (KeyboardInterrupt, EOFError):
+                break
+
+            if not line:
+                continue
+
+            if not line.startswith("/"):
+                con.warn("Commands must start with '/'. Type /help for a list of commands.")
+                continue
+
+            if not handle_command(ctx, line):
+                break

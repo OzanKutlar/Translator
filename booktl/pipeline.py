@@ -8,6 +8,7 @@ import time
 
 from . import console as con
 from . import prompts, parsing, storage, characters
+from .tracker import ChapterTracker
 from .client import ApiClient, ApiError
 
 try:
@@ -29,7 +30,7 @@ class Pipeline:
         self._worker_target = cfg.concurrency
         self._batch_seq = 0
         self._active = {}  # batch_id -> {'pages': list, 'cancel': bool}
-
+        self.tracker = ChapterTracker()
         self.auto_dispatch = True
         self.manual_active = False
         self.manual_pages = None
@@ -65,41 +66,78 @@ class Pipeline:
             if new_val > alive_count:
                 for i in range(alive_count, new_val):
                     self._spawn_worker(i + 1)
-
-    def offer_page(self, content: str, is_active: bool) -> dict:
+    def offer_page(self, content: str, is_active: bool, title: str | None = None) -> dict:
         """Ingest page from Tampermonkey and return scraper directive."""
         with self.lock:
             self.counters["pages_seen"] += 1
+            ch_num, conf = self.tracker.observe_page(title, content)
             self.buffer.append(content)
             count = len(self.buffer)
             needed = self.cfg.batch_size
-            con.info(f"Buffered page [bold]{count}/{needed}[/bold] ({len(content)} chars)")
+
+            ch_label = f"ch {'~' if conf == 'inferred' else ''}{ch_num}" if ch_num else "ch ??"
+            con.info(f"Buffered page [bold]{count}/{needed}[/bold] ({len(content)} chars) [{ch_label}]")
+
+            # Check if scraper reached stop goal
+            if self.tracker.goal_reached():
+                directive = self._goal_directive_locked()
+                return directive
 
             if count < needed:
                 directive = None
             else:
                 directive = self._try_dispatch_locked()
 
-        if directive is not None and directive.get("action") == "wait":
+        if directive is not None and directive.get("action") in ("wait", "stop"):
             return directive
 
         # Pacing delay to avoid hammering the source novel website
         delay = 1.0 if is_active else random.uniform(1.0, 3.5)
         time.sleep(delay)
-        return directive if directive else {"action": "next", "buffered": count, "needed": needed}
-
+        return directive if directive else {"action": "next", "buffered": count, "needed": needed, "chapter": ch_num}
     def poll_status(self, is_active: bool) -> dict:
         """Handle polling requests from scraper during wait states."""
         with self.lock:
+            if self.tracker.goal_reached():
+                return self._goal_directive_locked()
             if len(self.buffer) < self.cfg.batch_size:
-                return {"action": "next", "buffered": len(self.buffer)}
+                return {"action": "next", "buffered": len(self.buffer), "chapter": self.tracker.current_chapter}
             return self._try_dispatch_locked()
+
+    def _goal_directive_locked(self) -> dict:
+        """Flush any buffered pages and halt scraper upon reaching goal."""
+        if not self.tracker.goal_reached_flag:
+            self.tracker.goal_reached_flag = True
+            goal = self.tracker.goal_chapter
+            curr = self.tracker.current_chapter
+            con.panel(
+                f"Goal of Chapter [bold green]{goal}[/bold green] reached (current: {curr})!\n"
+                f"Flushing remaining buffered pages to active worker queue...",
+                title="Goal Reached",
+                style="green"
+            )
+            if self.buffer and self.auto_dispatch:
+                pages = list(self.buffer)
+                self.buffer = []
+                bid = self._enqueue_locked(pages)
+                con.ok(f"Dispatched final batch [bold cyan]#{bid}[/bold cyan] ({len(pages)} pages)")
+
+        return {
+            "action": "stop",
+            "reason": f"Goal chapter {self.tracker.goal_chapter} reached",
+            "chapter": self.tracker.current_chapter,
+            "goal": self.tracker.goal_chapter
+        }
 
     def _try_dispatch_locked(self) -> dict:
         if not self.cfg.book_dir:
             return {"action": "wait", "retryAfter": 5, "reason": "No book directory selected"}
         if not self.auto_dispatch:
             return {"action": "wait", "retryAfter": 5, "reason": "Auto-dispatch paused for manual mode"}
+
+        # Backstop: stop queueing new work if translated chapters hit or exceed goal
+        if self.tracker.translated_goal_reached():
+            return {"action": "stop", "reason": f"Translation goal of Chapter {self.tracker.goal_chapter} reached"}
 
         depth = self.work_q.qsize()
         if depth >= max(2, self.cfg.concurrency * 2):
@@ -292,11 +330,13 @@ class Pipeline:
                 con.fail(f"Batch #{batch_id} JSON error: {err}")
                 con.info(f"Quarantined failed payload to [cyan]{os.path.basename(qpath)}[/cyan] (use /retry later)")
                 return
-
             saved, skipped, filenames = storage.save_chapters(chapters, book_dir)
             with self.lock:
                 self.counters["chapters_saved"] += saved
                 self.counters["skipped"] += skipped
+                for entry in (chapters if isinstance(chapters, list) else []):
+                    if isinstance(entry, dict) and entry.get("chapterNo"):
+                        self.tracker.observe_translated(entry["chapterNo"])
 
             con.ok(f"Batch #{batch_id} complete: saved [bold green]{saved}[/bold green] chapter(s) to '{cfg.book_name}'")
             for fn in filenames:
@@ -311,7 +351,6 @@ class Pipeline:
             with self.lock:
                 self._active.pop(batch_id, None)
                 self.counters["batches_done"] += 1
-
     def stats(self) -> dict:
         with self.lock:
             return {
@@ -328,9 +367,24 @@ class Pipeline:
                 "json_mode": self.cfg.json_mode,
                 "temperature": self.cfg.temperature,
                 "counters": dict(self.counters),
+                "tracker": self.tracker.snapshot(),
             }
 
-    def shutdown(self) -> None:
+    def shutdown(self, drain: bool = True, timeout: int = 300) -> None:
+        """Gracefully drain in-flight batches and shut down workers."""
+        if drain:
+            with self.lock:
+                q_depth = self.work_q.qsize()
+                in_flight = len(self._active)
+            if q_depth > 0 or in_flight > 0:
+                con.info(f"Draining {q_depth} queued and {in_flight} active batch(es)... (Press Ctrl+C to force exit)")
+                start = time.time()
+                try:
+                    while (self.work_q.qsize() > 0 or len(self._active) > 0) and (time.time() - start < timeout):
+                        time.sleep(0.5)
+                except KeyboardInterrupt:
+                    con.warn("Drain interrupted by user. Forcing immediate shutdown...")
+
         self.stop_event.set()
         with self.lock:
             if self.buffer and self.cfg.book_dir:

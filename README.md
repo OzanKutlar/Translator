@@ -28,11 +28,12 @@ python translate.py
 - `python translate.py check` — Tests endpoint connectivity and runs a lightweight ping completion.
 - `python translate.py retry -b <BookName>` — Re-queues failed translation batches from `_failed/`.
 - `python translate.py prompt -b <BookName>` — Inspects the generated translation prompt.
-
 ## Interactive REPL Commands
 
 While running, type `/help` in the console to view all available commands:
-- `/status` — View current pipeline status, queue depth, and metrics.
+- `/goal <n|+n|none>` — Set stop goal (e.g. `/goal 3000` or `/goal +50` to translate next 50 chapters).
+- `/progress` — Render current scraping and translation progress bars.
+- `/status` — View current pipeline status, queue depth, chapter positions, and metrics.
 - `/model [id]` — Switch model on the fly or reopen the interactive model picker.
 - `/endpoint <url>` — Change the target API base URL.
 - `/batch <n>` — Adjust batch page size (default: 10).

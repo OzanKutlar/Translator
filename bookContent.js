@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         69shuba Content Auto-Sender
 // @namespace    http://tampermonkey.net/
-// @version      2.2
+// @version      2.3
 // @description  Scrapes novel chapter text from 69shuba and sends it to the translation server
 // @author       Gemini
 // @match        *://www.69shuba.com/txt/*
@@ -14,6 +14,8 @@
 
     const SERVER_URL = "http://127.0.0.1:5001";
     let isPaused = false;
+    let idlePollCount = 0;
+    const MAX_IDLE_POLLS = 40;
 
     // ==========================================
     // 🖥️ STATUS PANEL UI
@@ -73,7 +75,7 @@
         .gbp-btn:hover { background: rgba(255,255,255,0.12); color: #ccc; }
         #gbp-stats {
             display: grid;
-            grid-template-columns: 1fr 1fr;
+            grid-template-columns: 1fr 1fr 1fr;
             gap: 6px;
             padding: 8px 10px;
             border-bottom: 0.5px solid rgba(255,255,255,0.06);
@@ -88,6 +90,8 @@
         .gbp-stat.server .gbp-stat-label { color: #1de9b6; }
         .gbp-stat.autoplay { background: rgba(255,183,0,0.08); border: 0.5px solid rgba(255,183,0,0.2); }
         .gbp-stat.autoplay .gbp-stat-label { color: #ffb700; }
+        .gbp-stat.chapter { background: rgba(144,202,249,0.08); border: 0.5px solid rgba(144,202,249,0.2); }
+        .gbp-stat.chapter .gbp-stat-label { color: #90caf9; }
         #gbp-log {
             flex: 1;
             overflow-y: auto;
@@ -170,6 +174,10 @@
             <div class="gbp-stat autoplay">
                 <div class="gbp-stat-label">AUTOPLAY</div>
                 <div class="gbp-stat-value" id="gbp-autoplay-status">Active</div>
+            </div>
+            <div class="gbp-stat chapter">
+                <div class="gbp-stat-label">CHAPTER</div>
+                <div class="gbp-stat-value" id="gbp-chapter-status">--</div>
             </div>
         </div>
         <div id="gbp-log"></div>
@@ -260,6 +268,11 @@
     function setAutoplayStatus(text) {
         document.getElementById('gbp-autoplay-status').textContent = text;
     }
+
+    function setChapterStatus(text) {
+        const el = document.getElementById('gbp-chapter-status');
+        if (el) el.textContent = text;
+    }
     // ==========================================
     // ⌨️ CONTROLS
     // ==========================================
@@ -320,6 +333,7 @@
             headers: { "Content-Type": "application/json" },
             data: JSON.stringify({
                 content: novelText,
+                title: document.title,
                 isActive: isActive
             }),
             onload: function (response) {
@@ -346,7 +360,23 @@
     }
 
     function handleServerResponse(data) {
-        if (data.action === "next") {
+        if (data.chapter) {
+            setChapterStatus(data.goal ? `${data.chapter}/${data.goal}` : `ch ${data.chapter}`);
+        }
+
+        if (data.action === "stop") {
+            log(`🛑 Goal Reached: ${data.reason || 'Halting scraper'}`, "command");
+            setAutoplayStatus("Goal Hit");
+            setDot("warn");
+            idlePollCount++;
+            if (idlePollCount < MAX_IDLE_POLLS) {
+                log(`Will poll again in 15s in case goal is extended... (${idlePollCount}/${MAX_IDLE_POLLS})`, "info");
+                setTimeout(pollStatus, 15000);
+            } else {
+                log("Autoplay finished. Set higher /goal in console to resume or refresh page.", "info");
+            }
+        } else if (data.action === "next") {
+            idlePollCount = 0;
             log("Server says go to next page.", "success");
             if (isPaused) {
                 log("⏸️ Paused via hotkey. Will not go to next page automatically.", "warn");
@@ -355,6 +385,7 @@
                 goToNextPage();
             }
         } else if (data.action === "wait") {
+            idlePollCount = 0;
             const retrySeconds = data.retryAfter || 5;
             log(`Server says wait. Polling in ${retrySeconds}s...`, "active");
             setTimeout(pollStatus, retrySeconds * 1000);
