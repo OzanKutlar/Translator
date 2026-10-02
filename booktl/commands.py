@@ -7,6 +7,7 @@ from .library import select_book
 from .pipeline import Pipeline, HAS_CLIPBOARD
 from .progressbar import render_bars
 from .client import ApiClient
+from . import storage
 
 if HAS_CLIPBOARD:
     import pyperclip
@@ -48,13 +49,45 @@ def print_help() -> None:
     table.add_row("/auto <on|off>", "Toggle auto-dispatching (turn off to accumulate for /manual).")
     table.add_row("/manual", "Copy buffered pages to clipboard for external translation.")
     table.add_row("/paste", "Ingest translation JSON response from clipboard.")
-    table.add_row("/cancel", "Abort manual mode or active batch and recover pages to buffer.")
+    table.add_row("/cancel", "Abort manual mode, queued and in-flight batches; pages return to buffer immediately.")
     table.add_row("/retry", "Re-process quarantined failure batches from _failed/.")
+    table.add_row("/recover [batch_id]", "List spooled batches in _raw/, or load one back into the buffer.")
     table.add_row("/raw <on|off>", "Toggle saving raw model responses to _raw/.")
     table.add_row("/clear", "Clear terminal screen.")
     table.add_row("/quit", "Gracefully shut down workers and exit.")
 
     con.console.print(table)
+
+
+def print_spooled(ctx: ReplContext, limit: int = 15) -> None:
+    """Show the most recent spooled batches in _raw/."""
+    book_dir = ctx.cfg.book_dir
+    if not book_dir:
+        con.warn("No book directory selected.")
+        return
+    try:
+        records = storage.list_spooled(book_dir)
+    except OSError as e:
+        con.fail(f"Could not read _raw/: {e}")
+        return
+    if not records:
+        con.info("No spooled batches found in _raw/.")
+        return
+
+    shown = records[-limit:]
+    table = Table(title=f"Spooled Batches (latest {len(shown)} of {len(records)})", border_style="magenta")
+    table.add_column("Batch", style="cyan", justify="right")
+    table.add_column("Pages", justify="right")
+    table.add_column("Spooled At", style="dim")
+    for rec in shown:
+        ts = rec.get("timestamp")
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if isinstance(ts, (int, float)) else "?"
+        pages = str(rec["pages"]) if rec.get("pages") is not None else "[red]unreadable[/red]"
+        table.add_row(f"#{rec['batch_id']}", pages, when)
+    con.console.print(table)
+    con.info("Load one into the buffer with [bold cyan]/recover <batch_id>[/bold cyan].")
+
+
 def print_status(ctx: ReplContext) -> None:
     s = ctx.pipeline.stats()
     c = s["counters"]
@@ -241,6 +274,7 @@ def handle_command(ctx: ReplContext, line: str) -> bool:
             bpath, bname = res
             ctx.cfg.set_book(bpath, bname)
             ctx.pipeline.tracker.reset()
+            ctx.pipeline.sync_batch_seq()
             con.ok(f"Switched target novel to [bold green]{bname}[/bold green]")
         return True
 
@@ -299,6 +333,22 @@ def handle_command(ctx: ReplContext, line: str) -> bool:
     if cmd == "/retry":
         msg = ctx.pipeline.retry_failed()
         con.ok(msg)
+        return True
+
+    if cmd == "/recover":
+        if not args:
+            print_spooled(ctx)
+            return True
+        try:
+            batch_id = int(args[0].lstrip("#"))
+        except ValueError:
+            con.warn("Usage: /recover <batch_id>  (run /recover with no id to list spooled batches)")
+            return True
+        ok, msg = ctx.pipeline.recover_spooled(batch_id)
+        if ok:
+            con.ok(msg)
+        else:
+            con.warn(msg)
         return True
 
     if cmd == "/raw":

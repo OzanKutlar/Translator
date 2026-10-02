@@ -17,6 +17,8 @@ try:
 except ImportError:
     HAS_CLIPBOARD = False
 
+PAGE_SEPARATOR = "\n\n--- PAGE BREAK ---\n\n"
+
 
 class Pipeline:
     def __init__(self, cfg, client: ApiClient):
@@ -30,6 +32,7 @@ class Pipeline:
         self._worker_target = cfg.concurrency
         self._batch_seq = 0
         self._active = {}  # batch_id -> {'pages': list, 'cancel': bool}
+        self._cancel_gen = 0  # bumped by /cancel; queue items tagged with an older value are recovered
         self.tracker = ChapterTracker()
         self.auto_dispatch = True
         self.manual_active = False
@@ -48,10 +51,25 @@ class Pipeline:
 
     def start(self) -> None:
         """Spawn worker daemon threads matching target concurrency."""
+        self.sync_batch_seq()
         with self.lock:
             self.stop_event.clear()
             for i in range(self.cfg.concurrency):
                 self._spawn_worker(i + 1)
+
+    def sync_batch_seq(self) -> None:
+        """Advance batch numbering past existing spool files so _raw/ entries are never overwritten."""
+        book_dir = self.cfg.book_dir
+        if not book_dir:
+            return
+        try:
+            highest = storage.max_spooled_batch_id(book_dir)
+        except OSError as e:
+            con.warn(f"Could not scan spooled batches in _raw/: {e}")
+            return
+        with self.lock:
+            if highest > self._batch_seq:
+                self._batch_seq = highest
 
     def _spawn_worker(self, worker_id: int) -> None:
         t = threading.Thread(target=self._worker_loop, args=(worker_id,), daemon=True)
@@ -66,6 +84,7 @@ class Pipeline:
             if new_val > alive_count:
                 for i in range(alive_count, new_val):
                     self._spawn_worker(i + 1)
+
     def offer_page(self, content: str, is_active: bool, title: str | None = None) -> dict:
         """Ingest page from Tampermonkey and return scraper directive."""
         with self.lock:
@@ -95,6 +114,7 @@ class Pipeline:
         delay = 1.0 if is_active else random.uniform(1.0, 3.5)
         time.sleep(delay)
         return directive if directive else {"action": "next", "buffered": count, "needed": needed, "chapter": ch_num}
+
     def poll_status(self, is_active: bool) -> dict:
         """Handle polling requests from scraper during wait states."""
         with self.lock:
@@ -154,7 +174,7 @@ class Pipeline:
         self._batch_seq += 1
         bid = self._batch_seq
         self.counters["batches_sent"] += 1
-        self.work_q.put((bid, pages))
+        self.work_q.put((bid, pages, self._cancel_gen))
         return bid
 
     def flush(self) -> str:
@@ -178,7 +198,7 @@ class Pipeline:
             self.buffer = []
             self.manual_pages = pages
             self.manual_active = True
-            pages_text = "\n\n--- PAGE BREAK ---\n\n".join(pages)
+            pages_text = PAGE_SEPARATOR.join(pages)
             prompt = prompts.build_manual_prompt(self.cfg.book_dir, pages_text)
 
         if HAS_CLIPBOARD:
@@ -222,30 +242,117 @@ class Pipeline:
             res += f" ({skipped} skipped)"
         return res
 
+    # ------------------------------------------------------------------
+    # Cancellation & recovery
+    # ------------------------------------------------------------------
+
     def cancel(self) -> list[str]:
-        """Cancel manual mode or in-flight translation and recover pages to buffer."""
-        messages = []
+        """Cancel manual mode, queued and in-flight batches; pages return to the buffer immediately."""
         with self.lock:
-            if self.manual_active:
-                pages = self.manual_pages or []
-                self.buffer = pages + self.buffer
-                self.manual_active = False
-                self.manual_pages = None
-                messages.append(f"Manual translation aborted. {len(pages)} page(s) returned to buffer.")
+            self._cancel_gen += 1
+            active = self._cancel_active_locked()
+            queued = self._drain_queue_locked()
+            manual_pages = self._cancel_manual_locked()
+            restored = [p for _, pages in active + queued for p in pages]
+            if manual_pages:
+                restored.extend(manual_pages)
+            self.buffer = restored + self.buffer
+            auto_on = self.auto_dispatch
+        return self._describe_cancel(active, queued, manual_pages, auto_on)
 
-            cancelled_batches = 0
-            for bid, info in self._active.items():
-                if not info.get("cancel"):
-                    info["cancel"] = True
-                    cancelled_batches += 1
+    def _cancel_active_locked(self) -> list[tuple[int, list[str]]]:
+        """Flag in-flight batches as cancelled and return their pages. Late replies get discarded."""
+        recovered = []
+        for bid in sorted(self._active):
+            info = self._active[bid]
+            if info.get("cancel"):
+                continue
+            info["cancel"] = True
+            recovered.append((bid, list(info.get("pages", []))))
+        return recovered
 
-            if cancelled_batches > 0:
-                messages.append(f"Flagged {cancelled_batches} in-flight batch(es) for cancellation. Pages will revert to buffer.")
+    def _drain_queue_locked(self) -> list[tuple[int, list[str]]]:
+        """Pull batches that are queued but not yet started back out of the work queue."""
+        drained = []
+        for _ in range(self.work_q.qsize()):
+            try:
+                bid, pages, _gen = self.work_q.get_nowait()
+            except queue.Empty:
+                break
+            self.work_q.task_done()
+            drained.append((bid, list(pages)))
+        return drained
 
-            if not messages:
-                messages.append("No active manual session or in-flight batches to cancel.")
+    def _cancel_manual_locked(self) -> list[str] | None:
+        """End an active manual session and return its pages (None if no session)."""
+        if not self.manual_active:
+            return None
+        pages = list(self.manual_pages or [])
+        self.manual_active = False
+        self.manual_pages = None
+        return pages
 
+    @staticmethod
+    def _describe_cancel(active: list, queued: list, manual_pages: list | None, auto_on: bool) -> list[str]:
+        messages = []
+        if manual_pages is not None:
+            messages.append(f"Manual translation aborted. {len(manual_pages)} page(s) returned to buffer.")
+        if active:
+            ids = ", ".join(f"#{bid}" for bid, _ in active)
+            count = sum(len(p) for _, p in active)
+            messages.append(
+                f"Cancelled in-flight batch(es) {ids}: {count} page(s) returned to buffer. "
+                f"Any late reply will be discarded."
+            )
+        if queued:
+            ids = ", ".join(f"#{bid}" for bid, _ in queued)
+            count = sum(len(p) for _, p in queued)
+            messages.append(f"Pulled queued batch(es) {ids} back: {count} page(s) returned to buffer.")
+        if not messages:
+            return ["No active manual session, queued, or in-flight batches to cancel."]
+        if (active or queued) and auto_on:
+            messages.append("Auto-dispatch is ON, so these pages may be re-sent with the next batch. Use /auto off to keep them for /manual.")
         return messages
+
+    def recover_spooled(self, batch_id: int) -> tuple[bool, str]:
+        """Load a spooled batch from _raw/ back into the buffer (skipping pages already buffered)."""
+        book_dir = self.cfg.book_dir
+        if not book_dir:
+            return False, "No book directory selected."
+        if batch_id <= 0:
+            return False, "Batch id must be a positive integer."
+        with self.lock:
+            info = self._active.get(batch_id)
+            if info is not None and not info.get("cancel"):
+                return False, f"Batch #{batch_id} is still in flight. Use /cancel to recover it instead."
+
+        pages, err = storage.load_spooled(book_dir, batch_id)
+        if err:
+            return False, err
+
+        with self.lock:
+            new_pages = [p for p in pages if p not in self.buffer]
+            self.buffer = new_pages + self.buffer
+            total = len(self.buffer)
+            auto_on = self.auto_dispatch
+        if not new_pages:
+            return False, f"All {len(pages)} page(s) from batch #{batch_id} are already in the buffer."
+
+        msg = f"Recovered {len(new_pages)} page(s) from batch #{batch_id} ({total} now buffered). Use /manual or /flush."
+        msg += self._drop_matching_quarantine(batch_id, pages)
+        if auto_on:
+            msg += " Auto-dispatch is ON; use /auto off to keep them for /manual."
+        return True, msg
+
+    def _drop_matching_quarantine(self, batch_id: int, pages: list[str]) -> str:
+        """Remove identical _failed/ records so /retry cannot resend recovered pages."""
+        try:
+            removed = storage.remove_failed_matching(self.cfg.book_dir, batch_id, pages)
+        except OSError as e:
+            return f" (Could not check _failed/: {e})"
+        if removed:
+            return f" Removed {removed} matching _failed/ record(s) so /retry won't resend them."
+        return ""
 
     def retry_failed(self) -> str:
         """Load and re-queue all batches quarantined in _failed/."""
@@ -266,6 +373,10 @@ class Pipeline:
                     requeued += 1
         return f"Re-queued {requeued} failed batch(es) for processing."
 
+    # ------------------------------------------------------------------
+    # Workers
+    # ------------------------------------------------------------------
+
     def _worker_loop(self, worker_id: int) -> None:
         while not self.stop_event.is_set():
             try:
@@ -277,80 +388,132 @@ class Pipeline:
                         return
                 continue
 
-            batch_id, pages = item
+            batch_id, pages, gen = item
             try:
-                self._process_batch(batch_id, pages)
+                self._process_batch(batch_id, pages, gen)
             except Exception as e:
                 con.fail(f"Unexpected worker error on batch #{batch_id}: {e}")
             finally:
                 self.work_q.task_done()
 
-    def _process_batch(self, batch_id: int, pages: list[str]) -> None:
-        cfg = self.cfg
-        book_dir = cfg.book_dir
-
-        with self.lock:
-            self._active[batch_id] = {"pages": list(pages), "cancel": False}
-
+    def _process_batch(self, batch_id: int, pages: list[str], gen: int) -> None:
+        if not self._register_batch(batch_id, pages, gen):
+            return
         try:
-            storage.spool_pages(book_dir, batch_id, pages)
-            pages_text = "\n\n--- PAGE BREAK ---\n\n".join(pages)
-            messages = prompts.build_messages(book_dir, pages_text)
-
-            if cfg.dry_run:
-                con.rule(f"Dry Run: Batch #{batch_id}")
-                con.console.print(f"[dim]Constructed {len(messages)} messages for {cfg.model or '(no model)'}[/dim]")
-                return
-
-            con.info(f"Dispatching batch [bold cyan]#{batch_id}[/bold cyan] ({len(pages)} pages) to [bold green]{cfg.model}[/bold green]...")
-            raw_reply, usage = self.client.chat(cfg, messages)
-
-            if usage and isinstance(usage, dict):
-                toks = usage.get("total_tokens", 0)
-                with self.lock:
-                    self.counters["tokens"] += toks
-
-            if cfg.save_raw:
-                storage.save_raw_reply(book_dir, batch_id, raw_reply)
-
-            with self.lock:
-                was_cancelled = self._active.get(batch_id, {}).get("cancel", False)
-
-            if was_cancelled:
-                with self.lock:
-                    self.buffer = pages + self.buffer
-                con.warn(f"Batch #{batch_id} cancelled by user — {len(pages)} pages recovered to buffer.")
-                return
-
-            chapters, char_actions, err = parsing.parse_response(raw_reply)
-            if err:
-                with self.lock:
-                    self.counters["failures"] += 1
-                qpath = storage.quarantine_failure(book_dir, batch_id, pages, raw_reply, err)
-                con.fail(f"Batch #{batch_id} JSON error: {err}")
-                con.info(f"Quarantined failed payload to [cyan]{os.path.basename(qpath)}[/cyan] (use /retry later)")
-                return
-            saved, skipped, filenames = storage.save_chapters(chapters, book_dir)
-            with self.lock:
-                self.counters["chapters_saved"] += saved
-                self.counters["skipped"] += skipped
-                for entry in (chapters if isinstance(chapters, list) else []):
-                    if isinstance(entry, dict) and entry.get("chapterNo"):
-                        self.tracker.observe_translated(entry["chapterNo"])
-
-            con.ok(f"Batch #{batch_id} complete: saved [bold green]{saved}[/bold green] chapter(s) to '{cfg.book_name}'")
-            for fn in filenames:
-                con.dim(f"  ↳ wrote {fn}")
-
-            if char_actions:
-                action_results = characters.process_character_actions(book_dir, char_actions)
-                for res in action_results:
-                    con.console.print(f"  {res}")
-
+            self._run_batch(batch_id, pages)
+        except Exception as e:
+            self._handle_batch_failure(batch_id, pages, "", f"Unexpected {type(e).__name__}: {e}")
         finally:
             with self.lock:
                 self._active.pop(batch_id, None)
                 self.counters["batches_done"] += 1
+
+    def _register_batch(self, batch_id: int, pages: list[str], gen: int) -> bool:
+        """Mark batch active, unless /cancel ran while it was being dequeued (then recover it)."""
+        with self.lock:
+            if gen < self._cancel_gen:
+                self.buffer = list(pages) + self.buffer
+                con.warn(f"Batch #{batch_id} was cancelled before starting — {len(pages)} page(s) returned to buffer.")
+                return False
+            self._active[batch_id] = {"pages": list(pages), "cancel": False}
+            return True
+
+    def _is_cancelled(self, batch_id: int) -> bool:
+        with self.lock:
+            return bool(self._active.get(batch_id, {}).get("cancel", False))
+
+    def _run_batch(self, batch_id: int, pages: list[str]) -> None:
+        cfg = self.cfg
+        book_dir = cfg.book_dir
+        try:
+            storage.spool_pages(book_dir, batch_id, pages)
+        except OSError as e:
+            con.warn(f"Could not spool batch #{batch_id} to _raw/ ({e}); continuing without backup.")
+
+        pages_text = PAGE_SEPARATOR.join(pages)
+        messages = prompts.build_messages(book_dir, pages_text)
+
+        if cfg.dry_run:
+            con.rule(f"Dry Run: Batch #{batch_id}")
+            con.console.print(f"[dim]Constructed {len(messages)} messages for {cfg.model or '(no model)'}[/dim]")
+            return
+
+        con.info(f"Dispatching batch [bold cyan]#{batch_id}[/bold cyan] ({len(pages)} pages) to [bold green]{cfg.model}[/bold green]...")
+        try:
+            raw_reply, usage = self.client.chat(cfg, messages)
+        except ApiError as e:
+            self._handle_batch_failure(batch_id, pages, "", f"API error: {e}")
+            return
+
+        self._record_usage(usage)
+        if cfg.save_raw:
+            try:
+                storage.save_raw_reply(book_dir, batch_id, raw_reply)
+            except OSError as e:
+                con.warn(f"Could not save raw reply for batch #{batch_id}: {e}")
+
+        if self._is_cancelled(batch_id):
+            con.warn(f"Batch #{batch_id} finished after cancellation — reply discarded (pages are already in the buffer).")
+            return
+
+        chapters, char_actions, err = parsing.parse_response(raw_reply)
+        if err:
+            self._handle_batch_failure(batch_id, pages, raw_reply, f"JSON error: {err}")
+            return
+        if not chapters:
+            self._handle_batch_failure(batch_id, pages, raw_reply, "Reply contained no chapters")
+            return
+        self._save_batch_results(batch_id, chapters, char_actions)
+
+    def _record_usage(self, usage) -> None:
+        if not isinstance(usage, dict):
+            return
+        toks = usage.get("total_tokens")
+        if isinstance(toks, (int, float)):
+            with self.lock:
+                self.counters["tokens"] += int(toks)
+
+    def _handle_batch_failure(self, batch_id: int, pages: list[str], reply: str, error: str) -> None:
+        """Quarantine a failed batch so it is never silently dropped."""
+        if self._is_cancelled(batch_id):
+            con.warn(f"Batch #{batch_id} ended after cancellation ({error}). Pages are already in the buffer.")
+            return
+        with self.lock:
+            self.counters["failures"] += 1
+        try:
+            qpath = storage.quarantine_failure(self.cfg.book_dir, batch_id, pages, reply, error)
+        except OSError as qe:
+            with self.lock:
+                self.buffer = list(pages) + self.buffer
+            con.fail(f"Batch #{batch_id} failed ({error}) and could not be quarantined ({qe}). {len(pages)} page(s) returned to buffer.")
+            return
+        con.fail(f"Batch #{batch_id} failed: {error}")
+        con.info(f"Quarantined {len(pages)} page(s) to [cyan]{os.path.basename(qpath)}[/cyan] (use /retry, or /recover {batch_id} for /manual)")
+
+    def _save_batch_results(self, batch_id: int, chapters: list, char_actions: list) -> None:
+        book_dir = self.cfg.book_dir
+        saved, skipped, filenames = storage.save_chapters(chapters, book_dir)
+        with self.lock:
+            self.counters["chapters_saved"] += saved
+            self.counters["skipped"] += skipped
+            for entry in chapters:
+                if isinstance(entry, dict) and entry.get("chapterNo"):
+                    self.tracker.observe_translated(entry["chapterNo"])
+
+        con.ok(f"Batch #{batch_id} complete: saved [bold green]{saved}[/bold green] chapter(s) to '{self.cfg.book_name}'")
+        for fn in filenames:
+            con.dim(f"  ↳ wrote {fn}")
+
+        if not char_actions:
+            return
+        try:
+            results = characters.process_character_actions(book_dir, char_actions)
+        except (OSError, ValueError) as e:
+            con.fail(f"Character updates for batch #{batch_id} failed: {e}")
+            return
+        for res in results:
+            con.console.print(f"  {res}")
+
     def stats(self) -> dict:
         with self.lock:
             return {
