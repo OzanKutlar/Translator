@@ -6,6 +6,8 @@ import random
 import threading
 import time
 
+from rich.markup import escape
+
 from . import console as con
 from . import prompts, parsing, storage, characters
 from .tracker import ChapterTracker
@@ -18,6 +20,32 @@ except ImportError:
     HAS_CLIPBOARD = False
 
 PAGE_SEPARATOR = "\n\n--- PAGE BREAK ---\n\n"
+LABEL_CACHE_LIMIT = 1000  # remembered "Chapter N" labels for buffered pages
+
+
+def _is_saveable(entry) -> bool:
+    """Mirror storage.save_chapters: an entry needs a chapterNo and non-empty content."""
+    if not isinstance(entry, dict):
+        return False
+    return bool(str(entry.get("chapterNo") or "").strip()) and bool(entry.get("content"))
+
+
+def _format_chapter_ranges(numbers: list[int]) -> str:
+    """Compress chapter numbers into text like 'Chapters 10–14, 17'."""
+    nums = sorted(set(numbers))
+    if not nums:
+        return ""
+    ranges = []
+    start = prev = nums[0]
+    for num in nums[1:]:
+        if num != prev + 1:
+            ranges.append((start, prev))
+            start = num
+        prev = num
+    ranges.append((start, prev))
+    parts = [str(a) if a == b else f"{a}–{b}" for a, b in ranges]
+    noun = "Chapter" if len(nums) == 1 else "Chapters"
+    return f"{noun} {', '.join(parts)}"
 
 
 class Pipeline:
@@ -37,6 +65,7 @@ class Pipeline:
         self.auto_dispatch = True
         self.manual_active = False
         self.manual_pages = None
+        self._page_labels: dict[str, str] = {}
 
         self.counters = {
             "pages_seen": 0,
@@ -94,8 +123,9 @@ class Pipeline:
             count = len(self.buffer)
             needed = self.cfg.batch_size
 
-            ch_label = f"ch {'~' if conf == 'inferred' else ''}{ch_num}" if ch_num else "ch ??"
-            con.info(f"Buffered page [bold]{count}/{needed}[/bold] ({len(content)} chars) [{ch_label}]")
+            ch_label = self._chapter_label(ch_num, conf)
+            self._remember_label_locked(content, ch_label)
+            con.info(f"Buffered page [bold]{count}/{needed}[/bold] ({len(content):,} chars) · [bold cyan]{ch_label}[/bold cyan]")
 
             # Check if scraper reached stop goal
             if self.tracker.goal_reached():
@@ -114,6 +144,29 @@ class Pipeline:
         delay = 1.0 if is_active else random.uniform(1.0, 3.5)
         time.sleep(delay)
         return directive if directive else {"action": "next", "buffered": count, "needed": needed, "chapter": ch_num}
+
+    @staticmethod
+    def _chapter_label(ch_num: int | None, confidence: str) -> str:
+        """Human label for a detected chapter: 'Chapter 12', 'Chapter ~13' or 'Chapter ?'."""
+        if ch_num is None or confidence == "unknown":
+            return "Chapter ?"
+        prefix = "~" if confidence == "inferred" else ""
+        return f"Chapter {prefix}{ch_num}"
+
+    def _remember_label_locked(self, content: str, label: str) -> None:
+        """Remember the label shown at ingest so the buffer command repeats it (bounded cache)."""
+        self._page_labels[content] = label
+        if len(self._page_labels) > LABEL_CACHE_LIMIT:
+            self._page_labels.pop(next(iter(self._page_labels)))
+
+    def page_label(self, content: str) -> str:
+        """Chapter label for a buffered page; falls back to parsing the page text."""
+        with self.lock:
+            label = self._page_labels.get(content)
+        if label:
+            return label
+        ch_num = parsing.parse_chapter_number(content)
+        return self._chapter_label(ch_num, "parsed" if ch_num is not None else "unknown")
 
     def poll_status(self, is_active: bool) -> dict:
         """Handle polling requests from scraper during wait states."""
@@ -204,11 +257,11 @@ class Pipeline:
         if HAS_CLIPBOARD:
             try:
                 pyperclip.copy(prompt)
-                return prompt, f"Copied prompt for {len(pages)} page(s) to clipboard. Paste reply with /paste."
+                return prompt, f"Copied prompt for {len(pages)} page(s) to clipboard. Bring the reply back with the paste command."
             except Exception as e:
-                return prompt, f"Clipboard write failed ({e}). Prompt shown below. Use /paste when ready."
+                return prompt, f"Clipboard write failed ({e}). Prompt shown below. Use paste when ready."
         else:
-            return prompt, "pyperclip missing. Prompt printed below. Copy it, translate, and use /paste."
+            return prompt, "pyperclip missing. Prompt printed below. Copy it, translate, and use paste."
 
     def manual_paste(self, text: str) -> str:
         """Parse and ingest JSON pasted by the user."""
@@ -217,30 +270,21 @@ class Pipeline:
 
         chapters, char_actions, err = parsing.parse_response(text)
         if err:
-            return f"Parse error: {err}. Please copy the entire JSON object and run /paste again."
+            return f"Parse error: {err}. Please copy the entire JSON object and run paste again."
 
         book_dir = self.cfg.book_dir
         if not book_dir:
             return "No target book folder selected."
 
-        saved, skipped, files = storage.save_chapters(chapters, book_dir)
+        self._store_chapters("Manual paste", chapters)
         with self.lock:
-            self.counters["chapters_saved"] += saved
-            self.counters["skipped"] += skipped
-            if self.manual_active:
-                self.manual_active = False
-                self.manual_pages = None
+            was_manual = self.manual_active
+            self.manual_active = False
+            self.manual_pages = None
 
-        action_msgs = []
-        if char_actions:
-            action_msgs = characters.process_character_actions(book_dir, char_actions)
-            for msg in action_msgs:
-                con.console.print(f"  {msg}")
+        self._apply_character_actions("Manual paste", char_actions)
 
-        res = f"Saved {saved} chapter(s) to '{self.cfg.book_name}'."
-        if skipped:
-            res += f" ({skipped} skipped)"
-        return res
+        return "Manual session closed." if was_manual else "Pasted translation processed."
 
     # ------------------------------------------------------------------
     # Cancellation & recovery
@@ -311,7 +355,7 @@ class Pipeline:
         if not messages:
             return ["No active manual session, queued, or in-flight batches to cancel."]
         if (active or queued) and auto_on:
-            messages.append("Auto-dispatch is ON, so these pages may be re-sent with the next batch. Use /auto off to keep them for /manual.")
+            messages.append("Auto-dispatch is ON, so these pages may be re-sent with the next batch. Use 'auto off' to keep them for manual.")
         return messages
 
     def recover_spooled(self, batch_id: int) -> tuple[bool, str]:
@@ -324,7 +368,7 @@ class Pipeline:
         with self.lock:
             info = self._active.get(batch_id)
             if info is not None and not info.get("cancel"):
-                return False, f"Batch #{batch_id} is still in flight. Use /cancel to recover it instead."
+                return False, f"Batch #{batch_id} is still in flight. Use cancel to recover it instead."
 
         pages, err = storage.load_spooled(book_dir, batch_id)
         if err:
@@ -338,10 +382,10 @@ class Pipeline:
         if not new_pages:
             return False, f"All {len(pages)} page(s) from batch #{batch_id} are already in the buffer."
 
-        msg = f"Recovered {len(new_pages)} page(s) from batch #{batch_id} ({total} now buffered). Use /manual or /flush."
+        msg = f"Recovered {len(new_pages)} page(s) from batch #{batch_id} ({total} now buffered). Use manual or flush."
         msg += self._drop_matching_quarantine(batch_id, pages)
         if auto_on:
-            msg += " Auto-dispatch is ON; use /auto off to keep them for /manual."
+            msg += " Auto-dispatch is ON; use 'auto off' to keep them for manual."
         return True, msg
 
     def _drop_matching_quarantine(self, batch_id: int, pages: list[str]) -> str:
@@ -351,7 +395,7 @@ class Pipeline:
         except OSError as e:
             return f" (Could not check _failed/: {e})"
         if removed:
-            return f" Removed {removed} matching _failed/ record(s) so /retry won't resend them."
+            return f" Removed {removed} matching _failed/ record(s) so retry won't resend them."
         return ""
 
     def retry_failed(self) -> str:
@@ -488,31 +532,63 @@ class Pipeline:
             con.fail(f"Batch #{batch_id} failed ({error}) and could not be quarantined ({qe}). {len(pages)} page(s) returned to buffer.")
             return
         con.fail(f"Batch #{batch_id} failed: {error}")
-        con.info(f"Quarantined {len(pages)} page(s) to [cyan]{os.path.basename(qpath)}[/cyan] (use /retry, or /recover {batch_id} for /manual)")
+        con.info(f"Quarantined {len(pages)} page(s) to [cyan]{os.path.basename(qpath)}[/cyan] (use retry, or recover {batch_id} for manual)")
 
     def _save_batch_results(self, batch_id: int, chapters: list, char_actions: list) -> None:
-        book_dir = self.cfg.book_dir
-        saved, skipped, filenames = storage.save_chapters(chapters, book_dir)
+        label = f"Batch #{batch_id}"
+        self._store_chapters(label, chapters)
+        self._apply_character_actions(label, char_actions)
+
+    def _store_chapters(self, label: str, chapters: list) -> int:
+        """Write chapters to disk, update counters and tracker, and log one summary line."""
+        saved, skipped, _written = storage.save_chapters(chapters, self.cfg.book_dir)
+        numbers = self._record_translated(chapters, saved, skipped)
+        noun = "chapter" if saved == 1 else "chapters"
+        msg = f"{label}: Saved [bold green]{saved}[/bold green] {noun}"
+        span = _format_chapter_ranges(numbers)
+        if span:
+            msg += f" ({span})"
+        msg += f" to '{escape(self.cfg.book_name)}'"
+        if skipped:
+            msg += f", [yellow]{skipped} skipped[/yellow]"
+        if saved:
+            con.ok(msg)
+        else:
+            con.warn(msg)
+        return saved
+
+    def _record_translated(self, chapters: list, saved: int, skipped: int) -> list[int]:
+        """Update counters and the tracker; returns the chapter numbers that were read."""
+        numbers = []
         with self.lock:
             self.counters["chapters_saved"] += saved
             self.counters["skipped"] += skipped
             for entry in chapters:
-                if isinstance(entry, dict) and entry.get("chapterNo"):
-                    self.tracker.observe_translated(entry["chapterNo"])
+                if not _is_saveable(entry):
+                    continue
+                num = self.tracker.observe_translated(str(entry["chapterNo"]))
+                if num is not None:
+                    numbers.append(num)
+        return numbers
 
-        con.ok(f"Batch #{batch_id} complete: saved [bold green]{saved}[/bold green] chapter(s) to '{self.cfg.book_name}'")
-        for fn in filenames:
-            con.dim(f"  ↳ wrote {fn}")
-
+    def _apply_character_actions(self, label: str, char_actions: list) -> None:
+        """Apply character mutations and log one combined summary line."""
         if not char_actions:
             return
         try:
-            results = characters.process_character_actions(book_dir, char_actions)
+            summary = characters.process_character_actions(self.cfg.book_dir, char_actions)
         except (OSError, ValueError) as e:
-            con.fail(f"Character updates for batch #{batch_id} failed: {e}")
+            con.fail(f"{label}: character updates failed: {escape(str(e))}")
             return
-        for res in results:
-            con.console.print(f"  {res}")
+        for err in summary.get("failed", []):
+            con.fail(f"{label}: character update failed: {escape(err)}")
+        line = characters.format_summary(summary)
+        if line:
+            con.ok(f"{label}: {escape(line)}")
+
+        
+
+        
 
     def stats(self) -> dict:
         with self.lock:

@@ -1,9 +1,19 @@
 """OpenAI v1-compatible HTTP client."""
 
 import time
+
 import requests
+from rich.markup import escape
 from rich.table import Table
+
 from . import console as con
+from . import menu
+from .config import ConfigError
+
+MODEL_PAGE_SIZE = 15
+MAX_FALLBACK_ATTEMPTS = 10
+MANUAL_ENTRY_LABEL = "✎ Enter model ID manually…"
+_MANUAL = object()  # sentinel: the picker's manual-entry row was chosen
 
 
 class ApiError(Exception):
@@ -63,80 +73,131 @@ class ApiClient:
                 unique.append(m)
         return unique
 
+    # ------------------------------------------------------------------
+    # Model listing & selection
+    # ------------------------------------------------------------------
+
+    def print_models(self, cfg) -> bool:
+        """Print the endpoint's models as a table without asking for a choice."""
+        models = self._fetch_models(cfg)
+        if not models:
+            return False
+        con.console.print(self._model_table(models, 0, f"Available Models ({len(models)})"))
+        return True
+
     def select_model(self, cfg, allow_manual: bool = True) -> bool:
-        """Interactive model picker querying /models with pagination support."""
+        """Pick a model with the arrow-key menu (numbered list when there is no terminal)."""
+        models = self._fetch_models(cfg)
+        if not models:
+            return self._prompt_manual_model(cfg) if allow_manual else False
+        try:
+            choice = self._pick_model(cfg, models, allow_manual)
+        except menu.MenuUnavailable as e:
+            con.dim(f"Arrow-key menu unavailable ({escape(str(e))}); using numbered list.")
+            return self._select_model_fallback(cfg, models)
+        if choice is None:
+            con.warn("Model selection cancelled.")
+            return False
+        if choice is _MANUAL:
+            return self._prompt_manual_model(cfg)
+        return self._apply_model(cfg, choice)
+
+    def _fetch_models(self, cfg) -> list[dict]:
         try:
             models = self.list_models(cfg)
-        except Exception as e:
-            con.warn(f"Could not retrieve model list from {cfg.base_url}: {e}")
-            if allow_manual:
-                ans = con.console.input("[bold]Enter model ID manually: [/bold]").strip()
-                if ans:
-                    cfg.model = ans
-                    con.ok(f"Model set to [bold cyan]{ans}[/bold cyan]")
-                    return True
-            return False
-
+        except ApiError as e:
+            con.warn(f"Could not retrieve model list from {escape(cfg.base_url)}: {escape(str(e))}")
+            return []
         if not models:
-            con.warn(f"No models found on {cfg.base_url}")
-            if allow_manual:
-                ans = con.console.input("[bold]Enter model ID manually: [/bold]").strip()
-                if ans:
-                    cfg.model = ans
-                    return True
-            return False
+            con.warn(f"No models found on {escape(cfg.base_url)}")
+        return models
 
-        page_size = 15
-        total_pages = (len(models) + page_size - 1) // page_size
-        current_page = 0
+    def _pick_model(self, cfg, models: list[dict], allow_manual: bool):
+        """Returns a model id, the _MANUAL sentinel, or None when cancelled."""
+        options = [m["id"] for m in models]
+        hints = [m["owned_by"] for m in models]
+        if allow_manual:
+            options.append(MANUAL_ENTRY_LABEL)
+            hints.append("")
+        current = cfg.model
+        model_ids = options[:len(models)]
+        default = model_ids.index(current) if current and current in model_ids else 0
+        title = f"Select model ({len(models)} available on {cfg.base_url})"
+        idx = menu.select_option(title, options, hints, default)
+        if idx is None:
+            return None
+        return _MANUAL if idx >= len(models) else models[idx]["id"]
 
-        while current_page < total_pages:
-            start_idx = current_page * page_size
-            end_idx = min(start_idx + page_size, len(models))
-            page_items = models[start_idx:end_idx]
-
-            table = Table(title=f"Available Models (Page {current_page + 1}/{total_pages})")
-            table.add_column("#", justify="right", style="cyan", no_wrap=True)
-            table.add_column("Model ID", style="green")
-            table.add_column("Owned By", style="dim")
-
-            for idx, m in enumerate(page_items, start=start_idx + 1):
-                table.add_row(str(idx), m["id"], m["owned_by"])
-
+    def _select_model_fallback(self, cfg, models: list[dict]) -> bool:
+        """Numbered, paginated picker used when the arrow-key menu cannot run."""
+        total_pages = (len(models) + MODEL_PAGE_SIZE - 1) // MODEL_PAGE_SIZE
+        page = 0
+        for _ in range(total_pages + MAX_FALLBACK_ATTEMPTS):
+            start = page * MODEL_PAGE_SIZE
+            title = f"Available Models (Page {page + 1}/{total_pages})"
             con.rule("Model Selection")
-            con.console.print(table)
-
-            prompt_text = "[bold]Select model # (or 'm' for more, 'q' to cancel): [/bold]"
-            if current_page == total_pages - 1:
-                prompt_text = "[bold]Select model # (or type model ID, 'q' to cancel): [/bold]"
-
-            ans = con.console.input(prompt_text).strip()
+            con.console.print(self._model_table(models[start:start + MODEL_PAGE_SIZE], start, title))
+            is_last = page >= total_pages - 1
+            extra = "or type a model ID" if is_last else "'m' for more"
+            try:
+                ans = con.console.input(f"[bold]Select model # ({extra}, 'q' to cancel): [/bold]").strip()
+            except (KeyboardInterrupt, EOFError):
+                return False
             if ans.lower() in ("q", "quit"):
                 return False
-            if ans.lower() == "m" and current_page < total_pages - 1:
-                current_page += 1
+            if ans.lower() == "m" and not is_last:
+                page += 1
                 continue
-
-            try:
-                selected_idx = int(ans) - 1
-                if 0 <= selected_idx < len(models):
-                    chosen = models[selected_idx]["id"]
-                    cfg.model = chosen
-                    con.ok(f"Selected model: [bold cyan]{chosen}[/bold cyan]")
-                    return True
-            except ValueError:
-                if ans:
-                    cfg.model = ans
-                    con.ok(f"Set model: [bold cyan]{ans}[/bold cyan]")
-                    return True
+            chosen = self._resolve_model_answer(models, ans)
+            if chosen:
+                return self._apply_model(cfg, chosen)
             con.warn("Invalid selection, please try again.")
-
         return False
+
+    @staticmethod
+    def _resolve_model_answer(models: list[dict], ans: str) -> str | None:
+        if not ans:
+            return None
+        if not ans.isdigit():
+            return ans
+        idx = int(ans) - 1
+        return models[idx]["id"] if 0 <= idx < len(models) else None
+
+    @staticmethod
+    def _model_table(models: list[dict], start: int, title: str) -> Table:
+        table = Table(title=title)
+        table.add_column("#", justify="right", style="cyan", no_wrap=True)
+        table.add_column("Model ID", style="green")
+        table.add_column("Owned By", style="dim")
+        for idx, m in enumerate(models, start=start + 1):
+            table.add_row(str(idx), escape(m["id"]), escape(m["owned_by"]))
+        return table
+
+    @staticmethod
+    def _apply_model(cfg, model_id: str) -> bool:
+        try:
+            cfg.model = model_id
+        except ConfigError as e:
+            con.fail(str(e))
+            return False
+        con.ok(f"Selected model: [bold cyan]{escape(cfg.model)}[/bold cyan]")
+        return True
+
+    def _prompt_manual_model(self, cfg) -> bool:
+        try:
+            ans = con.console.input("[bold]Enter model ID manually (blank to cancel): [/bold]").strip()
+        except (KeyboardInterrupt, EOFError):
+            return False
+        return self._apply_model(cfg, ans) if ans else False
+
+    # ------------------------------------------------------------------
+    # Chat completions
+    # ------------------------------------------------------------------
 
     def chat(self, cfg, messages: list[dict]) -> tuple[str, dict | None]:
         """Send chat completion request with exponential backoff."""
         if not cfg.model:
-            raise ApiError("No model specified. Use /model to configure.")
+            raise ApiError("No model specified. Use the model command to configure one.")
 
         payload = {
             "model": cfg.model,

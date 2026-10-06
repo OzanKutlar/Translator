@@ -27,8 +27,9 @@ def save_chapters(chapters: list, book_dir: str) -> tuple[int, int, list[str]]:
         if not isinstance(entry, dict):
             skipped += 1
             continue
-        chapter_no = entry.get("chapterNo", "").strip()
-        content = entry.get("content", "")
+        chapter_no = str(entry.get("chapterNo") or "").strip()
+        content = entry.get("content") or ""
+        content = content if isinstance(content, str) else str(content)
         if not chapter_no or not content:
             skipped += 1
             continue

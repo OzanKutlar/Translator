@@ -373,7 +373,7 @@
                 log(`Will poll again in 15s in case goal is extended... (${idlePollCount}/${MAX_IDLE_POLLS})`, "info");
                 setTimeout(pollStatus, 15000);
             } else {
-                log("Autoplay finished. Set higher /goal in console to resume or refresh page.", "info");
+                log("Autoplay finished. Set a higher goal in the console (e.g. 'goal +50') to resume, or refresh the page.", "info");
             }
         } else if (data.action === "next") {
             idlePollCount = 0;

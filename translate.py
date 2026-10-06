@@ -98,7 +98,7 @@ def main():
     # Handle 'models' subcommand
     if sub == "models":
         con.rule(f"Querying Models from {cfg.base_url}")
-        client.select_model(cfg, allow_manual=False)
+        client.print_models(cfg)
         return
 
     # Handle 'prompt' subcommand
