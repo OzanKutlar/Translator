@@ -623,7 +623,7 @@ class Pipeline:
                 "tracker": self.tracker.snapshot(),
             }
 
-    def shutdown(self, drain: bool = True, timeout: int = 300) -> None:
+    def shutdown(self, drain: bool = True, timeout: int = 600) -> None:
         """Gracefully drain in-flight batches and shut down workers."""
         if drain:
             with self.lock:

@@ -65,7 +65,7 @@ class Config:
         self._max_tokens = None
         self._batch_size = DEFAULT_BATCH_SIZE
         self._concurrency = DEFAULT_CONCURRENCY
-        self._timeout = 300
+        self._timeout = 600
         self._retries = 2
         self._json_mode = "auto"
         self._library_dir = DEFAULT_LIBRARY
@@ -280,7 +280,7 @@ class Config:
         concurrency = getattr(args, "concurrency", None) or os.environ.get("TL_CONCURRENCY") or DEFAULT_CONCURRENCY
         cfg.concurrency = concurrency
 
-        timeout = getattr(args, "timeout", None) or os.environ.get("TL_TIMEOUT") or 300
+        timeout = getattr(args, "timeout", None) or os.environ.get("TL_TIMEOUT") or 600
         cfg.timeout = timeout
 
         retries = getattr(args, "retries", None) or os.environ.get("TL_RETRIES") or 2
