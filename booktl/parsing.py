@@ -100,6 +100,7 @@ _VALID_JSON_KEYS = [
     "chapters", "characterActions",
     "action", "Chinese", "English", "Description",
     "ModType", "Content", "Find", "Replace",
+    "arcEnds", "endType", "arcName", "isAfterword",
 ]
 
 
@@ -172,3 +173,43 @@ def parse_response(raw_response: str) -> tuple[list | None, list | None, str | N
         return parsed, [], None
 
     return None, None, "Unexpected JSON top-level structure (expected object or array)"
+
+
+def _load_payload(raw_response: str) -> tuple[object, str | None]:
+    """Decode a reply, falling back to repair_json. Returns (parsed, error_message)."""
+    if not raw_response or not raw_response.strip():
+        return None, "Empty response payload received from model"
+    cleaned = _strip_fences(raw_response.strip())
+    try:
+        return json.loads(cleaned), None
+    except json.JSONDecodeError:
+        repaired = repair_json(raw_response)  # second attempt after fixing common LLM quoting mistakes
+    try:
+        return json.loads(repaired), None
+    except json.JSONDecodeError as e:
+        return None, f"JSON parse failed: {e}"
+
+
+def _list_field(parsed: dict, key: str) -> list:
+    value = parsed.get(key, [])
+    return value if isinstance(value, list) else []
+
+
+def parse_reply(raw_response: str) -> tuple[list | None, list, list, str | None]:
+    """Parse the LLM JSON response including arc endings.
+
+    Returns (chapters, character_actions, arc_ends, error_message). Missing
+    "characterActions" or "arcEnds" keys become empty lists, so older replies still parse.
+    parse_response() above keeps its 3-tuple shape for any existing callers.
+    """
+    parsed, err = _load_payload(raw_response)
+    if err:
+        return None, [], [], err
+    if isinstance(parsed, list):
+        return parsed, [], [], None
+    if not isinstance(parsed, dict):
+        return None, [], [], "Unexpected JSON top-level structure (expected object or array)"
+    chapters = parsed.get("chapters", [])
+    if not isinstance(chapters, list):
+        return None, [], [], "'chapters' key must be a JSON array"
+    return chapters, _list_field(parsed, "characterActions"), _list_field(parsed, "arcEnds"), None

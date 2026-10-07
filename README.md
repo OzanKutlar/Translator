@@ -55,3 +55,23 @@ Progress bars count from the first chapter the scraper sends after the program s
 ### Logs
 
 Each finished batch logs one chapter summary, such as `Batch #4: Saved 10 chapters (Chapters 10–19)`, and one character summary, such as `Modified 2 characters, added 1 character, associated 3 characters`.
+
+### Arc / Volume Tracking
+
+When the author explicitly marks a chapter as the end of an arc or volume (for example `（第一卷完）` or an author's note saying the volume is over), the model reports it in an `arcEnds` list and the translator records it in `<Book>/Arcs.json`. The model is told never to guess endings from the plot, so a book only gains an entry when the author actually declares one.
+
+    {
+      "version": 1,
+      "bookName": "",
+      "author": "",
+      "arcs": [
+        { "endChapter": 2001, "storyEndChapter": 2000, "name": "Volume 1: Above the Ruins", "type": "volume", "source": "model" }
+      ]
+    }
+
+- Each arc starts one chapter after the previous one ends, so start chapters are not stored.
+- An ending is only accepted for a chapter that was in the same reply. Re-translating a chapter never creates a duplicate.
+- An author's afterword ("Thoughts on Volume 1", 卷末感言) up to 5 chapters after an ending is folded into that volume. `endChapter` moves to the afterword and `storyEndChapter` keeps the chapter where the story ended.
+- `bookName` and `author` are left empty by the translator; the PDF tool fills them in. Arcs you define yourself (`"source": "user"`) are never moved.
+- Recorded endings are sent to the model as context so afterwords reuse the exact same name.
+- Every change is logged, e.g. `Batch #4: 📕 Volume end recorded at Chapter 2000 — “Volume 1: Above the Ruins”`.

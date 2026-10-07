@@ -9,7 +9,7 @@ import time
 from rich.markup import escape
 
 from . import console as con
-from . import prompts, parsing, storage, characters
+from . import arcs, prompts, parsing, storage, characters
 from .tracker import ChapterTracker
 from .client import ApiClient, ApiError
 
@@ -268,7 +268,7 @@ class Pipeline:
         if not text or not text.strip():
             return "Provided payload is empty."
 
-        chapters, char_actions, err = parsing.parse_response(text)
+        chapters, char_actions, arc_ends, err = parsing.parse_reply(text)
         if err:
             return f"Parse error: {err}. Please copy the entire JSON object and run paste again."
 
@@ -283,6 +283,7 @@ class Pipeline:
             self.manual_pages = None
 
         self._apply_character_actions("Manual paste", char_actions)
+        self._apply_arc_ends("Manual paste", arc_ends, chapters)
 
         return "Manual session closed." if was_manual else "Pasted translation processed."
 
@@ -500,14 +501,14 @@ class Pipeline:
             con.warn(f"Batch #{batch_id} finished after cancellation — reply discarded (pages are already in the buffer).")
             return
 
-        chapters, char_actions, err = parsing.parse_response(raw_reply)
+        chapters, char_actions, arc_ends, err = parsing.parse_reply(raw_reply)
         if err:
             self._handle_batch_failure(batch_id, pages, raw_reply, f"JSON error: {err}")
             return
         if not chapters:
             self._handle_batch_failure(batch_id, pages, raw_reply, "Reply contained no chapters")
             return
-        self._save_batch_results(batch_id, chapters, char_actions)
+        self._save_batch_results(batch_id, chapters, char_actions, arc_ends)
 
     def _record_usage(self, usage) -> None:
         if not isinstance(usage, dict):
@@ -534,10 +535,11 @@ class Pipeline:
         con.fail(f"Batch #{batch_id} failed: {error}")
         con.info(f"Quarantined {len(pages)} page(s) to [cyan]{os.path.basename(qpath)}[/cyan] (use retry, or recover {batch_id} for manual)")
 
-    def _save_batch_results(self, batch_id: int, chapters: list, char_actions: list) -> None:
+    def _save_batch_results(self, batch_id: int, chapters: list, char_actions: list, arc_ends: list) -> None:
         label = f"Batch #{batch_id}"
         self._store_chapters(label, chapters)
         self._apply_character_actions(label, char_actions)
+        self._apply_arc_ends(label, arc_ends, chapters)
 
     def _store_chapters(self, label: str, chapters: list) -> int:
         """Write chapters to disk, update counters and tracker, and log one summary line."""
@@ -570,6 +572,33 @@ class Pipeline:
                 if num is not None:
                     numbers.append(num)
         return numbers
+
+    def _apply_arc_ends(self, label: str, arc_ends: list, chapters: list) -> None:
+        """Record author-declared arc/volume endings in Arcs.json and log every change."""
+        if not arc_ends:
+            return
+        valid = arcs.chapter_numbers([entry for entry in chapters if _is_saveable(entry)])
+        try:
+            summary = arcs.record_arc_ends(self.cfg.book_dir, arc_ends, valid)
+        except (OSError, ValueError, TypeError) as e:
+            con.fail(f"{label}: arc/volume update failed: {escape(str(e))}")
+            return
+        self._log_arc_summary(label, summary)
+
+    @staticmethod
+    def _log_arc_summary(label: str, summary: dict) -> None:
+        """One log line per arc event; failures are never silent."""
+        for ev in summary.get("recorded", []):
+            kind = "Volume" if ev["type"] == "volume" else "Arc"
+            con.ok(f"{label}: 📕 {kind} end recorded at Chapter {ev['chapter']} — “{escape(ev['name'])}”")
+        for ev in summary.get("extended", []):
+            con.ok(f"{label}: 📕 Afterword Chapter {ev['to']} added to “{escape(ev['name'])}” (was ending at {ev['from']})")
+        for ev in summary.get("unchanged", []):
+            con.dim(f"{label}: ending at Chapter {ev['chapter']} already recorded as “{escape(ev['name'])}”")
+        for reason in summary.get("skipped", []):
+            con.warn(f"{label}: arc/volume entry skipped: {escape(reason)}")
+        for err in summary.get("failed", []):
+            con.fail(f"{label}: arc/volume update failed: {escape(err)}")
 
     def _apply_character_actions(self, label: str, char_actions: list) -> None:
         """Apply character mutations and log one combined summary line."""
