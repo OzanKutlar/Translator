@@ -30,22 +30,7 @@ def _is_saveable(entry) -> bool:
     return bool(str(entry.get("chapterNo") or "").strip()) and bool(entry.get("content"))
 
 
-def _format_chapter_ranges(numbers: list[int]) -> str:
-    """Compress chapter numbers into text like 'Chapters 10–14, 17'."""
-    nums = sorted(set(numbers))
-    if not nums:
-        return ""
-    ranges = []
-    start = prev = nums[0]
-    for num in nums[1:]:
-        if num != prev + 1:
-            ranges.append((start, prev))
-            start = num
-        prev = num
-    ranges.append((start, prev))
-    parts = [str(a) if a == b else f"{a}–{b}" for a, b in ranges]
-    noun = "Chapter" if len(nums) == 1 else "Chapters"
-    return f"{noun} {', '.join(parts)}"
+_format_chapter_ranges = parsing.format_chapter_ranges
 
 
 class Pipeline:

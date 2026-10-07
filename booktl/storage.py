@@ -5,6 +5,8 @@ import os
 import re
 import time
 
+from .parsing import parse_chapter_number, format_chapter_ranges
+
 RAW_DIRNAME = "_raw"
 FAILED_DIRNAME = "_failed"
 
@@ -165,15 +167,25 @@ def max_spooled_batch_id(book_dir: str) -> int:
 
 
 def list_spooled(book_dir: str) -> list[dict]:
-    """Summaries of spooled batches: batch_id, pages (count or None), timestamp, error."""
+    """Summaries of spooled batches: batch_id, pages (count or None), timestamp, error, chapters."""
     summaries = []
     for batch_id, path in _spooled_ids(book_dir):
         data, err = _read_spool(path)
+        pages = data.get("pages") if data and isinstance(data.get("pages"), list) else None
+        ch_nums = []
+        if pages:
+            for p in pages:
+                ch = parse_chapter_number(p)
+                if ch is not None:
+                    ch_nums.append(ch)
+        ch_summary = format_chapter_ranges(ch_nums) if ch_nums else ("?" if pages else "")
         summaries.append({
             "batch_id": batch_id,
-            "pages": len(data["pages"]) if data else None,
+            "pages": len(pages) if pages is not None else None,
             "timestamp": data.get("timestamp") if data else None,
             "error": err,
+            "chapter_numbers": ch_nums,
+            "chapters": ch_summary,
         })
     return summaries
 

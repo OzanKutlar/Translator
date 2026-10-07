@@ -48,7 +48,7 @@ HELP_ROWS = (
     ("paste", "Ingest translation JSON response from clipboard."),
     ("cancel", "Abort manual mode, queued and in-flight batches; pages return to buffer immediately."),
     ("retry", "Re-process quarantined failure batches from _failed/."),
-    ("recover [batch_id]", "List spooled batches in _raw/, or load one back into the buffer."),
+    ("recover [batch_id|ch]", "List spooled batches in _raw/, or load one back by batch ID or chapter."),
     ("raw <on|off>", "Toggle saving raw model responses to _raw/."),
     ("clear", "Clear terminal screen."),
     ("help", "Show this list (alias: ?)."),
@@ -95,15 +95,17 @@ def print_spooled(ctx: ReplContext, limit: int = 15) -> None:
     shown = records[-limit:]
     table = Table(title=f"Spooled Batches (latest {len(shown)} of {len(records)})", border_style="magenta")
     table.add_column("Batch", style="cyan", justify="right")
+    table.add_column("Chapters", style="bold green")
     table.add_column("Pages", justify="right")
     table.add_column("Spooled At", style="dim")
     for rec in shown:
         ts = rec.get("timestamp")
         when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if isinstance(ts, (int, float)) else "?"
         pages = str(rec["pages"]) if rec.get("pages") is not None else "[red]unreadable[/red]"
-        table.add_row(f"#{rec['batch_id']}", pages, when)
+        ch_str = rec.get("chapters") or "[dim]?[/dim]"
+        table.add_row(f"#{rec['batch_id']}", ch_str, pages, when)
     con.console.print(table)
-    con.info("Load one into the buffer with [bold cyan]recover <batch_id>[/bold cyan].")
+    con.info("Load one into the buffer with [bold cyan]recover <batch_id>[/bold cyan] (e.g. recover 8 or recover ch71).")
 
 
 def _current_chapter_text(tr: dict) -> str:
@@ -350,16 +352,61 @@ def cmd_retry(ctx: ReplContext, args: list[str]) -> None:
     con.ok(ctx.pipeline.retry_failed())
 
 
+def _find_batch_by_chapter(records: list[dict], target_ch: int) -> dict | None:
+    """Find the latest spooled batch containing target_ch."""
+    matches = [r for r in records if target_ch in r.get("chapter_numbers", [])]
+    return matches[-1] if matches else None
+
+
 def cmd_recover(ctx: ReplContext, args: list[str]) -> None:
     if not args:
         print_spooled(ctx)
         return
-    try:
-        batch_id = int(args[0].lstrip("#"))
-    except ValueError:
-        con.warn("Usage: recover <batch_id>  (run recover with no id to list spooled batches)")
+    book_dir = ctx.cfg.book_dir
+    if not book_dir:
+        con.warn("No book directory selected.")
         return
-    ok, msg = ctx.pipeline.recover_spooled(batch_id)
+
+    query = " ".join(args).strip()
+    records = storage.list_spooled(book_dir)
+
+    target_batch_id = None
+    # Check if user typed a chapter prefix, e.g. 'ch71', 'ch 71', 'chapter 75'
+    ch_match = None
+    import re
+    m = re.search(r'(?:ch(?:apter)?\.?\s*)(\d+)', query, re.IGNORECASE)
+    if m:
+        ch_match = int(m.group(1))
+
+    if ch_match is not None:
+        rec = _find_batch_by_chapter(records, ch_match)
+        if not rec:
+            con.warn(f"No spooled batch found containing Chapter {ch_match}.")
+            return
+        target_batch_id = rec["batch_id"]
+        con.info(f"Located Chapter {ch_match} in Batch [bold cyan]#{target_batch_id}[/bold cyan] ({rec.get('chapters', '')}).")
+    else:
+        # Check if query is an integer
+        clean_query = query.lstrip("#").strip()
+        if clean_query.isdigit():
+            val = int(clean_query)
+            # If a batch with this batch_id exists, use it
+            if any(r["batch_id"] == val for r in records):
+                target_batch_id = val
+            else:
+                # Otherwise see if this integer corresponds to a chapter number in spooled batches
+                rec = _find_batch_by_chapter(records, val)
+                if rec:
+                    target_batch_id = rec["batch_id"]
+                    con.info(f"Batch #{val} not found, but located Chapter {val} in Batch [bold cyan]#{target_batch_id}[/bold cyan] ({rec.get('chapters', '')}).")
+                else:
+                    # Fall back to treating it as batch_id
+                    target_batch_id = val
+        else:
+            con.warn("Usage: recover <batch_id|chapter>  (e.g. recover 8 or recover ch71)")
+            return
+
+    ok, msg = ctx.pipeline.recover_spooled(target_batch_id)
     if ok:
         con.ok(msg)
     else:

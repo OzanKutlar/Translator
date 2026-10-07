@@ -95,6 +95,25 @@ def parse_chapter_number(text: str) -> int | None:
 
     return None
 
+
+def format_chapter_ranges(numbers: list[int]) -> str:
+    """Compress chapter numbers into text like 'Chapters 10–14, 17' or 'Chapter 5'."""
+    nums = sorted(set(n for n in numbers if isinstance(n, int) and n > 0))
+    if not nums:
+        return ""
+    ranges = []
+    start = prev = nums[0]
+    for num in nums[1:]:
+        if num != prev + 1:
+            ranges.append((start, prev))
+            start = num
+        prev = num
+    ranges.append((start, prev))
+    parts = [str(a) if a == b else f"{a}–{b}" for a, b in ranges]
+    noun = "Chapter" if len(nums) == 1 else "Chapters"
+    return f"{noun} {', '.join(parts)}"
+
+
 _VALID_JSON_KEYS = [
     "chapterNo", "content",
     "chapters", "characterActions",
