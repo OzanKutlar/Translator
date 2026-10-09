@@ -1,5 +1,6 @@
 """Interactive console command handlers. Commands are bare words; a leading '/' is optional."""
 
+import re
 import time
 
 from rich.markup import escape
@@ -10,7 +11,8 @@ from . import storage
 from .client import ApiClient
 from .config import Config, ConfigError
 from .library import select_book
-from .pipeline import Pipeline, HAS_CLIPBOARD
+from .parsing import format_chapter_ranges
+from .pipeline import Pipeline, HAS_CLIPBOARD, describe_entries
 from .progressbar import render_bars
 
 if HAS_CLIPBOARD:
@@ -26,29 +28,35 @@ except ImportError:
 
 # The console runs until the user quits; this bound only guards against a runaway loop.
 MAX_REPL_ITERATIONS = 10_000_000
-ALIASES = {"exit": "quit", "q": "quit", "?": "help", "setpage": "batch"}
+MAX_PROBLEM_ROWS = 200
+ALIASES = {
+    "exit": "quit", "q": "quit", "?": "help", "setpage": "batch",
+    "buffer": "pending", "queue": "pending", "retranslate": "retry", "rt": "retry",
+}
+_BATCH_REF_RE = re.compile(r"^(?:#|b(?:atch)?\s*#?)\s*(\d+)$", re.IGNORECASE)
 
 HELP_ROWS = (
     ("status", "Display live status, pipeline counters, and current settings."),
     ("model [id]", "Switch model directly, or open the arrow-key model picker."),
     ("endpoint <url>", "Change target API base URL."),
     ("key <token|none>", "Set or clear the API authorization bearer key."),
-    ("batch <n>", "Set number of pages per translation batch (alias: setpage)."),
+    ("batch <n>", "Set pages per translation batch (alias: setpage). Applies to the very next batch sent."),
     ("concurrency <n>", "Adjust active parallel worker threads."),
     ("temp <0.0-2.0>", "Adjust model generation temperature."),
     ("maxtokens <n|none>", "Set or clear maximum response tokens."),
     ("jsonmode <auto|on|off>", "Configure JSON formatting parameter handling."),
     ("book", "Switch target book (arrow-key picker)."),
-    ("goal <n|+n|none>", "Set or clear the stop chapter (e.g. goal 3000 or goal +50). Progress counts from this session's first scraped chapter."),
+    ("goal <n|+n|none>", "Set or clear the stop chapter. With a goal the scraper runs until the goal; without one it waits at 4 x batch size pending pages."),
     ("progress", "Display current scraping and translation progress bars."),
-    ("buffer", "List buffered pages with their chapter numbers."),
-    ("flush", "Immediately dispatch all currently buffered pages."),
-    ("auto <on|off>", "Toggle auto-dispatching (turn off to accumulate pages for manual)."),
-    ("manual", "Copy buffered pages to clipboard for external translation."),
+    ("pending [all]", "List pending chapters and in-flight batches; 'all' lists every page (aliases: buffer, queue)."),
+    ("missing", "List chapters left out of replies and chapters from failed batches. They are never re-queued automatically."),
+    ("retry [chapters]", "Re-queue and send chapters now: retry 112-115, retry 120 130, retry missing, retry failed, retry all. No argument re-queues all failed chapters (aliases: retranslate, rt)."),
+    ("recover [#batch|chapters]", "No argument lists spooled batches. 'recover #8' loads batch 8; 'recover 112-115' loads chapters to the front of the pool without forcing a send."),
+    ("flush", "Send all pending pages now, including a final partial batch."),
+    ("auto <on|off>", "Toggle auto-dispatching (turn off to keep pages pending for manual)."),
+    ("manual", "Copy the next batch of pending pages to the clipboard for external translation."),
     ("paste", "Ingest translation JSON response from clipboard."),
-    ("cancel", "Abort manual mode, queued and in-flight batches; pages return to buffer immediately."),
-    ("retry", "Re-process quarantined failure batches from _failed/."),
-    ("recover [batch_id|ch]", "List spooled batches in _raw/, or load one back by batch ID or chapter."),
+    ("cancel", "Abort manual mode and in-flight batches; their pages return to the front of the pending pool."),
     ("raw <on|off>", "Toggle saving raw model responses to _raw/."),
     ("clear", "Clear terminal screen."),
     ("help", "Show this list (alias: ?)."),
@@ -66,6 +74,15 @@ class ReplContext:
 # ----------------------------------------------------------------------
 # Display helpers
 # ----------------------------------------------------------------------
+
+_REPORT_PRINTERS = {"ok": con.ok, "info": con.info, "warn": con.warn, "fail": con.fail}
+
+
+def print_report(report) -> None:
+    """Print (level, message) pairs returned by pipeline operations."""
+    for level, message in report or []:
+        _REPORT_PRINTERS.get(level, con.info)(message)
+
 
 def print_help() -> None:
     table = Table(title="Available Commands", border_style="blue")
@@ -86,7 +103,7 @@ def print_spooled(ctx: ReplContext, limit: int = 15) -> None:
     try:
         records = storage.list_spooled(book_dir)
     except OSError as e:
-        con.fail(f"Could not read _raw/: {e}")
+        con.fail(f"Could not read _raw/: {escape(str(e))}")
         return
     if not records:
         con.info("No spooled batches found in _raw/.")
@@ -105,7 +122,10 @@ def print_spooled(ctx: ReplContext, limit: int = 15) -> None:
         ch_str = rec.get("chapters") or "[dim]?[/dim]"
         table.add_row(f"#{rec['batch_id']}", ch_str, pages, when)
     con.console.print(table)
-    con.info("Load one into the buffer with [bold cyan]recover <batch_id>[/bold cyan] (e.g. recover 8 or recover ch71).")
+    con.info(
+        "Load a batch with [bold cyan]recover #<batch_id>[/bold cyan] (e.g. recover #8), "
+        "or chapters with [bold cyan]recover 112-115[/bold cyan]."
+    )
 
 
 def _current_chapter_text(tr: dict) -> str:
@@ -137,8 +157,15 @@ def _goal_status_text(tr: dict) -> str:
     )
 
 
-def _print_bars(tr: dict) -> None:
-    con.console.print("\n" + render_bars(tr) + "\n", markup=False, highlight=False)
+def _print_bars(tr: dict, queue: dict | None = None) -> None:
+    con.console.print("\n" + render_bars(tr, queue=queue) + "\n", markup=False, highlight=False)
+
+
+def _pending_text(s: dict) -> str:
+    limit = s.get("backlog_limit")
+    cap = f" (scraper waits at {limit})" if limit else " (no cap while a goal is set)"
+    drain = " · [yellow]drain mode[/yellow]" if s.get("drain") else ""
+    return f"{s['pending']}{cap}{drain}"
 
 
 def print_status(ctx: ReplContext) -> None:
@@ -162,17 +189,18 @@ def print_status(ctx: ReplContext) -> None:
     table.add_row("Temperature", str(s["temperature"]))
     table.add_row("JSON Mode", s["json_mode"])
     table.add_row("Auto Dispatch", "[green]ON[/green]" if s["auto_dispatch"] else "[yellow]PAUSED[/yellow]")
-    table.add_row("Manual Active", "[yellow]YES[/yellow]" if s["manual_active"] else "NO")
-    table.add_row("Buffered Pages", f"{s['buffer_count']}/{s['batch_size']}")
-    table.add_row("Queue Depth", str(s["queue_depth"]))
-    table.add_row("In-Flight Batches", str(s["in_flight"]))
+    table.add_row("Manual Active", f"[yellow]YES ({s['manual']} pages)[/yellow]" if s["manual_active"] else "NO")
+    table.add_row("Pending Pages", _pending_text(s))
+    table.add_row("In-Flight", f"{s['in_flight_batches']} batch(es), {s['in_flight']} page(s)")
+    table.add_row("Missing Chapters", f"[bold yellow]{s['missing']}[/bold yellow]" if s["missing"] else "0")
+    table.add_row("Failed Chapters", f"[bold red]{s['failed']}[/bold red]" if s["failed"] else "0")
     table.add_row("Chapters Saved", f"[bold green]{c['chapters_saved']}[/bold green]")
     table.add_row("Pages Received", str(c["pages_seen"]))
     table.add_row("Failed Batches", f"[bold red]{c['failures']}[/bold red]" if c["failures"] else "0")
     table.add_row("Total Tokens Reported", f"{c['tokens']:,}")
 
     con.console.print(table)
-    _print_bars(tr)
+    _print_bars(tr, ctx.pipeline.queue_counts())
 
 
 # ----------------------------------------------------------------------
@@ -194,6 +222,7 @@ def cmd_status(ctx: ReplContext, args: list[str]) -> None:
 def cmd_goal(ctx: ReplContext, args: list[str]) -> None:
     if args:
         con.ok(ctx.pipeline.tracker.set_goal(args[0]))
+        ctx.pipeline.wake_workers()
         return
     tr = ctx.pipeline.tracker.snapshot()
     con.info(f"Stop goal: {_goal_status_text(tr)}")
@@ -202,7 +231,7 @@ def cmd_goal(ctx: ReplContext, args: list[str]) -> None:
 
 
 def cmd_progress(ctx: ReplContext, args: list[str]) -> None:
-    _print_bars(ctx.pipeline.tracker.snapshot())
+    _print_bars(ctx.pipeline.tracker.snapshot(), ctx.pipeline.queue_counts())
 
 
 def cmd_model(ctx: ReplContext, args: list[str]) -> None:
@@ -240,21 +269,24 @@ def cmd_key(ctx: ReplContext, args: list[str]) -> None:
     con.ok("API key updated." if ctx.cfg.api_key else "API key cleared.")
 
 
-def _set_setting(ctx: ReplContext, args: list[str], attr: str, label: str, usage: str) -> None:
-    """Shared handler for simple Config properties validated by their setters."""
+def _set_setting(ctx: ReplContext, args: list[str], attr: str, label: str, usage: str) -> bool:
+    """Shared handler for simple Config properties validated by their setters. Returns True on change."""
     if not args:
         con.warn(f"Current {label} is {getattr(ctx.cfg, attr)}. Usage: {usage}")
-        return
+        return False
     try:
         setattr(ctx.cfg, attr, args[0])
     except ConfigError as e:
         con.fail(str(e))
-        return
+        return False
     con.ok(f"{label[0].upper()}{label[1:]} set to [bold green]{getattr(ctx.cfg, attr)}[/bold green]")
+    return True
 
 
 def cmd_batch(ctx: ReplContext, args: list[str]) -> None:
-    _set_setting(ctx, args, "batch_size", "batch size", "batch <number>")
+    if _set_setting(ctx, args, "batch_size", "batch size", "batch <number>"):
+        ctx.pipeline.wake_workers()
+        con.dim("Applies to the next batch a worker sends; batches already in flight are unchanged.")
 
 
 def cmd_temp(ctx: ReplContext, args: list[str]) -> None:
@@ -293,18 +325,97 @@ def cmd_book(ctx: ReplContext, args: list[str]) -> None:
         return
     bpath, bname = res
     ctx.cfg.set_book(bpath, bname)
-    ctx.pipeline.tracker.reset()
-    ctx.pipeline.sync_batch_seq()
+    ctx.pipeline.on_book_changed()
     con.ok(f"Switched target novel to [bold green]{escape(bname)}[/bold green]")
+    pending = ctx.pipeline.queue_counts()["pending"]
+    if pending:
+        con.warn(f"{pending} page(s) scraped for the previous book are still pending and will be translated into this book.")
 
 
-def cmd_buffer(ctx: ReplContext, args: list[str]) -> None:
-    with ctx.pipeline.lock:
-        pages = list(ctx.pipeline.buffer)
-    con.info(f"Buffer holds {len(pages)} page(s) (target: {ctx.cfg.batch_size}):")
-    for i, page in enumerate(pages, start=1):
-        label = ctx.pipeline.page_label(page)
-        con.console.print(f"  Page {i}: [bold cyan]{label}[/bold cyan] ({len(page):,} characters)")
+def _print_page_list(entries) -> None:
+    for i, entry in enumerate(entries, start=1):
+        con.console.print(
+            f"  {i:>4}. [bold cyan]{escape(entry.label)}[/bold cyan] "
+            f"[dim]({escape(entry.key)}, {len(entry.content):,} characters)[/dim]"
+        )
+
+
+def cmd_pending(ctx: ReplContext, args: list[str]) -> None:
+    view = ctx.pipeline.pending_view()
+    pending = view["pending"]
+    limit = view["backlog_limit"]
+    cap = f"scraper waits at {limit}" if limit else "no cap while a goal is set"
+    drain = " · [yellow]drain mode[/yellow]" if view["drain"] else ""
+    con.info(f"{len(pending)} page(s) pending (batch size {view['batch_size']}, {cap}){drain}")
+    if pending:
+        con.console.print(f"  Pending: [bold cyan]{escape(describe_entries(pending))}[/bold cyan]")
+        if args and args[0].lower() == "all":
+            _print_page_list(pending)
+    for bid, entries, cancelled in view["in_flight"]:
+        flag = " [yellow](cancelled)[/yellow]" if cancelled else ""
+        con.console.print(f"  In flight #{bid}: {escape(describe_entries(entries))} ({len(entries)} pages){flag}")
+    if view["manual"]:
+        con.console.print(f"  Manual session: {escape(describe_entries(view['manual']))} ({len(view['manual'])} pages)")
+
+
+def _problem_sort_key(item) -> tuple:
+    key, info = item
+    chapter = info.get("chapter")
+    return (0, chapter, "") if isinstance(chapter, int) else (1, 0, key)
+
+
+def _batch_text(batch) -> str:
+    if isinstance(batch, int):
+        return f"#{batch}"
+    return str(batch) if batch else "?"
+
+
+def _when_text(stamp) -> str:
+    if not isinstance(stamp, (int, float)):
+        return "?"
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(stamp))
+
+
+def _problem_rows(missing: dict, failed: dict) -> list[tuple]:
+    rows = []
+    for status, records, style in (("Missing", missing, "yellow"), ("Failed", failed, "red")):
+        for key, info in sorted(records.items(), key=_problem_sort_key):
+            rows.append((
+                f"[{style}]{status}[/{style}]",
+                escape(str(info.get("label") or key)),
+                _batch_text(info.get("batch")),
+                escape(str(info.get("reason") or "")),
+                _when_text(info.get("time")),
+            ))
+    return rows
+
+
+def _chapter_numbers(records: dict) -> list[int]:
+    return [info["chapter"] for info in records.values() if isinstance(info.get("chapter"), int)]
+
+
+def cmd_missing(ctx: ReplContext, args: list[str]) -> None:
+    missing, failed = ctx.pipeline.problems()
+    if not missing and not failed:
+        con.ok("No missing or failed chapters.")
+        return
+    rows = _problem_rows(missing, failed)
+    table = Table(title="Missing & Failed Chapters", border_style="red")
+    for column in ("Status", "Chapter", "Batch", "Reason", "Recorded"):
+        table.add_column(column)
+    for row in rows[:MAX_PROBLEM_ROWS]:
+        table.add_row(*row)
+    con.console.print(table)
+    if len(rows) > MAX_PROBLEM_ROWS:
+        con.dim(f"Showing {MAX_PROBLEM_ROWS} of {len(rows)} rows.")
+    if missing:
+        con.info(f"Missing ({len(missing)}): {escape(format_chapter_ranges(_chapter_numbers(missing)) or 'unnumbered pages only')}")
+    if failed:
+        con.info(f"Failed ({len(failed)}): {escape(format_chapter_ranges(_chapter_numbers(failed)) or 'unnumbered pages only')}")
+    con.info(
+        "Nothing is re-queued automatically. Use [bold cyan]retry missing[/bold cyan], "
+        "[bold cyan]retry failed[/bold cyan] or e.g. [bold cyan]retry 112-115[/bold cyan]."
+    )
 
 
 def cmd_flush(ctx: ReplContext, args: list[str]) -> None:
@@ -316,11 +427,11 @@ def cmd_auto(ctx: ReplContext, args: list[str]) -> None:
         con.warn("Usage: auto <on|off>")
         return
     enabled = args[0].lower() == "on"
-    ctx.pipeline.auto_dispatch = enabled
+    ctx.pipeline.set_auto_dispatch(enabled)
     if enabled:
         con.ok("Auto-dispatch enabled. Batches will be sent to the LLM automatically.")
     else:
-        con.warn("Auto-dispatch paused. Pages will accumulate in the buffer for manual or flush.")
+        con.warn("Auto-dispatch paused. Pages keep collecting in the pending pool for manual or flush.")
 
 
 def cmd_manual(ctx: ReplContext, args: list[str]) -> None:
@@ -349,68 +460,27 @@ def cmd_cancel(ctx: ReplContext, args: list[str]) -> None:
 
 
 def cmd_retry(ctx: ReplContext, args: list[str]) -> None:
-    con.ok(ctx.pipeline.retry_failed())
-
-
-def _find_batch_by_chapter(records: list[dict], target_ch: int) -> dict | None:
-    """Find the latest spooled batch containing target_ch."""
-    matches = [r for r in records if target_ch in r.get("chapter_numbers", [])]
-    return matches[-1] if matches else None
+    """retry -> all failed chapters; retry <chapters|ranges|missing|failed|all> -> those, sent now."""
+    if args:
+        print_report(ctx.pipeline.requeue(args, drain=True))
+        return
+    print_report(ctx.pipeline.retry_failed())
 
 
 def cmd_recover(ctx: ReplContext, args: list[str]) -> None:
+    """recover -> list spools; recover #8 -> batch 8; recover 112-115 -> chapters (no forced send)."""
     if not args:
         print_spooled(ctx)
         return
-    book_dir = ctx.cfg.book_dir
-    if not book_dir:
+    if not ctx.cfg.book_dir:
         con.warn("No book directory selected.")
         return
-
-    query = " ".join(args).strip()
-    records = storage.list_spooled(book_dir)
-
-    target_batch_id = None
-    # Check if user typed a chapter prefix, e.g. 'ch71', 'ch 71', 'chapter 75'
-    ch_match = None
-    import re
-    m = re.search(r'(?:ch(?:apter)?\.?\s*)(\d+)', query, re.IGNORECASE)
-    if m:
-        ch_match = int(m.group(1))
-
-    if ch_match is not None:
-        rec = _find_batch_by_chapter(records, ch_match)
-        if not rec:
-            con.warn(f"No spooled batch found containing Chapter {ch_match}.")
-            return
-        target_batch_id = rec["batch_id"]
-        con.info(f"Located Chapter {ch_match} in Batch [bold cyan]#{target_batch_id}[/bold cyan] ({rec.get('chapters', '')}).")
-    else:
-        # Check if query is an integer
-        clean_query = query.lstrip("#").strip()
-        if clean_query.isdigit():
-            val = int(clean_query)
-            # If a batch with this batch_id exists, use it
-            if any(r["batch_id"] == val for r in records):
-                target_batch_id = val
-            else:
-                # Otherwise see if this integer corresponds to a chapter number in spooled batches
-                rec = _find_batch_by_chapter(records, val)
-                if rec:
-                    target_batch_id = rec["batch_id"]
-                    con.info(f"Batch #{val} not found, but located Chapter {val} in Batch [bold cyan]#{target_batch_id}[/bold cyan] ({rec.get('chapters', '')}).")
-                else:
-                    # Fall back to treating it as batch_id
-                    target_batch_id = val
-        else:
-            con.warn("Usage: recover <batch_id|chapter>  (e.g. recover 8 or recover ch71)")
-            return
-
-    ok, msg = ctx.pipeline.recover_spooled(target_batch_id)
-    if ok:
-        con.ok(msg)
-    else:
-        con.warn(msg)
+    batch_ref = _BATCH_REF_RE.match(" ".join(args).strip())
+    if batch_ref:
+        ok, msg = ctx.pipeline.recover_spooled(int(batch_ref.group(1)))
+        (con.ok if ok else con.warn)(msg)
+        return
+    print_report(ctx.pipeline.requeue(args, drain=False, verb="Recovered"))
 
 
 def cmd_raw(ctx: ReplContext, args: list[str]) -> None:
@@ -436,7 +506,8 @@ HANDLERS = {
     "maxtokens": cmd_maxtokens,
     "jsonmode": cmd_jsonmode,
     "book": cmd_book,
-    "buffer": cmd_buffer,
+    "pending": cmd_pending,
+    "missing": cmd_missing,
     "flush": cmd_flush,
     "auto": cmd_auto,
     "manual": cmd_manual,
@@ -446,7 +517,7 @@ HANDLERS = {
     "recover": cmd_recover,
     "raw": cmd_raw,
 }
-COMMAND_WORDS = tuple(sorted(list(HANDLERS) + ["quit"]))
+COMMAND_WORDS = tuple(sorted(set(HANDLERS) | {"quit", "retranslate", "buffer", "queue"}))
 
 
 def _normalise_command(token: str) -> str:
@@ -501,7 +572,7 @@ def _make_prompt_reader(ctx: ReplContext):
     session = PromptSession(completer=CommandCompleter(COMMAND_WORDS), complete_while_typing=False)
 
     def get_prompt_message():
-        bars = render_bars(ctx.pipeline.tracker.snapshot())
+        bars = render_bars(ctx.pipeline.tracker.snapshot(), queue=ctx.pipeline.queue_counts())
         return [
             ("class:bars", f"\n{bars}\n"),
             ("class:prompt", "booktl> "),

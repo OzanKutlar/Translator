@@ -192,13 +192,6 @@ class ChapterTracker:
                 return False
             return self.current_chapter >= self.goal_chapter
 
-    def translated_goal_reached(self) -> bool:
-        """Check if translated chapters have reached or passed the goal."""
-        with self._lock:
-            if self.goal_chapter is None or self.highest_translated is None:
-                return False
-            return self.highest_translated >= self.goal_chapter
-
     def _progress(self, chapters: set[int]) -> tuple[int, int | None, float | None]:
         """Inclusive count of session chapters in [session_start, goal]."""
         if self.goal_state() != "active":

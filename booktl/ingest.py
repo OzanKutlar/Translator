@@ -5,22 +5,32 @@ from flask import Flask, request, jsonify
 from .pipeline import Pipeline
 
 
+def _read_payload() -> dict:
+    """Parse the JSON body defensively; malformed bodies become an empty dict."""
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
+
+
 def create_ingest_app(pipeline: Pipeline) -> Flask:
     app = Flask("BookIngest")
 
     # Suppress verbose Flask route logs to keep CLI clean
     log = logging.getLogger("werkzeug")
     log.setLevel(logging.ERROR)
+
     @app.route("/book-content", methods=["POST"])
     def book_content():
-        data = request.json or {}
+        data = _read_payload()
         content = data.get("content", "")
-        is_active = bool(data.get("isActive", False))
+        content = content if isinstance(content, str) else ""
         title = data.get("title", "")
+        title = title if isinstance(title, str) else ""
+        is_active = bool(data.get("isActive", False))
 
         if not content.strip():
             return jsonify({"action": "wait", "retryAfter": 3, "message": "Empty content received"}), 400
 
+        # Directive includes 'pending' and 'backlogLimit' (None while a goal is set)
         directive = pipeline.offer_page(content, is_active, title=title)
         return jsonify(directive), 200
 

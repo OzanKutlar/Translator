@@ -26,25 +26,56 @@ python translate.py
 - `python translate.py models` — Prints the models available on your configured endpoint.
 - `python translate.py books` — Lists books in your library directory.
 - `python translate.py check` — Tests endpoint connectivity and runs a lightweight ping completion.
-- `python translate.py retry -b <BookName>` — Re-queues failed translation batches from `_failed/`.
+- `python translate.py retry -b <BookName>` — Re-queues every Failed chapter (and any older `_failed/` batches), waits for them, then exits.
 - `python translate.py prompt -b <BookName>` — Inspects the generated translation prompt.
+
+## How Pages Flow
+
+Every scraped page goes into one **pending pool**. Batches are not formed in advance: a worker cuts a batch from the front of the pool only when it is free to send one, using the batch size set at that moment. Running `batch 5` therefore applies to the very next batch.
+
+- **With a goal**, the scraper keeps going until the goal chapter, then stops. The remaining pending pages are sent, including a final partial batch.
+- **Without a goal**, the scraper is told to wait once **4 × batch size** pages are pending. Pages already in flight don't count toward that limit. Scraping resumes automatically as the pool shrinks.
+
+Partial batches are only sent in *drain mode*, which turns on when the goal is reached, or when you run `flush`, `retry`, or shut down. It turns off by itself once the pool is empty.
+
+### Missing and Failed Chapters
+
+After each reply, the chapters that were sent are compared with the chapters that came back.
+
+- **Missing**: a chapter that was sent but not returned. It is logged, e.g. `Batch #7: ⚠ Missing Chapters 123, 125 (not re-queued …)`.
+- **Failed**: every chapter in a batch that hit an API or JSON error. The batch is also quarantined to `_failed/`.
+
+Neither list is re-queued automatically. Use `missing` to see them, and `retry` to send them again. A chapter leaves both lists once it is translated successfully or re-queued. The lists are stored in `<Book>/_queue_state.json`, so they survive restarts.
+
+Pages with no readable chapter number are keyed as `page:<id>`. They can only be checked for missing by count, and `retry page:<id>` works only during the session that scraped them.
+
 ## Interactive Console Commands
 
 Everything typed into the console is a command, so no `/` prefix is needed (a leading `/` is still accepted). Press Tab to complete command names, and type `help` for the full list:
 - `goal <n|+n|none>` — Set the stop chapter (e.g. `goal 3000`, or `goal +50` for the next 50 chapters).
-- `progress` — Render current scraping and translation progress bars.
-- `status` — View pipeline status, queue depth, session start, goal progress, and metrics.
+- `progress` — Render current scraping and translation progress bars plus the queue line.
+- `status` — View pipeline status, pending/in-flight pages, missing/failed counts, goal progress, and metrics.
 - `model [id]` — Switch model directly or reopen the arrow-key model picker.
 - `endpoint <url>` — Change the target API base URL.
-- `batch <n>` — Adjust batch page size (default: 10).
+- `batch <n>` — Adjust batch page size (default: 10). Applies to the next batch sent.
 - `concurrency <n>` — Adjust active worker threads.
-- `buffer` — List buffered pages with their chapter numbers.
-- `manual` — Copy buffered pages to clipboard for external translation.
-- `paste` — Ingest translated JSON from clipboard.
-- `cancel` — Cancel manual mode or active batch and recover pages to buffer.
-- `flush` — Dispatch any partially filled page buffer immediately.
-- `retry` — Re-dispatch all quarantined failed batches.
+- `pending [all]` — Show pending chapters and in-flight batches (aliases: `buffer`, `queue`).
+- `missing` — Table of Missing and Failed chapters with batch and reason.
+- `retry [chapters]` — Re-queue chapters at the front of the pool and send them now. Ranges include both ends:
+  - `retry 112-115` — Chapters 112, 113, 114 and 115.
+  - `retry 120 130`, `retry ch120` — Individual chapters.
+  - `retry missing`, `retry failed`, `retry all` — Everything on the Missing list, the Failed list, or both.
+  - `retry` — With no argument, re-queues all Failed chapters.
+  - Aliases: `retranslate`, `rt`.
+- `recover [#batch|chapters]` — With no argument, lists spooled batches. `recover #8` loads spooled batch 8. `recover 112-115` puts those chapters at the front of the pool *without* forcing a send, for `manual` or `flush`.
+- `manual` — Copy the next batch of pending pages to clipboard for external translation.
+- `paste` — Ingest translated JSON from clipboard (missing chapters are detected here too).
+- `cancel` — Cancel manual mode or in-flight batches; their pages return to the front of the pool.
+- `flush` — Send all pending pages now, including a partial batch.
+- `auto <on|off>` — Pause or resume automatic sending.
 - `quit` — Gracefully drain and shut down workers.
+
+`retry` and `recover` find source pages in this order: in-flight batches, `_raw/chapters/`, older `_raw/batch_XXXX_pages.json` spools (newest first), then `_failed/` records. Chapters with no source are reported, not silently skipped.
 
 ### Goal progress
 
@@ -54,7 +85,15 @@ Progress bars count from the first chapter the scraper sends after the program s
 
 ### Logs
 
-Each finished batch logs one chapter summary, such as `Batch #4: Saved 10 chapters (Chapters 10–19)`, and one character summary, such as `Modified 2 characters, added 1 character, associated 3 characters`.
+Each finished batch logs one chapter summary, such as `Batch #4: Saved 10 chapters (Chapters 10–19)`, and one character summary, such as `Modified 2 characters, added 1 character, associated 3 characters`. If the reply left chapters out, one extra line lists them as Missing.
+
+### Files Written per Book
+
+- `_raw/chapters/ch_000120.txt` — Latest raw page for each scraped chapter (source for `retry`).
+- `_raw/batch_XXXX_pages.json` — Pages of every batch sent, written before the API call.
+- `_raw/unsent_*.json` — Pending pages that were never sent when the program exited.
+- `_failed/` — Quarantined failed batches with the model reply and error.
+- `_queue_state.json` — Missing and Failed chapter lists.
 
 ### Arc / Volume Tracking
 

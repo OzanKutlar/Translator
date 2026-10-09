@@ -9,6 +9,8 @@ from .parsing import parse_chapter_number, format_chapter_ranges
 
 RAW_DIRNAME = "_raw"
 FAILED_DIRNAME = "_failed"
+CHAPTER_PAGES_DIRNAME = "chapters"   # _raw/chapters/ch_000120.txt: latest raw page per chapter
+QUEUE_STATE_FILENAME = "_queue_state.json"
 
 
 def sanitize_filename(name: str) -> str:
@@ -71,20 +73,30 @@ def save_raw_reply(book_dir: str, batch_id: int, reply_text: str) -> str:
     return filepath
 
 
-def quarantine_failure(book_dir: str, batch_id: int, pages: list[str], reply_text: str, error: str) -> str:
-    """Quarantine unparseable or failed batches to _failed/ for subsequent retries."""
+def quarantine_failure(book_dir: str, batch_id: int, pages: list[str], reply_text: str, error: str,
+                       chapters: list | None = None) -> str:
+    """Quarantine unparseable or failed batches to _failed/ for subsequent retries.
+
+    Records written with ``chapters`` are marked "tracked": their chapters are listed as
+    Failed in the queue state and 'retry' re-queues them per chapter. Records without
+    the flag (older versions) are re-queued page by page.
+    """
     failed_dir = os.path.join(book_dir, FAILED_DIRNAME)
     os.makedirs(failed_dir, exist_ok=True)
     filename = f"failed_{int(time.time())}_batch_{batch_id:04d}.json"
     filepath = os.path.join(failed_dir, filename)
+    record = {
+        "batch_id": batch_id,
+        "timestamp": time.time(),
+        "error": error,
+        "pages": pages,
+        "reply": reply_text,
+    }
+    if chapters is not None:
+        record["tracked"] = True
+        record["chapters"] = [c for c in chapters if isinstance(c, int)]
     with open(filepath, "w", encoding="utf-8") as f:
-        json.dump({
-            "batch_id": batch_id,
-            "timestamp": time.time(),
-            "error": error,
-            "pages": pages,
-            "reply": reply_text
-        }, f, ensure_ascii=False, indent=2)
+        json.dump(record, f, ensure_ascii=False, indent=2)
     return filepath
 
 
@@ -211,3 +223,152 @@ def remove_failed_matching(book_dir: str, batch_id: int, pages: list[str]) -> in
             remove_failed(rec["_filepath"])
             removed += 1
     return removed
+
+
+# ----------------------------------------------------------------------
+# Per-chapter raw page store and source lookup
+# ----------------------------------------------------------------------
+
+def _write_text_atomic(path: str, text: str) -> None:
+    """Write via a temp file and rename so a crash never leaves a half-written file."""
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def _require_chapter(chapter) -> None:
+    if isinstance(chapter, bool) or not isinstance(chapter, int) or chapter <= 0:
+        raise ValueError(f"Invalid chapter number: {chapter!r}")
+
+
+def _chapter_page_path(book_dir: str, chapter: int) -> str:
+    return os.path.join(book_dir, RAW_DIRNAME, CHAPTER_PAGES_DIRNAME, f"ch_{chapter:06d}.txt")
+
+
+def save_scraped_page(book_dir: str, chapter: int, content: str) -> str:
+    """Store the latest raw page for a chapter in _raw/chapters/. Raises OSError/ValueError."""
+    if not book_dir:
+        raise ValueError("No book directory selected")
+    _require_chapter(chapter)
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("Page content is empty")
+    path = _chapter_page_path(book_dir, chapter)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _write_text_atomic(path, content)
+    return path
+
+
+def load_scraped_page(book_dir: str, chapter: int) -> str | None:
+    """Return the stored raw page for a chapter, or None if none was saved. Raises OSError on read errors."""
+    _require_chapter(chapter)
+    path = _chapter_page_path(book_dir, chapter)
+    if not os.path.isfile(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _match_pages(pages, wanted: set[int], found: dict, source: str) -> None:
+    for page in pages:
+        if not isinstance(page, str):
+            continue
+        chapter = parse_chapter_number(page)
+        if chapter in wanted and chapter not in found:
+            found[chapter] = (page, source)
+
+
+def _find_in_chapter_store(book_dir: str, wanted: set[int], found: dict, warnings: list[str]) -> None:
+    for chapter in sorted(wanted):
+        try:
+            page = load_scraped_page(book_dir, chapter)
+        except (OSError, ValueError) as e:
+            warnings.append(f"Could not read stored page for Chapter {chapter}: {e}")
+            continue
+        if page:
+            found[chapter] = (page, f"{RAW_DIRNAME}/{CHAPTER_PAGES_DIRNAME}")
+
+
+def _find_in_spools(book_dir: str, wanted: set[int], found: dict, warnings: list[str]) -> None:
+    try:
+        spools = _spooled_ids(book_dir)
+    except OSError as e:
+        warnings.append(f"Could not list {RAW_DIRNAME}/: {e}")
+        return
+    for batch_id, path in reversed(spools):
+        if not (wanted - found.keys()):
+            return
+        data, err = _read_spool(path)
+        if err:
+            warnings.append(err)
+            continue
+        _match_pages(data["pages"], wanted, found, f"{RAW_DIRNAME}/batch_{batch_id:04d}")
+
+
+def _find_in_failed(book_dir: str, wanted: set[int], found: dict, warnings: list[str]) -> None:
+    try:
+        records = list_failed(book_dir)
+    except OSError as e:
+        warnings.append(f"Could not list {FAILED_DIRNAME}/: {e}")
+        return
+    for rec in reversed(records):
+        if not (wanted - found.keys()):
+            return
+        pages = rec.get("pages") if isinstance(rec.get("pages"), list) else []
+        _match_pages(pages, wanted, found, f"{FAILED_DIRNAME}/{os.path.basename(rec['_filepath'])}")
+
+
+def find_chapter_pages(book_dir: str, chapters) -> tuple[dict[int, tuple[str, str]], list[str]]:
+    """Locate raw pages for chapters.
+
+    Search order: _raw/chapters/, spooled batches (newest first), then _failed/ records.
+    Returns ({chapter: (content, source)}, warnings).
+    """
+    wanted = {c for c in (chapters or []) if isinstance(c, int) and not isinstance(c, bool) and c > 0}
+    found: dict[int, tuple[str, str]] = {}
+    warnings: list[str] = []
+    if not book_dir or not wanted:
+        return found, warnings
+    _find_in_chapter_store(book_dir, wanted, found, warnings)
+    if wanted - found.keys():
+        _find_in_spools(book_dir, wanted, found, warnings)
+    if wanted - found.keys():
+        _find_in_failed(book_dir, wanted, found, warnings)
+    return found, warnings
+
+
+# ----------------------------------------------------------------------
+# Missing/Failed queue state
+# ----------------------------------------------------------------------
+
+def _queue_state_path(book_dir: str) -> str:
+    return os.path.join(book_dir, QUEUE_STATE_FILENAME)
+
+
+def load_queue_state(book_dir: str) -> tuple[dict, str | None]:
+    """Read <Book>/_queue_state.json. Returns (state, error_message); state is {} when absent."""
+    if not book_dir:
+        return {}, None
+    path = _queue_state_path(book_dir)
+    if not os.path.isfile(path):
+        return {}, None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        return {}, f"Could not read {QUEUE_STATE_FILENAME}: {e}"
+    if not isinstance(data, dict):
+        return {}, f"{QUEUE_STATE_FILENAME} has an unexpected structure; ignoring it."
+    return data, None
+
+
+def save_queue_state(book_dir: str, state: dict) -> str:
+    """Atomically write <Book>/_queue_state.json. Raises OSError/ValueError/TypeError."""
+    if not book_dir:
+        raise ValueError("No book directory selected")
+    if not isinstance(state, dict):
+        raise TypeError("Queue state must be a dict")
+    os.makedirs(book_dir, exist_ok=True)
+    path = _queue_state_path(book_dir)
+    _write_text_atomic(path, json.dumps(state, ensure_ascii=False, indent=2))
+    return path

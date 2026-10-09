@@ -12,8 +12,10 @@ from booktl.library import select_book, ensure_book, discover_books
 from booktl.client import ApiClient
 from booktl.pipeline import Pipeline
 from booktl.ingest import create_ingest_app
-from booktl.commands import ReplContext, run_repl
+from booktl.commands import ReplContext, run_repl, print_report
 from booktl.prompts import build_messages
+
+RETRY_DRAIN_TIMEOUT = 6 * 3600  # seconds the 'retry' subcommand waits for re-queued chapters
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -169,13 +171,19 @@ def main():
 
     if sub == "retry":
         con.rule("Batch Reprocessing")
-        msg = pipeline.retry_failed()
-        con.ok(msg)
-        con.info("Draining queue...")
-        while pipeline.work_q.qsize() > 0 or len(pipeline._active) > 0:
-            time.sleep(1.0)
-        pipeline.shutdown()
-        con.ok("Retry complete.")
+        print_report(pipeline.retry_failed())
+        con.info("Waiting for re-queued chapters to finish... (Ctrl+C to stop waiting)")
+        try:
+            finished = pipeline.wait_until_idle(RETRY_DRAIN_TIMEOUT)
+        except KeyboardInterrupt:
+            finished = False
+            con.warn("Stopped waiting at user request.")
+        pipeline.shutdown(drain=False)
+        stats = pipeline.stats()
+        if finished:
+            con.ok(f"Retry complete. Missing chapters: {stats['missing']}, failed chapters: {stats['failed']}.")
+        else:
+            con.warn("Retry did not finish; unsent pending pages were saved to _raw/.")
         return
 
     # 4. Flask Ingest Server
@@ -206,6 +214,8 @@ def main():
             f"Total Chapters Saved: [bold green]{cnt['chapters_saved']}[/bold green]\n"
             f"Pages Processed: {cnt['pages_seen']}\n"
             f"Failed Batches: {cnt['failures']}\n"
+            f"Missing Chapters: {stats['missing']}\n"
+            f"Failed Chapters: {stats['failed']}\n"
             f"Reported Tokens: {cnt['tokens']:,}",
             title="Session Summary",
             style="blue"
