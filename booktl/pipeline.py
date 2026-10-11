@@ -14,7 +14,7 @@ import time
 from rich.markup import escape
 
 from . import console as con
-from . import arcs, prompts, parsing, storage, characters
+from . import arcs, prompts, parsing, storage, characters, glossary
 from .tracker import ChapterTracker
 from .client import ApiClient, ApiError
 from .workpool import PageEntry, PendingPool, entry_sort_key, parse_selection
@@ -349,14 +349,14 @@ class Pipeline:
         if not text or not text.strip():
             return "Provided payload is empty."
 
-        chapters, char_actions, arc_ends, err = parsing.parse_reply(text)
-        if err:
-            return f"Parse error: {escape(err)}. Please copy the entire JSON object and run paste again."
+        reply = parsing.parse_reply(text)
+        if reply.error:
+            return f"Parse error: {escape(reply.error)}. Please copy the entire JSON object and run paste again."
         if not self.cfg.book_dir:
             return "No target book folder selected."
 
-        chapters = chapters or []
-        numbers = self._save_results("Manual paste", chapters, char_actions, arc_ends)
+        chapters = reply.chapters or []
+        numbers = self._save_results("Manual paste", chapters, reply)
         with self.lock:
             entries = self.manual_entries if self.manual_active else None
             self.manual_active = False
@@ -364,6 +364,7 @@ class Pipeline:
             self.pool.notify()
         if entries:
             self._reconcile("Manual paste", "manual", entries, chapters, numbers)
+            self._check_term_drift("Manual paste", entries, chapters)
             return "Manual session closed."
         self._resolve_returned(numbers)
         return "Pasted translation processed."
@@ -726,16 +727,17 @@ class Pipeline:
             con.warn(f"Batch #{batch_id} finished after cancellation — reply discarded (pages are already back in the pending pool).")
             return
 
-        chapters, char_actions, arc_ends, err = parsing.parse_reply(raw_reply)
-        if err:
-            self._handle_batch_failure(batch_id, entries, raw_reply, f"JSON error: {err}")
+        reply = parsing.parse_reply(raw_reply)
+        if reply.error:
+            self._handle_batch_failure(batch_id, entries, raw_reply, f"JSON error: {reply.error}")
             return
-        if not chapters:
+        if not reply.chapters:
             self._handle_batch_failure(batch_id, entries, raw_reply, "Reply contained no chapters")
             return
         label = f"Batch #{batch_id}"
-        numbers = self._save_results(label, chapters, char_actions, arc_ends)
-        self._reconcile(label, batch_id, entries, chapters, numbers)
+        numbers = self._save_results(label, reply.chapters, reply)
+        self._reconcile(label, batch_id, entries, reply.chapters, numbers)
+        self._check_term_drift(label, entries, reply.chapters)
 
     def _save_raw_reply(self, batch_id: int, raw_reply: str) -> None:
         if not self.cfg.save_raw:
@@ -785,11 +787,12 @@ class Pipeline:
     # Results
     # ------------------------------------------------------------------
 
-    def _save_results(self, label: str, chapters: list, char_actions: list, arc_ends: list) -> list[int]:
-        """Store chapters, apply character and arc updates. Returns translated chapter numbers."""
+    def _save_results(self, label: str, chapters: list, reply: parsing.ParsedReply) -> list[int]:
+        """Store chapters, apply character, term and arc updates. Returns translated chapter numbers."""
         numbers = self._store_chapters(label, chapters)
-        self._apply_character_actions(label, char_actions)
-        self._apply_arc_ends(label, arc_ends, chapters)
+        self._apply_character_actions(label, reply.character_actions)
+        self._apply_term_actions(label, reply.term_actions, numbers)
+        self._apply_arc_ends(label, reply.arc_ends, chapters)
         return numbers
 
     def _reconcile(self, label: str, batch_ref, entries: list[PageEntry], chapters: list, numbers: list[int]) -> None:
@@ -902,6 +905,69 @@ class Pipeline:
         line = characters.format_summary(summary)
         if line:
             con.ok(f"{label}: {escape(line)}")
+
+    def _apply_term_actions(self, label: str, term_actions: list, numbers: list[int]) -> None:
+        """Register new glossary terms; a different rendering for a locked term is only logged."""
+        if not term_actions:
+            return
+        first = min(numbers) if numbers else None
+        try:
+            summary = glossary.record_term_actions(self.cfg.book_dir, term_actions, first)
+        except (OSError, ValueError, TypeError) as e:
+            con.fail(f"{label}: glossary update failed: {escape(str(e))}")
+            return
+        self._log_term_summary(label, summary)
+
+    @staticmethod
+    def _log_term_summary(label: str, summary: dict) -> None:
+        """Conflicts and failures get one line each; everything else one summary line."""
+        for ev in summary.get("conflicts", []):
+            con.warn(
+                f"{label}: ⚠ Term conflict: {escape(ev['chinese'])} is locked as “{escape(ev['current'])}” "
+                f"but the model suggested “{escape(ev['suggested'])}”; kept “{escape(ev['current'])}”"
+            )
+        for reason in summary.get("skipped", [])[:MAX_REPORTED_WARNINGS]:
+            con.dim(f"{label}: term action skipped: {escape(reason)}")
+        for err in summary.get("failed", []):
+            con.fail(f"{label}: glossary update failed: {escape(err)}")
+        line = glossary.format_summary(summary)
+        if line:
+            con.ok(f"{label}: {escape(line)}")
+
+    def _check_term_drift(self, label: str, entries: list[PageEntry], chapters: list) -> None:
+        """Warn when a raw page contains a locked term but its translation lacks the English rendering."""
+        try:
+            drift = self._find_term_drift(entries, chapters)
+        except Exception as e:  # a checker bug must never fail a batch that is already saved
+            con.warn(f"{label}: term drift check failed: {escape(str(e))}")
+            return
+        for ev in drift[:MAX_REPORTED_WARNINGS]:
+            con.warn(
+                f"{label}: ⚠ Term drift in {escape(ev['label'])}: expected “{escape(ev['english'])}” "
+                f"for {escape(ev['forms'])}, not found in the translation"
+            )
+        if len(drift) > MAX_REPORTED_WARNINGS:
+            con.warn(f"{label}: ... and {len(drift) - MAX_REPORTED_WARNINGS} more term drift warning(s).")
+
+    def _find_term_drift(self, entries: list[PageEntry], chapters: list) -> list[dict]:
+        translated = self._translated_by_number(chapters)
+        pairs = [(e.label, e.content, translated[e.chapter]) for e in entries if e.chapter in translated]
+        if not pairs:
+            return []
+        return glossary.check_term_usage(glossary.load_terms(self.cfg.book_dir), pairs)
+
+    @staticmethod
+    def _translated_by_number(chapters: list) -> dict[int, str]:
+        """Translated chapter content keyed by chapter number."""
+        result = {}
+        for entry in chapters or []:
+            if not _is_saveable(entry):
+                continue
+            num = parsing.parse_chapter_number(str(entry["chapterNo"]))
+            content = entry.get("content")
+            if num is not None and isinstance(content, str):
+                result[num] = content
+        return result
 
     # ------------------------------------------------------------------
     # Introspection

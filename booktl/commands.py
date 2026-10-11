@@ -7,6 +7,7 @@ from rich.markup import escape
 from rich.table import Table
 
 from . import console as con
+from . import glossary
 from . import storage
 from .client import ApiClient
 from .config import Config, ConfigError
@@ -29,9 +30,15 @@ except ImportError:
 # The console runs until the user quits; this bound only guards against a runaway loop.
 MAX_REPL_ITERATIONS = 10_000_000
 MAX_PROBLEM_ROWS = 200
+MAX_TERM_ROWS = 300
+TERM_USAGE = (
+    "Usage: term add <chinese> = <english> [type:<type>] · "
+    "term alias <chinese> = <term> · term rm <chinese>"
+)
 ALIASES = {
     "exit": "quit", "q": "quit", "?": "help", "setpage": "batch",
     "buffer": "pending", "queue": "pending", "retranslate": "retry", "rt": "retry",
+    "glossary": "terms",
 }
 _BATCH_REF_RE = re.compile(r"^(?:#|b(?:atch)?\s*#?)\s*(\d+)$", re.IGNORECASE)
 
@@ -52,6 +59,10 @@ HELP_ROWS = (
     ("missing", "List chapters left out of replies and chapters from failed batches. They are never re-queued automatically."),
     ("retry [chapters]", "Re-queue and send chapters now: retry 112-115, retry 120 130, retry missing, retry failed, retry all. No argument re-queues all failed chapters (aliases: retranslate, rt)."),
     ("recover [#batch|chapters]", "No argument lists spooled batches. 'recover #8' loads batch 8; 'recover 112-115' loads chapters to the front of the pool without forcing a send."),
+    ("terms [search]", "Show the glossary of locked terms (titles, skills, debuffs, items, places...), optionally filtered (alias: glossary)."),
+    ("term add <chinese> = <english> [type:<type>]", "Add or override a term and lock it as yours; the model never changes your terms."),
+    ("term alias <chinese> = <term>", "Make another Chinese spelling render like an existing term (named by its Chinese or English)."),
+    ("term rm <chinese>", "Remove a term together with its aliases, or remove a single alias."),
     ("flush", "Send all pending pages now, including a final partial batch."),
     ("auto <on|off>", "Toggle auto-dispatching (turn off to keep pages pending for manual)."),
     ("manual", "Copy the next batch of pending pages to the clipboard for external translation."),
@@ -483,6 +494,98 @@ def cmd_recover(ctx: ReplContext, args: list[str]) -> None:
     print_report(ctx.pipeline.requeue(args, drain=False, verb="Recovered"))
 
 
+def _term_table(rows: list[dict], title: str) -> Table:
+    table = Table(title=title, border_style="magenta")
+    for column in ("Chinese", "English", "Type", "Aliases", "Refers To", "Source", "First Ch."):
+        table.add_column(column)
+    for row in rows[:MAX_TERM_ROWS]:
+        first = row.get("firstChapter")
+        table.add_row(
+            escape(row["chinese"]),
+            f"[bold green]{escape(row['english'])}[/bold green]",
+            escape(row["type"]),
+            escape(", ".join(row["aliases"])),
+            escape(row["refersTo"]),
+            escape(row["source"]),
+            str(first) if first else "",
+        )
+    return table
+
+
+def cmd_terms(ctx: ReplContext, args: list[str]) -> None:
+    """terms [search] -> glossary table, optionally filtered."""
+    if not ctx.cfg.book_dir:
+        con.warn("No book directory selected.")
+        return
+    query = " ".join(args).strip()
+    rows, err = glossary.search_terms(ctx.cfg.book_dir, query)
+    if err:
+        con.fail(escape(err))
+        return
+    if not rows:
+        if query:
+            con.info(f"No glossary terms match '{escape(query)}'.")
+        else:
+            con.info("The glossary is empty. Terms are added as the model meets them, or with 'term add'.")
+        return
+    suffix = f" matching '{query}'" if query else ""
+    con.console.print(_term_table(rows, escape(f"Glossary: {len(rows)} term(s){suffix}")))
+    if len(rows) > MAX_TERM_ROWS:
+        con.dim(f"Showing {MAX_TERM_ROWS} of {len(rows)} terms. Narrow it down with 'terms <search>'.")
+
+
+def _split_assignment(args: list[str]) -> tuple[str, str] | None:
+    """'小丑 = Joker' -> ('小丑', 'Joker'); None when either side is missing."""
+    left, sep, right = " ".join(args).partition("=")
+    left, right = left.strip(), right.strip()
+    if not sep or not left or not right:
+        return None
+    return left, right
+
+
+def _term_add(book_dir: str, args: list[str]) -> tuple[bool, str]:
+    pair = _split_assignment(args)
+    if pair is None:
+        return False, TERM_USAGE
+    chinese, english = pair
+    words = english.split()
+    term_type = None
+    if len(words) > 1 and words[-1].lower().startswith("type:"):
+        term_type, english = words[-1][5:], " ".join(words[:-1])
+    return glossary.add_user_term(book_dir, chinese, english, term_type)
+
+
+def _term_alias(book_dir: str, args: list[str]) -> tuple[bool, str]:
+    pair = _split_assignment(args)
+    if pair is None:
+        return False, TERM_USAGE
+    return glossary.add_user_alias(book_dir, pair[0], pair[1])
+
+
+def _term_remove(book_dir: str, args: list[str]) -> tuple[bool, str]:
+    return glossary.remove_term(book_dir, " ".join(args).strip())
+
+
+_TERM_SUBCOMMANDS = {
+    "add": _term_add, "set": _term_add,
+    "alias": _term_alias, "link": _term_alias,
+    "rm": _term_remove, "remove": _term_remove, "del": _term_remove, "delete": _term_remove,
+}
+
+
+def cmd_term(ctx: ReplContext, args: list[str]) -> None:
+    """term add|alias|rm -> edit the glossary by hand; your entries are never changed by the model."""
+    if not ctx.cfg.book_dir:
+        con.warn("No book directory selected.")
+        return
+    handler = _TERM_SUBCOMMANDS.get(args[0].lower()) if args else None
+    if handler is None:
+        con.warn(escape(TERM_USAGE))
+        return
+    ok, msg = handler(ctx.cfg.book_dir, args[1:])
+    (con.ok if ok else con.warn)(escape(msg))
+
+
 def cmd_raw(ctx: ReplContext, args: list[str]) -> None:
     if not args or args[0].lower() not in ("on", "off"):
         con.warn(f"Saving raw replies is currently {'on' if ctx.cfg.save_raw else 'off'}. Usage: raw <on|off>")
@@ -516,8 +619,10 @@ HANDLERS = {
     "retry": cmd_retry,
     "recover": cmd_recover,
     "raw": cmd_raw,
+    "terms": cmd_terms,
+    "term": cmd_term,
 }
-COMMAND_WORDS = tuple(sorted(set(HANDLERS) | {"quit", "retranslate", "buffer", "queue"}))
+COMMAND_WORDS = tuple(sorted(set(HANDLERS) | {"quit", "retranslate", "buffer", "queue", "glossary"}))
 
 
 def _normalise_command(token: str) -> str:

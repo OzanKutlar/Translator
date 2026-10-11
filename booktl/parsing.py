@@ -1,6 +1,7 @@
 """JSON repair and response parsing helpers."""
 import json
 import re
+from dataclasses import dataclass, field
 
 _CHINESE_DIGITS = {
     "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3,
@@ -120,6 +121,7 @@ _VALID_JSON_KEYS = [
     "action", "Chinese", "English", "Description",
     "ModType", "Content", "Find", "Replace",
     "arcEnds", "endType", "arcName", "isAfterword",
+    "termActions", "Type", "RefersTo", "Note", "Aliases",
 ]
 
 
@@ -214,21 +216,36 @@ def _list_field(parsed: dict, key: str) -> list:
     return value if isinstance(value, list) else []
 
 
-def parse_reply(raw_response: str) -> tuple[list | None, list, list, str | None]:
-    """Parse the LLM JSON response including arc endings.
+@dataclass
+class ParsedReply:
+    """Decoded model reply. chapters is None when the reply could not be used (see error)."""
 
-    Returns (chapters, character_actions, arc_ends, error_message). Missing
-    "characterActions" or "arcEnds" keys become empty lists, so older replies still parse.
-    parse_response() above keeps its 3-tuple shape for any existing callers.
+    chapters: list | None
+    character_actions: list = field(default_factory=list)
+    arc_ends: list = field(default_factory=list)
+    term_actions: list = field(default_factory=list)
+    error: str | None = None
+
+
+def parse_reply(raw_response: str) -> ParsedReply:
+    """Parse the LLM JSON response including arc endings and term actions.
+
+    Missing "characterActions", "arcEnds" or "termActions" keys become empty lists, so older
+    replies still parse. parse_response() above keeps its 3-tuple shape for any existing callers.
     """
     parsed, err = _load_payload(raw_response)
     if err:
-        return None, [], [], err
+        return ParsedReply(None, error=err)
     if isinstance(parsed, list):
-        return parsed, [], [], None
+        return ParsedReply(parsed)
     if not isinstance(parsed, dict):
-        return None, [], [], "Unexpected JSON top-level structure (expected object or array)"
+        return ParsedReply(None, error="Unexpected JSON top-level structure (expected object or array)")
     chapters = parsed.get("chapters", [])
     if not isinstance(chapters, list):
-        return None, [], [], "'chapters' key must be a JSON array"
-    return chapters, _list_field(parsed, "characterActions"), _list_field(parsed, "arcEnds"), None
+        return ParsedReply(None, error="'chapters' key must be a JSON array")
+    return ParsedReply(
+        chapters,
+        character_actions=_list_field(parsed, "characterActions"),
+        arc_ends=_list_field(parsed, "arcEnds"),
+        term_actions=_list_field(parsed, "termActions"),
+    )

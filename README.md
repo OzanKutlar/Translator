@@ -71,6 +71,10 @@ Everything typed into the console is a command, so no `/` prefix is needed (a le
 - `manual` — Copy the next batch of pending pages to clipboard for external translation.
 - `paste` — Ingest translated JSON from clipboard (missing chapters are detected here too).
 - `cancel` — Cancel manual mode or in-flight batches; their pages return to the front of the pool.
+- `terms [search]` — Table of glossary terms, optionally filtered (alias: `glossary`).
+- `term add <chinese> = <english> [type:<type>]` — Add or override a term and lock it as yours, e.g. `term add 秃鹫尊者 = Venerable Vulture type:title`.
+- `term alias <chinese> = <term>` — Make another Chinese spelling render like an existing term (named by its Chinese or English).
+- `term rm <chinese>` — Remove a term together with its aliases, or a single alias.
 - `flush` — Send all pending pages now, including a partial batch.
 - `auto <on|off>` — Pause or resume automatic sending.
 - `quit` — Gracefully drain and shut down workers.
@@ -94,6 +98,25 @@ Each finished batch logs one chapter summary, such as `Batch #4: Saved 10 chapte
 - `_raw/unsent_*.json` — Pending pages that were never sent when the program exited.
 - `_failed/` — Quarantined failed batches with the model reply and error.
 - `_queue_state.json` — Missing and Failed chapter lists.
+- `Glossary.json` — Locked term renderings (see below).
+
+### Glossary / Locked Terms
+
+Character files keep people's names consistent. Everything else that must stay the same across the book lives in `<Book>/Glossary.json`: titles and nicknames (秃鹫尊者 → "Venerable Vulture"), skills, buffs and debuffs, items, places, organizations and ranks.
+
+    {
+      "version": 1,
+      "terms": {
+        "小丑印记": { "en": "Joker's Mark", "type": "status", "aliases": ["小丑标记"], "refersTo": "", "note": "debuff", "source": "user", "firstChapter": 1040 }
+      }
+    }
+
+- Before each batch, every term whose Chinese text or one of its `aliases` appears in the pages is sent to the model as **LOCKED TERMS**, which it must use exactly. Longer spellings are matched first, so 小丑印记 wins over 小丑.
+- The model registers new terms with `AddTerm` and links other spellings with `AliasTerm`. If it adds a new spelling with an English rendering that already exists, the spelling becomes an alias of that term.
+- The model can never change an existing term. A different rendering is logged as `⚠ Term conflict … kept “Joker's Mark”`.
+- Terms you add with `term add` are marked `"source": "user"`. The model never edits them, not even to add an alias; it logs a hint instead.
+- After each reply, every chapter whose raw page contains a locked term is checked for that term's English. If it is missing, a `⚠ Term drift` warning names the chapter; use `retry <chapter>` if the translation really drifted. Text the model skips (site headers, recommendations) can occasionally cause a false warning.
+- Chinese keys and aliases must be 2–40 characters; one-character keys would match almost every page.
 
 ### Arc / Volume Tracking
 

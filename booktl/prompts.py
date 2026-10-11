@@ -1,6 +1,6 @@
 """System prompt definitions and message building logic."""
 
-from . import arcs, characters
+from . import arcs, characters, glossary
 
 SYSTEM_PROMPT = (
     "You are a professional Chinese to English translator working for a book translation company. "
@@ -86,12 +86,36 @@ SYSTEM_PROMPT = (
     "  {\"chapterNo\": \"Chapter 2001\", \"endType\": \"volume\", "
     "\"arcName\": \"Volume 1: Above the Ruins\", \"isAfterword\": true}\n\n"
 
+    "=== GLOSSARY / LOCKED TERMS ===\n"
+    "Besides people's names, every recurring proper noun or coined term must stay identical across the whole book: "
+    "titles, nicknames and epithets (e.g. 秃鹫尊者), skills and techniques, buffs and debuffs, items and artifacts, "
+    "places, sects and organizations, ranks and cultivation realms, currencies.\n"
+    "If a LOCKED TERMS section is provided, use exactly the English listed there for each term, every time, "
+    "including inside longer phrases, even if another rendering seems more natural. Never re-translate a locked term, "
+    "and never AddTerm a term that is already locked.\n"
+    "When you choose an English rendering for such a term that is NOT locked yet, register it in the "
+    "\"termActions\" list so later chapters reuse it. Do not register ordinary vocabulary, and do not register "
+    "a person's real name (people belong in characterActions). A person's nickname or title IS a term.\n\n"
+
+    "Available term actions:\n"
+    "  1. AddTerm — Register a new term.\n"
+    "     Fields: action, Chinese (the exact Chinese text), English (your rendering), "
+    "Type (one of: title, skill, item, status, place, organization, rank, other), "
+    "RefersTo (for a title or nickname: the English name of the person, otherwise \"\"), "
+    "Note (optional short note, e.g. \"debuff\"), "
+    "Aliases (optional list of other Chinese spellings of the same term).\n"
+    "  2. AliasTerm — Make a different Chinese spelling use an existing term's English.\n"
+    "     Fields: action, Chinese (the other spelling), English (the existing term's exact English).\n\n"
+
+    "If no term actions are needed, return an empty list for \"termActions\".\n\n"
+
     "RESPONSE FORMAT - you must respond with ONLY a valid JSON object. "
     "No preamble, no explanation, no markdown code fences, nothing else.\n"
-    "The object must have exactly three keys:\n"
+    "The object must have exactly four keys:\n"
     "  \"chapters\"         : an array of chapter objects\n"
     "  \"characterActions\" : an array of action objects (or empty list)\n"
-    "  \"arcEnds\"          : an array of arc/volume ending objects (almost always an empty list)\n\n"
+    "  \"arcEnds\"          : an array of arc/volume ending objects (almost always an empty list)\n"
+    "  \"termActions\"      : an array of term action objects (or empty list)\n\n"
 
     "Each chapter object must have exactly these two fields:\n"
     "  \"chapterNo\" : the chapter identifier string  (e.g. \"Chapter 1615\")\n"
@@ -122,28 +146,52 @@ SYSTEM_PROMPT = (
     "      \"English\": \"Li Yao\"\n"
     "    }\n"
     "  ],\n"
-    "  \"arcEnds\": []\n"
+    "  \"arcEnds\": [],\n"
+    "  \"termActions\": [\n"
+    "    {\n"
+    "      \"action\": \"AddTerm\",\n"
+    "      \"Chinese\": \"秃鹫尊者\",\n"
+    "      \"English\": \"Venerable Vulture\",\n"
+    "      \"Type\": \"title\",\n"
+    "      \"RefersTo\": \"Li Yao\",\n"
+    "      \"Note\": \"\",\n"
+    "      \"Aliases\": []\n"
+    "    },\n"
+    "    {\n"
+    "      \"action\": \"AliasTerm\",\n"
+    "      \"Chinese\": \"秃鹫老祖\",\n"
+    "      \"English\": \"Venerable Vulture\"\n"
+    "    }\n"
+    "  ]\n"
     "}"
 )
+
+
+def _context_blocks(book_dir: str, pages_text: str) -> list[str]:
+    """Book-specific context for one batch: characters, locked terms and recorded arc endings."""
+    if not book_dir:
+        return []
+    blocks = []
+    all_chars = characters.get_all_characters_summary(book_dir)
+    if all_chars:
+        blocks.append(f"=== ALL KNOWN CHARACTERS ===\n{all_chars}\n=== END ALL KNOWN CHARACTERS ===")
+    detected = characters.get_character_context(book_dir, pages_text)
+    if detected:
+        blocks.append(f"=== DETECTED CHARACTER CONTEXT ===\n{detected}\n=== END DETECTED CHARACTER CONTEXT ===")
+    locked = glossary.get_term_context(glossary.match_terms(book_dir, pages_text))
+    if locked:
+        blocks.append(f"=== LOCKED TERMS ===\n{locked}\n=== END LOCKED TERMS ===")
+    recorded_arcs = arcs.get_arcs_summary(book_dir)
+    if recorded_arcs:
+        blocks.append(f"=== RECORDED ARC/VOLUME ENDINGS ===\n{recorded_arcs}\n=== END RECORDED ARC/VOLUME ENDINGS ===")
+    return blocks
 
 
 def build_messages(book_dir: str, pages_text: str) -> list[dict]:
     """Construct clean OpenAI-style role messages."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    context_blocks = []
-    if book_dir:
-        all_chars = characters.get_all_characters_summary(book_dir)
-        if all_chars:
-            context_blocks.append(f"=== ALL KNOWN CHARACTERS ===\n{all_chars}\n=== END ALL KNOWN CHARACTERS ===")
-
-        detected = characters.get_character_context(book_dir, pages_text)
-        if detected:
-            context_blocks.append(f"=== DETECTED CHARACTER CONTEXT ===\n{detected}\n=== END DETECTED CHARACTER CONTEXT ===")
-
-        recorded_arcs = arcs.get_arcs_summary(book_dir)
-        if recorded_arcs:
-            context_blocks.append(f"=== RECORDED ARC/VOLUME ENDINGS ===\n{recorded_arcs}\n=== END RECORDED ARC/VOLUME ENDINGS ===")
+    context_blocks = _context_blocks(book_dir, pages_text)
 
     if context_blocks:
         messages.append({"role": "system", "content": "\n\n".join(context_blocks)})
@@ -157,19 +205,7 @@ def build_messages(book_dir: str, pages_text: str) -> list[dict]:
 
 def build_manual_prompt(book_dir: str, pages_text: str) -> str:
     """Construct a single unified text string for manual clipboard export."""
-    parts = [SYSTEM_PROMPT]
-    if book_dir:
-        all_chars = characters.get_all_characters_summary(book_dir)
-        if all_chars:
-            parts.append(f"=== ALL KNOWN CHARACTERS ===\n{all_chars}\n=== END ALL KNOWN CHARACTERS ===")
-
-        detected = characters.get_character_context(book_dir, pages_text)
-        if detected:
-            parts.append(f"=== DETECTED CHARACTER CONTEXT ===\n{detected}\n=== END DETECTED CHARACTER CONTEXT ===")
-
-        recorded_arcs = arcs.get_arcs_summary(book_dir)
-        if recorded_arcs:
-            parts.append(f"=== RECORDED ARC/VOLUME ENDINGS ===\n{recorded_arcs}\n=== END RECORDED ARC/VOLUME ENDINGS ===")
+    parts = [SYSTEM_PROMPT, *_context_blocks(book_dir, pages_text)]
 
     parts.append(f"=== BEGIN PAGES ===\n\n{pages_text}\n\n=== END PAGES ===")
     return "\n\n".join(parts)
