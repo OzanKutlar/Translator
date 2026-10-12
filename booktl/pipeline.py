@@ -14,7 +14,7 @@ import time
 from rich.markup import escape
 
 from . import console as con
-from . import activity, arcs, prompts, parsing, storage, characters, glossary
+from . import activity, arcs, prompts, parsing, storage, characters, glossary, termlookup
 from .tracker import ChapterTracker
 from .client import ApiClient, ApiError
 from .workpool import PageEntry, PendingPool, entry_sort_key, parse_selection
@@ -32,6 +32,7 @@ MAX_WORKER_POLLS = 50_000_000   # bounded-loop guard (~290 days of idle polling)
 IDLE_POLL_SECONDS = 0.5
 MAX_REPORTED_WARNINGS = 5
 MISSING_REASON = "Not in model reply"
+SCOUT_MAX_TOKENS = 4096        # the scout only returns a short term list
 
 
 def _is_saveable(entry) -> bool:
@@ -77,6 +78,7 @@ class Pipeline:
         self._state_io_lock = threading.Lock()  # always taken BEFORE self.lock, never while holding it
         self._backlog_full = False
         self.tracker = ChapterTracker()
+        self.corpus = termlookup.TermCorpus()
         self.auto_dispatch = True
         self.manual_active = False
         self.manual_entries: list[PageEntry] | None = None
@@ -108,6 +110,7 @@ class Pipeline:
     def on_book_changed(self) -> None:
         """Reset session tracking and load the new book's Missing/Failed lists."""
         self.tracker.reset()
+        self.corpus.clear()
         self.sync_batch_seq()
         self.load_queue_state()
 
@@ -708,7 +711,13 @@ class Pipeline:
         except OSError as e:
             con.warn(f"Could not spool batch #{batch_id} to _raw/ ({escape(str(e))}); continuing without backup.")
 
-        messages = prompts.build_messages(book_dir, PAGE_SEPARATOR.join(pages))
+        label = f"Batch #{batch_id}"
+        pages_text = PAGE_SEPARATOR.join(pages)
+        lookup = self._scout_terms(label, entries, pages_text)
+        if self._is_cancelled(batch_id):
+            con.warn(f"Batch #{batch_id} was cancelled during the term lookup; nothing sent (pages are already back in the pending pool).")
+            return
+        messages = prompts.build_messages(book_dir, pages_text, prior_usage=lookup.context)
         if cfg.dry_run:
             con.rule(f"Dry Run: Batch #{batch_id}")
             con.console.print(f"[dim]Constructed {len(messages)} messages for {escape(cfg.model or '(no model)')} · {len(pages)} pages · {span}[/dim]")
@@ -734,10 +743,66 @@ class Pipeline:
         if not reply.chapters:
             self._handle_batch_failure(batch_id, entries, raw_reply, "Reply contained no chapters")
             return
-        label = f"Batch #{batch_id}"
-        numbers = self._save_results(label, reply.chapters, reply)
+        numbers = self._save_results(label, reply.chapters, reply, lookup.first_seen)
         self._reconcile(label, batch_id, entries, reply.chapters, numbers)
         self._check_term_drift(label, entries, reply.chapters)
+
+    # ------------------------------------------------------------------
+    # Prior-usage term lookup
+    # ------------------------------------------------------------------
+
+    def _scout_terms(self, label: str, entries: list[PageEntry], pages_text: str) -> termlookup.LookupResult:
+        """Ask the model which terms it will register, then find how earlier chapters rendered them.
+
+        Never raises: any failure is logged and the batch is translated without the lookup.
+        """
+        if not self.cfg.term_lookup:
+            return termlookup.LookupResult()
+        if self.cfg.dry_run:
+            scout = prompts.build_scout_messages(self.cfg.book_dir, pages_text)
+            con.dim(f"{label}: term scout would send {len(scout)} message(s) first (skipped in dry run)")
+            return termlookup.LookupResult()
+        try:
+            return self._run_scout(label, entries, pages_text)
+        except ApiError as e:
+            con.warn(f"{label}: term scout call failed ({escape(str(e))}); translating without the prior-usage lookup.")
+        except Exception as e:  # the lookup is an aid and must never fail a batch
+            con.warn(f"{label}: prior-usage lookup failed ({escape(f'{type(e).__name__}: {e}')}); translating without it.")
+        return termlookup.LookupResult()
+
+    def _run_scout(self, label: str, entries: list[PageEntry], pages_text: str) -> termlookup.LookupResult:
+        book_dir = self.cfg.book_dir
+        messages = prompts.build_scout_messages(book_dir, pages_text)
+        raw_reply, usage = self.client.chat(self.cfg, messages, max_tokens=SCOUT_MAX_TOKENS)
+        self._record_usage(usage)
+        proposed, err = parsing.parse_scout_reply(raw_reply)
+        if err:
+            con.warn(f"{label}: term scout reply unusable ({escape(err)}); translating without the prior-usage lookup.")
+            return termlookup.LookupResult()
+        candidates = termlookup.filter_candidates(book_dir, proposed, pages_text)
+        batch_chapters = {e.chapter for e in entries if e.chapter is not None}
+        result = termlookup.build_prior_usage(self.corpus, book_dir, candidates, batch_chapters)
+        self._log_lookup(label, len(proposed), result)
+        return result
+
+    @staticmethod
+    def _log_lookup(label: str, proposed: int, result: termlookup.LookupResult) -> None:
+        for warning in result.warnings[:MAX_REPORTED_WARNINGS]:
+            con.dim(f"{label}: lookup: {escape(warning)}")
+        if not result.candidates:
+            con.dim(f"{label}: 🔎 Term scout proposed {proposed} term(s); none are new")
+            return
+        found = [f"{u.candidate.chinese} ← Ch {u.chapters[0]}" for u in result.usages]
+        detail = ""
+        if found:
+            more = ", …" if len(found) > MAX_REPORTED_WARNINGS else ""
+            detail = f" ({escape(', '.join(found[:MAX_REPORTED_WARNINGS]))}{more})"
+        con.info(
+            f"{label}: 🔎 Term scout found {result.candidates} new candidate(s), "
+            f"{len(result.usages)} with prior usage{detail}"
+        )
+        if result.truncated:
+            con.dim(f"{label}: {result.truncated} more term(s) with prior usage left out to keep the prompt small")
 
     def _save_raw_reply(self, batch_id: int, raw_reply: str) -> None:
         if not self.cfg.save_raw:
@@ -787,11 +852,15 @@ class Pipeline:
     # Results
     # ------------------------------------------------------------------
 
-    def _save_results(self, label: str, chapters: list, reply: parsing.ParsedReply) -> list[int]:
-        """Store chapters, apply character, term and arc updates. Returns translated chapter numbers."""
+    def _save_results(self, label: str, chapters: list, reply: parsing.ParsedReply,
+                      first_seen: dict | None = None) -> list[int]:
+        """Store chapters, apply character, term and arc updates. Returns translated chapter numbers.
+
+        first_seen (from the prior-usage lookup) maps Chinese terms to their earliest earlier chapter.
+        """
         numbers = self._store_chapters(label, chapters)
         self._apply_character_actions(label, reply.character_actions)
-        self._apply_term_actions(label, reply.term_actions, numbers)
+        self._apply_term_actions(label, reply.term_actions, numbers, first_seen)
         self._apply_arc_ends(label, reply.arc_ends, chapters)
         return numbers
 
@@ -914,13 +983,14 @@ class Pipeline:
         if line:
             con.ok(f"{label}: {escape(line)}")
 
-    def _apply_term_actions(self, label: str, term_actions: list, numbers: list[int]) -> None:
+    def _apply_term_actions(self, label: str, term_actions: list, numbers: list[int],
+                            first_seen: dict | None = None) -> None:
         """Register new glossary terms; a different rendering for a locked term is only logged."""
         if not term_actions:
             return
         first = min(numbers) if numbers else None
         try:
-            summary = glossary.record_term_actions(self.cfg.book_dir, term_actions, first)
+            summary = glossary.record_term_actions(self.cfg.book_dir, term_actions, first, first_seen)
         except (OSError, ValueError, TypeError) as e:
             con.fail(f"{label}: glossary update failed: {escape(str(e))}")
             return
@@ -938,6 +1008,11 @@ class Pipeline:
             con.dim(f"{label}: term action skipped: {escape(reason)}")
         for err in summary.get("failed", []):
             con.fail(f"{label}: glossary update failed: {escape(err)}")
+        for ev in summary.get("recovered", []):
+            con.ok(
+                f"{label}: 📖 Registered “{escape(str(ev['english']))}” for {escape(str(ev['chinese']))}, "
+                f"first seen in Chapter {ev['chapter']}"
+            )
         line = glossary.format_summary(summary)
         if line:
             con.ok(f"{label}: {escape(line)}")
@@ -1042,6 +1117,7 @@ class Pipeline:
                 "manual_active": self.manual_active,
                 "json_mode": self.cfg.json_mode,
                 "temperature": self.cfg.temperature,
+                "term_lookup": self.cfg.term_lookup,
                 "counters": dict(self.counters),
                 "tracker": self.tracker.snapshot(),
                 **counts,

@@ -15,7 +15,7 @@ from booktl.client import ApiClient
 from booktl.pipeline import Pipeline
 from booktl.ingest import create_ingest_app
 from booktl.commands import ReplContext, run_repl, print_report
-from booktl.prompts import build_messages
+from booktl.prompts import build_messages, build_scout_messages
 
 RETRY_DRAIN_TIMEOUT = 6 * 3600  # seconds the 'retry' subcommand waits for re-queued chapters
 
@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--host", default="127.0.0.1", help="Ingest server bind host")
         p.add_argument("--dry-run", action="store_true", help="Build prompts without calling LLM endpoint")
         p.add_argument("--save-raw", action="store_true", help="Save raw LLM output to _raw/ folder")
+        p.add_argument("--no-term-lookup", action="store_true", help="Skip the term-scout call and prior-usage lookup before each batch")
 
     # Default 'run' subcommand
     p_run = subparsers.add_parser("run", help="Start ingest server and worker console")
@@ -112,9 +113,12 @@ def main():
         if not book_res:
             return
         bpath, bname = book_res
-        messages = build_messages(bpath, "[Sample Chinese raw text page goes here...]")
-        for m in messages:
+        sample = "[Sample Chinese raw text page goes here...]"
+        for m in build_messages(bpath, sample):
             con.panel(m["content"], title=f"Role: {m['role'].upper()}", style="cyan")
+        con.rule("Term Scout Call (sent first while term lookup is on)")
+        for m in build_scout_messages(bpath, sample):
+            con.panel(escape(m["content"]), title=f"Scout Role: {m['role'].upper()}", style="magenta")
         return
 
     # Handle 'check' subcommand

@@ -9,6 +9,7 @@ from rich.table import Table
 from . import console as con
 from . import glossary
 from . import storage
+from . import termlookup
 from .client import ApiClient
 from .config import Config, ConfigError
 from .library import create_book, select_book
@@ -31,6 +32,7 @@ except ImportError:
 MAX_REPL_ITERATIONS = 10_000_000
 MAX_PROBLEM_ROWS = 200
 MAX_TERM_ROWS = 300
+MAX_AUDIT_WARNINGS = 5
 TERM_USAGE = (
     "Usage: term add <chinese> = <english> [type:<type>] · "
     "term alias <chinese> = <term> · term rm <chinese>"
@@ -64,6 +66,8 @@ HELP_ROWS = (
     ("term add <chinese> = <english> [type:<type>]", "Add or override a term and lock it as yours; the model never changes your terms."),
     ("term alias <chinese> = <term>", "Make another Chinese spelling render like an existing term (named by its Chinese or English)."),
     ("term rm <chinese>", "Remove a term together with its aliases, or remove a single alias."),
+    ("terms audit <chinese>", "Show every translated chapter whose raw page contains a term, with the Chinese sentence and the matching English passage."),
+    ("lookup <on|off>", "Toggle the prior-usage term lookup: a short scout call before each batch so new terms reuse earlier renderings."),
     ("flush", "Send all pending pages now, including a final partial batch."),
     ("auto <on|off>", "Toggle auto-dispatching (turn off to keep pages pending for manual)."),
     ("manual", "Copy the next batch of pending pages to the clipboard for external translation."),
@@ -201,6 +205,7 @@ def print_status(ctx: ReplContext) -> None:
     table.add_row("Temperature", str(s["temperature"]))
     table.add_row("JSON Mode", s["json_mode"])
     table.add_row("Auto Dispatch", "[green]ON[/green]" if s["auto_dispatch"] else "[yellow]PAUSED[/yellow]")
+    table.add_row("Term Lookup", "[green]ON[/green]" if s.get("term_lookup") else "[yellow]OFF[/yellow]")
     table.add_row("Manual Active", f"[yellow]YES ({s['manual']} pages)[/yellow]" if s["manual_active"] else "NO")
     table.add_row("Pending Pages", _pending_text(s))
     table.add_row("In-Flight", f"{s['in_flight_batches']} batch(es), {s['in_flight']} page(s)")
@@ -542,6 +547,9 @@ def cmd_terms(ctx: ReplContext, args: list[str]) -> None:
     if not ctx.cfg.book_dir:
         con.warn("No book directory selected.")
         return
+    if args and args[0].lower() == "audit":
+        _terms_audit(ctx, args[1:])
+        return
     query = " ".join(args).strip()
     rows, err = glossary.search_terms(ctx.cfg.book_dir, query)
     if err:
@@ -557,6 +565,51 @@ def cmd_terms(ctx: ReplContext, args: list[str]) -> None:
     con.console.print(_term_table(rows, escape(f"Glossary: {len(rows)} term(s){suffix}")))
     if len(rows) > MAX_TERM_ROWS:
         con.dim(f"Showing {MAX_TERM_ROWS} of {len(rows)} terms. Narrow it down with 'terms <search>'.")
+
+
+def _print_occurrence(occ) -> None:
+    anchors = ", ".join(occ.anchors) if occ.anchors else "no anchors, position estimate only"
+    body = f"[dim]ZH:[/dim] {escape(occ.zh)}\n\n[dim]EN:[/dim] {escape(occ.en)}"
+    con.panel(body, title=escape(f"Chapter {occ.chapter} · {anchors}"), style="magenta")
+
+
+def _terms_audit(ctx: ReplContext, args: list[str]) -> None:
+    """terms audit <chinese> -> every translated chapter containing the term, with excerpts."""
+    key = glossary.usable_key(" ".join(args))
+    if not key:
+        con.warn("Usage: terms audit <chinese> (2–40 characters)")
+        return
+    book_dir = ctx.cfg.book_dir
+    try:
+        usage, warnings = termlookup.audit_term(ctx.pipeline.corpus, book_dir, key)
+    except (OSError, ValueError) as e:
+        con.fail(f"Could not search the raw pages: {escape(str(e))}")
+        return
+    for warning in warnings[:MAX_AUDIT_WARNINGS]:
+        con.dim(escape(warning))
+    locked = glossary.spelling_map(glossary.load_terms(book_dir)).get(key)
+    if locked:
+        con.info(f"{escape(key)} is locked as [bold green]{escape(locked)}[/bold green].")
+    if usage is None:
+        con.info(f"{escape(key)} was not found in any translated chapter with a stored raw page in _raw/chapters/.")
+        return
+    chapters = escape(format_chapter_ranges(list(usage.chapters)))
+    con.info(f"{escape(key)} appears in {len(usage.chapters)} translated chapter(s): {chapters}")
+    for occ in usage.occurrences:
+        _print_occurrence(occ)
+
+
+def cmd_lookup(ctx: ReplContext, args: list[str]) -> None:
+    """lookup on|off -> toggle the term-scout call and prior-usage lookup before each batch."""
+    if not args or args[0].lower() not in ("on", "off"):
+        state = "on" if ctx.cfg.term_lookup else "off"
+        con.warn(f"Prior-usage term lookup is currently {state}. Usage: lookup <on|off>")
+        return
+    ctx.cfg.term_lookup = args[0].lower() == "on"
+    if ctx.cfg.term_lookup:
+        con.ok("Term lookup on: each batch first asks the model for glossary candidates and shows it how earlier chapters rendered them.")
+    else:
+        con.ok("Term lookup off: batches go out as a single translation call.")
 
 
 def _split_assignment(args: list[str]) -> tuple[str, str] | None:
@@ -646,6 +699,7 @@ HANDLERS = {
     "raw": cmd_raw,
     "terms": cmd_terms,
     "term": cmd_term,
+    "lookup": cmd_lookup,
 }
 COMMAND_WORDS = tuple(sorted(set(HANDLERS) | {"quit", "retranslate", "buffer", "queue", "glossary"}))
 

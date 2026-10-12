@@ -93,6 +93,8 @@ SYSTEM_PROMPT = (
     "If a LOCKED TERMS section is provided, use exactly the English listed there for each term, every time, "
     "including inside longer phrases, even if another rendering seems more natural. Never re-translate a locked term, "
     "and never AddTerm a term that is already locked.\n"
+    "If a PRIOR USAGE section is provided, follow its instructions: it shows how earlier chapters already "
+    "rendered terms that are not locked yet, and those renderings take priority over your own choice.\n"
     "When you choose an English rendering for such a term that is NOT locked yet, register it in the "
     "\"termActions\" list so later chapters reuse it. Do not register ordinary vocabulary, and do not register "
     "a person's real name (people belong in characterActions). A person's nickname or title IS a term.\n\n"
@@ -167,8 +169,42 @@ SYSTEM_PROMPT = (
 )
 
 
-def _context_blocks(book_dir: str, pages_text: str) -> list[str]:
-    """Book-specific context for one batch: characters, locked terms and recorded arc endings."""
+PRIOR_USAGE_INTRO = (
+    "These candidate terms appear in this section and were already translated in earlier chapters, "
+    "but were never registered in the glossary. Each entry shows the Chinese sentence from an earlier chapter "
+    "and the matching passage of its existing English translation. Passages are located by position, so one "
+    "may be slightly off; 'anchors matched' lists names found near the term that confirm the spot.\n"
+    "For each term:\n"
+    "  1. Work out how the earlier English rendered it and reuse that rendering exactly, "
+    "including inside longer phrases.\n"
+    "  2. Register it with AddTerm using that rendering. If earlier chapters disagree, use the EARLIEST "
+    "rendering and put the other one in Note, e.g. 'also written as X in Chapter 612'.\n"
+    "  3. Only if the earlier rendering clearly does not fit the current context (for example the term means "
+    "something different here), use a better rendering, register that one, put 'previously written as X' in Note, "
+    "and after the paragraph where it first appears add: "
+    "(TN: This was written as X in earlier chapters, but Y fits the current context better.)\n"
+    "  4. If an excerpt does not show the term at all, ignore that excerpt."
+)
+
+SCOUT_REQUEST_LIMIT = 25   # the software keeps at most termlookup.MAX_CANDIDATES of these
+
+SCOUT_PROMPT = (
+    "You are preparing to translate Chinese novel pages into English. Do NOT translate anything yet.\n\n"
+    "List the recurring proper nouns and coined terms in these pages that belong in the book's glossary: "
+    "titles, nicknames and epithets, skills and techniques, buffs and debuffs, items and artifacts, places, "
+    "sects and organizations, ranks and cultivation realms, currencies.\n"
+    "Leave out people's real names, ordinary vocabulary, and every term listed under LOCKED TERMS.\n"
+    f"List at most {SCOUT_REQUEST_LIMIT} terms, most important first. Copy the Chinese text exactly as it "
+    "appears in the pages, without surrounding punctuation.\n\n"
+    "RESPONSE FORMAT - respond with ONLY a valid JSON object. No preamble, no explanation, no markdown code fences.\n"
+    '{"candidateTerms": [{"Chinese": "血魔印", "ProposedEnglish": "Blood Fiend Mark", "Type": "item"}]}\n'
+    "Type is one of: title, skill, item, status, place, organization, rank, other. "
+    'If there are no such terms, respond with {"candidateTerms": []}.'
+)
+
+
+def _context_blocks(book_dir: str, pages_text: str, prior_usage: str = "") -> list[str]:
+    """Book-specific context for one batch: characters, locked terms, prior usage and arc endings."""
     if not book_dir:
         return []
     blocks = []
@@ -181,17 +217,19 @@ def _context_blocks(book_dir: str, pages_text: str) -> list[str]:
     locked = glossary.get_term_context(glossary.match_terms(book_dir, pages_text))
     if locked:
         blocks.append(f"=== LOCKED TERMS ===\n{locked}\n=== END LOCKED TERMS ===")
+    if prior_usage:
+        blocks.append(f"=== PRIOR USAGE ===\n{PRIOR_USAGE_INTRO}\n\n{prior_usage}\n=== END PRIOR USAGE ===")
     recorded_arcs = arcs.get_arcs_summary(book_dir)
     if recorded_arcs:
         blocks.append(f"=== RECORDED ARC/VOLUME ENDINGS ===\n{recorded_arcs}\n=== END RECORDED ARC/VOLUME ENDINGS ===")
     return blocks
 
 
-def build_messages(book_dir: str, pages_text: str) -> list[dict]:
-    """Construct clean OpenAI-style role messages."""
+def build_messages(book_dir: str, pages_text: str, prior_usage: str = "") -> list[dict]:
+    """Construct clean OpenAI-style role messages. prior_usage comes from termlookup."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    context_blocks = _context_blocks(book_dir, pages_text)
+    context_blocks = _context_blocks(book_dir, pages_text, prior_usage)
 
     if context_blocks:
         messages.append({"role": "system", "content": "\n\n".join(context_blocks)})
@@ -209,3 +247,13 @@ def build_manual_prompt(book_dir: str, pages_text: str) -> str:
 
     parts.append(f"=== BEGIN PAGES ===\n\n{pages_text}\n\n=== END PAGES ===")
     return "\n\n".join(parts)
+
+
+def build_scout_messages(book_dir: str, pages_text: str) -> list[dict]:
+    """Messages for the term-scout call: which glossary terms the model plans to register."""
+    messages = [{"role": "system", "content": SCOUT_PROMPT}]
+    locked = glossary.get_term_context(glossary.match_terms(book_dir, pages_text)) if book_dir else ""
+    if locked:
+        messages.append({"role": "system", "content": f"=== LOCKED TERMS ===\n{locked}\n=== END LOCKED TERMS ==="})
+    messages.append({"role": "user", "content": f"=== BEGIN PAGES ===\n\n{pages_text}\n\n=== END PAGES ==="})
+    return messages

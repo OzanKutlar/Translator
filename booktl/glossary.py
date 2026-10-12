@@ -209,6 +209,18 @@ def _find_by_english(terms: dict, english: str) -> str | None:
     return None
 
 
+def usable_key(value) -> str:
+    """Chinese text cleaned like a glossary key, or '' when it cannot be one."""
+    return _clean_key(value)
+
+
+def spelling_map(terms: dict) -> dict[str, str]:
+    """Every usable Chinese spelling (keys and aliases) -> its English rendering."""
+    if not isinstance(terms, dict):
+        return {}
+    return {form: _english_of(terms.get(key)) for form, key in _build_index(terms).items()}
+
+
 def _matched(key: str, record: dict, forms: list[str]) -> MatchedTerm:
     return MatchedTerm(
         key=key,
@@ -268,8 +280,9 @@ def get_term_context(matched: list[MatchedTerm]) -> str:
 # ----------------------------------------------------------------------
 
 def _new_summary() -> dict:
-    """added/unchanged: English names; aliased/conflicts: dicts; skipped/failed: reasons."""
-    return {"added": [], "aliased": [], "unchanged": [], "conflicts": [], "skipped": [], "failed": []}
+    """added/unchanged: English names; aliased/conflicts/recovered: dicts; skipped/failed: reasons."""
+    return {"added": [], "aliased": [], "unchanged": [], "conflicts": [], "recovered": [],
+            "skipped": [], "failed": []}
 
 
 def _action_aliases(act: dict) -> list[str]:
@@ -385,7 +398,30 @@ def _apply_action(terms: dict, index: dict, act, chapter, summary: dict) -> bool
     return handler(terms, index, act, chapter, summary)
 
 
-def _merge_actions(book_dir: str, actions: list, chapter, summary: dict) -> None:
+def _prior_chapter(act, first_seen: dict) -> int | None:
+    """Earliest earlier chapter where the prior-usage lookup found the action's Chinese text."""
+    if not first_seen or not isinstance(act, dict):
+        return None
+    return _first_chapter(first_seen.get(_clean_key(act.get("Chinese"))))
+
+
+def _apply_with_prior(terms: dict, index: dict, act, chapter, first_seen: dict, summary: dict) -> bool:
+    """Apply one action; a new term found in earlier chapters stores that chapter as firstChapter."""
+    prior = _prior_chapter(act, first_seen)
+    if prior is None:
+        return _apply_action(terms, index, act, chapter, summary)
+    added_before = len(summary["added"])
+    changed = _apply_action(terms, index, act, prior, summary)
+    if len(summary["added"]) > added_before:
+        summary["recovered"].append({
+            "chinese": _clean_key(act.get("Chinese")),
+            "english": summary["added"][-1],
+            "chapter": prior,
+        })
+    return changed
+
+
+def _merge_actions(book_dir: str, actions: list, chapter, first_seen: dict, summary: dict) -> None:
     data, err = load_glossary(book_dir)
     if err:
         summary["failed"].append(f"{err} (nothing was written; fix or remove the file)")
@@ -394,21 +430,25 @@ def _merge_actions(book_dir: str, actions: list, chapter, summary: dict) -> None
     index = _build_index(terms)
     changed = False
     for act in actions:
-        changed = _apply_action(terms, index, act, chapter, summary) or changed
+        changed = _apply_with_prior(terms, index, act, chapter, first_seen, summary) or changed
     if not changed:
         return
     save_err = _try_save(book_dir, data)
     if save_err:
         summary["added"].clear()
         summary["aliased"].clear()
+        summary["recovered"].clear()
         summary["failed"].append(save_err)
 
 
-def record_term_actions(book_dir: str, actions, first_chapter=None) -> dict:
+def record_term_actions(book_dir: str, actions, first_chapter=None, first_seen=None) -> dict:
     """Apply model term actions to Glossary.json and return a summary (see _new_summary).
 
-    first_chapter is stored on new terms for reference only.
+    first_chapter is stored on new terms for reference only. first_seen maps Chinese text to
+    the earliest earlier chapter where the prior-usage lookup found it; new terms in it store
+    that chapter instead and are reported under "recovered".
     """
+    seen = first_seen if isinstance(first_seen, dict) else {}
     summary = _new_summary()
     if not book_dir:
         summary["failed"].append("no book directory selected")
@@ -421,7 +461,7 @@ def record_term_actions(book_dir: str, actions, first_chapter=None) -> dict:
         return summary
     if actions:
         with _file_lock:
-            _merge_actions(book_dir, actions, first_chapter, summary)
+            _merge_actions(book_dir, actions, first_chapter, seen, summary)
     return summary
 
 

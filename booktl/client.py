@@ -194,8 +194,11 @@ class ApiClient:
     # Chat completions
     # ------------------------------------------------------------------
 
-    def chat(self, cfg, messages: list[dict]) -> tuple[str, dict | None]:
-        """Send chat completion request with exponential backoff."""
+    def chat(self, cfg, messages: list[dict], max_tokens: int | None = None) -> tuple[str, dict | None]:
+        """Send chat completion request with exponential backoff.
+
+        max_tokens limits this call only; when cfg.max_tokens is also set, the smaller one wins.
+        """
         if not cfg.model:
             raise ApiError("No model specified. Use the model command to configure one.")
 
@@ -204,8 +207,9 @@ class ApiClient:
             "messages": messages,
             "temperature": cfg.temperature,
         }
-        if cfg.max_tokens:
-            payload["max_tokens"] = cfg.max_tokens
+        limits = [n for n in (cfg.max_tokens, max_tokens) if isinstance(n, int) and not isinstance(n, bool) and n > 0]
+        if limits:
+            payload["max_tokens"] = min(limits)
 
         wants_json = cfg.json_mode == "on" or (
             cfg.json_mode == "auto" and cfg.model not in self._no_json_format_models

@@ -122,6 +122,7 @@ _VALID_JSON_KEYS = [
     "ModType", "Content", "Find", "Replace",
     "arcEnds", "endType", "arcName", "isAfterword",
     "termActions", "Type", "RefersTo", "Note", "Aliases",
+    "candidateTerms", "ProposedEnglish",
 ]
 
 
@@ -249,3 +250,42 @@ def parse_reply(raw_response: str) -> ParsedReply:
         arc_ends=_list_field(parsed, "arcEnds"),
         term_actions=_list_field(parsed, "termActions"),
     )
+
+
+MAX_SCOUT_ENTRIES = 100   # the scout is asked for far fewer; more is certainly a model error
+MAX_SCOUT_FIELD = 120
+
+
+def _scout_text(value) -> str:
+    if value is None or isinstance(value, (dict, list)):
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()[:MAX_SCOUT_FIELD]
+
+
+def _scout_entry(item) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    chinese = _scout_text(item.get("Chinese"))
+    if not chinese:
+        return None
+    english = _scout_text(item.get("ProposedEnglish")) or _scout_text(item.get("English"))
+    return {"Chinese": chinese, "ProposedEnglish": english, "Type": _scout_text(item.get("Type"))}
+
+
+def parse_scout_reply(raw_response: str) -> tuple[list[dict], str | None]:
+    """Candidate glossary terms from the term-scout reply. Returns (entries, error_message).
+
+    Each entry is {"Chinese", "ProposedEnglish", "Type"}; a bare JSON array is accepted too.
+    """
+    parsed, err = _load_payload(raw_response)
+    if err:
+        return [], err
+    items = parsed.get("candidateTerms") if isinstance(parsed, dict) else parsed
+    if not isinstance(items, list):
+        return [], "'candidateTerms' key must be a JSON array"
+    entries = []
+    for item in items[:MAX_SCOUT_ENTRIES]:
+        entry = _scout_entry(item)
+        if entry is not None:
+            entries.append(entry)
+    return entries, None

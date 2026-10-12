@@ -88,6 +88,8 @@ Everything typed into the console is a command, so no `/` prefix is needed (a le
 - `term add <chinese> = <english> [type:<type>]` — Add or override a term and lock it as yours, e.g. `term add 秃鹫尊者 = Venerable Vulture type:title`.
 - `term alias <chinese> = <term>` — Make another Chinese spelling render like an existing term (named by its Chinese or English).
 - `term rm <chinese>` — Remove a term together with its aliases, or a single alias.
+- `terms audit <chinese>` — Every translated chapter whose raw page contains the term, with the Chinese sentence and the matching English passage.
+- `lookup <on|off>` — Turn the prior-usage term lookup on or off (see below).
 - `flush` — Send all pending pages now, including a partial batch.
 - `auto <on|off>` — Pause or resume automatic sending.
 - `quit` — Gracefully drain and shut down workers.
@@ -131,6 +133,22 @@ Character files keep people's names consistent. Everything else that must stay t
 - Terms you add with `term add` are marked `"source": "user"`. The model never edits them, not even to add an alias; it logs a hint instead.
 - After each reply, every chapter whose raw page contains a locked term is checked for that term's English. If it is missing, a `⚠ Term drift` warning names the chapter; use `retry <chapter>` if the translation really drifted. Text the model skips (site headers, recommendations) can occasionally cause a false warning.
 - Chinese keys and aliases must be 2–40 characters; one-character keys would match almost every page.
+
+### Prior-Usage Lookup
+
+A term the model never registered may still have been translated before, e.g. 血魔印 as "Blood Demon Seal" in Chapter 300. To stop Chapter 900 from coining a second rendering, each batch makes two calls while the lookup is on:
+
+1. **Term scout.** A short call lists the glossary terms the model plans to register for these pages (`candidateTerms`). Nothing is translated yet.
+2. **Lookup.** Candidates that are already locked, known characters, or not in the pages are dropped, and at most 15 are kept. Each one is searched in `_raw/chapters/` among chapters that already have a translated `.md` file; the current batch is skipped. For up to 3 hits (earliest, most recent and one in between) the Chinese sentence and the matching English passage are cut out. The passage is placed by position in the chapter, then moved onto the paragraphs that mention the names and locked terms found next to the hit ("anchors").
+3. **Translation.** The normal call gets a **PRIOR USAGE** block. The model reuses the earlier rendering and registers it with `AddTerm`; `firstChapter` becomes the earliest chapter found, and the log shows `📖 Registered “Blood Demon Seal” for 血魔印, first seen in Chapter 300`.
+
+- If earlier chapters disagree, the earliest rendering wins and the other one is put in the term's note.
+- If the model decides the old rendering does not fit the current context, it uses a new one, notes `previously written as X`, and adds `(TN: This was written as X in earlier chapters, but Y fits the current context better.)` to the chapter.
+- If the scout call or the lookup fails, the batch is translated normally with a warning. The lookup never fails a batch.
+- The scout call sends the pages a second time, so input tokens per batch roughly double. Turn it off with `lookup off`, `--no-term-lookup` or `TL_TERM_LOOKUP=off`.
+- Only chapters with a stored raw page in `_raw/chapters/` are searched. `manual` / `paste` and `--dry-run` skip the lookup.
+- Site text is ignored: everything above the `第…章` title line, everything from `(本章完)` on, and lines with site names or URLs. Extend `END_MARKERS` / `BOILERPLATE` in `booktl/termlookup.py` for other sites.
+- `terms audit <chinese>` uses the same search, so you can check a rendering before `term add`.
 
 ### Arc / Volume Tracking
 

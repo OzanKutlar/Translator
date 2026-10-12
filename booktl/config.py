@@ -75,6 +75,7 @@ class Config:
         self._save_raw = False
         self._host = "127.0.0.1"
         self._port = 5001
+        self._term_lookup = True
 
     @property
     def base_url(self) -> str:
@@ -247,6 +248,17 @@ class Config:
             self._save_raw = bool(val)
 
     @property
+    def term_lookup(self) -> bool:
+        """Run the term-scout call and prior-usage lookup before each batch."""
+        with self._lock:
+            return self._term_lookup
+
+    @term_lookup.setter
+    def term_lookup(self, val: bool):
+        with self._lock:
+            self._term_lookup = bool(val)
+
+    @property
     def host(self) -> str:
         with self._lock:
             return self._host
@@ -297,6 +309,10 @@ class Config:
 
         cfg.dry_run = bool(getattr(args, "dry_run", False))
         cfg.save_raw = bool(getattr(args, "save_raw", False))
+
+        lookup_env = os.environ.get("TL_TERM_LOOKUP", "").strip().lower()
+        lookup_off = bool(getattr(args, "no_term_lookup", False)) or lookup_env in ("0", "off", "false", "no")
+        cfg.term_lookup = not lookup_off
 
         port = getattr(args, "port", None) or os.environ.get("TL_PORT") or 5001
         cfg._port = int(port)

@@ -246,6 +246,32 @@ def _chapter_page_path(book_dir: str, chapter: int) -> str:
     return os.path.join(book_dir, RAW_DIRNAME, CHAPTER_PAGES_DIRNAME, f"ch_{chapter:06d}.txt")
 
 
+_CHAPTER_PAGE_RE = re.compile(r"^ch_(\d{1,9})\.txt$")
+
+
+def chapter_page_path(book_dir: str, chapter: int) -> str:
+    """Path of the stored raw page for a chapter (the file may not exist). Raises ValueError."""
+    if not book_dir:
+        raise ValueError("No book directory selected")
+    _require_chapter(chapter)
+    return _chapter_page_path(book_dir, chapter)
+
+
+def list_scraped_chapters(book_dir: str) -> list[int]:
+    """Chapter numbers stored in _raw/chapters/, ascending. Raises OSError when the folder is unreadable."""
+    if not book_dir:
+        return []
+    folder = os.path.join(book_dir, RAW_DIRNAME, CHAPTER_PAGES_DIRNAME)
+    if not os.path.isdir(folder):
+        return []
+    numbers = []
+    for name in os.listdir(folder):
+        match = _CHAPTER_PAGE_RE.match(name)
+        if match and int(match.group(1)) > 0:
+            numbers.append(int(match.group(1)))
+    return sorted(numbers)
+
+
 def save_scraped_page(book_dir: str, chapter: int, content: str) -> str:
     """Store the latest raw page for a chapter in _raw/chapters/. Raises OSError/ValueError."""
     if not book_dir:
