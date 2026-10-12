@@ -13,6 +13,7 @@ from rich.markup import escape
 from . import activity
 from . import console as con
 from . import menu
+from .parsing import parse_chapter_number
 
 MAX_NUMBERED_ATTEMPTS = 5
 MAX_NAME_ATTEMPTS = 5
@@ -54,18 +55,65 @@ class BookInfo:
 # Discovery and ordering
 # ----------------------------------------------------------------------
 
+_COMMON_CH1_NAMES = frozenset({
+    "1.md",
+    "chapter 1.md",
+    "chapter_1.md",
+    "chapter-1.md",
+    "ch 1.md",
+    "ch1.md",
+    "ch_000001.md",
+    "0001.md",
+    "01.md",
+})
+
+
+def has_chapter_one(book_dir: str) -> bool:
+    """Fast check for whether a directory contains a Chapter 1 markdown file."""
+    if not os.path.isdir(book_dir):
+        return False
+    try:
+        with os.scandir(book_dir) as entries:
+            for entry in entries:
+                if not entry.name.lower().endswith(".md"):
+                    continue
+                low_name = entry.name.lower()
+                if low_name in _COMMON_CH1_NAMES:
+                    return True
+                if parse_chapter_number(entry.name[:-3]) == 1:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
 def discover_books(library_dir: str) -> list[str]:
-    """Return sorted directory names inside the library folder."""
+    """Return sorted directory names inside the library folder that contain a Chapter 1 file."""
     abs_lib = os.path.abspath(library_dir)
     if not os.path.exists(abs_lib):
         return []
-    return sorted(
-        [
+    books = []
+    for d in os.listdir(abs_lib):
+        if d.startswith("."):
+            continue
+        dir_path = os.path.join(abs_lib, d)
+        if os.path.isdir(dir_path) and has_chapter_one(dir_path):
+            books.append(d)
+    return sorted(books, key=str.lower)
+
+
+def _list_existing_dirs(library_dir: str) -> list[str]:
+    """List all directory names in library_dir regardless of contents for collision check."""
+    abs_lib = os.path.abspath(library_dir)
+    if not os.path.isdir(abs_lib):
+        return []
+    try:
+        return [
             d for d in os.listdir(abs_lib)
             if os.path.isdir(os.path.join(abs_lib, d)) and not d.startswith(".")
-        ],
-        key=str.lower,
-    )
+        ]
+    except OSError:
+        return []
 
 
 def _book_sort_key(info: BookInfo) -> tuple:
@@ -127,7 +175,7 @@ def create_book(library_dir: str, name: str) -> tuple[str, str]:
     Raises ValueError for an unusable or taken name, OSError when the folder cannot be created.
     """
     abs_lib = os.path.abspath(library_dir)
-    error = validate_book_name(name, discover_books(abs_lib))
+    error = validate_book_name(name, _list_existing_dirs(abs_lib))
     if error:
         raise ValueError(error)
     clean = name.strip()
