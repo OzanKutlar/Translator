@@ -17,17 +17,28 @@ pip install -r requirements.txt
 python translate.py
 ```
 
-3. Pick your target book from `../TranslateBook/` and your model from the live model list. Both pickers use the arrow keys: ↑/↓ to move, Enter to select, Esc to cancel. When input isn't a terminal (e.g. piped), a numbered list is shown instead.
+3. Pick your target book from `../TranslateBook/`, or choose **＋ New book…** to create one, and your model from the live model list. Both pickers use the arrow keys: ↑/↓ to move, Enter to select, Esc to cancel. When input isn't a terminal (e.g. piped), a numbered list is shown instead; type `n` there for a new book. See [Choosing or Creating a Book](#choosing-or-creating-a-book).
 4. Install `bookContent.js` in Tampermonkey and navigate to your book page on 69shuba.
 
 ## Subcommands
 
 - `python translate.py run` (default) — Starts the ingest server and interactive REPL.
 - `python translate.py models` — Prints the models available on your configured endpoint.
-- `python translate.py books` — Lists books in your library directory.
+- `python translate.py books` — Lists books in your library, most recently translated first.
 - `python translate.py check` — Tests endpoint connectivity and runs a lightweight ping completion.
 - `python translate.py retry -b <BookName>` — Re-queues every Failed chapter (and any older `_failed/` batches), waits for them, then exits.
 - `python translate.py prompt -b <BookName>` — Inspects the generated translation prompt.
+
+## Choosing or Creating a Book
+
+The book picker lists the books you translated recently first, newest at the top, with a hint such as `translated 2h ago · ch 1240`. Pressing Enter on the first row therefore opens the book you worked on last. Books without a recorded translation follow in alphabetical order.
+
+- The last row, **＋ New book…**, asks for a name and creates the folder, with `Characters/Characters.json`, inside the library. In the numbered fallback, type `n`.
+- An empty or missing library goes straight to the new-book prompt.
+- Names may use any characters, including Chinese, except `< > : " / \ | ? *`. They cannot start or end with `.`, cannot be a reserved Windows name such as `CON` or `NUL`, and cannot match an existing book (ignoring case).
+- In the console, `book` reopens the picker and `book new <name>` creates a book and switches to it.
+
+Each time a batch saves chapters, the time and the highest chapter in that batch are written to `<Book>/_activity.json`. Books from before this file existed use the modification time of their newest chapter `.md` file instead. To count only a time window as recent, set `RECENT_WINDOW_DAYS` in `booktl/activity.py` (e.g. `30`); older books then sort alphabetically.
 
 ## How Pages Flow
 
@@ -52,6 +63,8 @@ Pages with no readable chapter number are keyed as `page:<id>`. They can only be
 ## Interactive Console Commands
 
 Everything typed into the console is a command, so no `/` prefix is needed (a leading `/` is still accepted). Press Tab to complete command names, and type `help` for the full list:
+- `book` — Reopen the book picker (recent books first, **＋ New book…** last).
+- `book new <name>` — Create a new book in the library and switch to it.
 - `goal <n|+n|none>` — Set the stop chapter (e.g. `goal 3000`, or `goal +50` for the next 50 chapters).
 - `progress` — Render current scraping and translation progress bars plus the queue line.
 - `status` — View pipeline status, pending/in-flight pages, missing/failed counts, goal progress, and metrics.
@@ -99,6 +112,7 @@ Each finished batch logs one chapter summary, such as `Batch #4: Saved 10 chapte
 - `_failed/` — Quarantined failed batches with the model reply and error.
 - `_queue_state.json` — Missing and Failed chapter lists.
 - `Glossary.json` — Locked term renderings (see below).
+- `_activity.json` — When the book was last translated and the highest chapter in that batch; orders the book picker.
 
 ### Glossary / Locked Terms
 

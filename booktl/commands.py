@@ -11,7 +11,7 @@ from . import glossary
 from . import storage
 from .client import ApiClient
 from .config import Config, ConfigError
-from .library import select_book
+from .library import create_book, select_book
 from .parsing import format_chapter_ranges
 from .pipeline import Pipeline, HAS_CLIPBOARD, describe_entries
 from .progressbar import render_bars
@@ -52,7 +52,8 @@ HELP_ROWS = (
     ("temp <0.0-2.0>", "Adjust model generation temperature."),
     ("maxtokens <n|none>", "Set or clear maximum response tokens."),
     ("jsonmode <auto|on|off>", "Configure JSON formatting parameter handling."),
-    ("book", "Switch target book (arrow-key picker)."),
+    ("book", "Switch target book. Recently translated books are listed first; the last row creates a new book."),
+    ("book new <name>", "Create a new book folder in the library and switch to it."),
     ("goal <n|+n|none>", "Set or clear the stop chapter. With a goal the scraper runs until the goal; without one it waits at 4 x batch size pending pages."),
     ("progress", "Display current scraping and translation progress bars."),
     ("pending [all]", "List pending chapters and in-flight batches; 'all' lists every page (aliases: buffer, queue)."),
@@ -329,18 +330,42 @@ def cmd_concurrency(ctx: ReplContext, args: list[str]) -> None:
     con.ok(f"Concurrency adjusted to [bold green]{num}[/bold green] workers.")
 
 
-def cmd_book(ctx: ReplContext, args: list[str]) -> None:
-    res = select_book(ctx.cfg.library_dir)
-    if not res:
-        con.info("Book unchanged.")
-        return
-    bpath, bname = res
+def _switch_book(ctx: ReplContext, bpath: str, bname: str) -> None:
     ctx.cfg.set_book(bpath, bname)
     ctx.pipeline.on_book_changed()
     con.ok(f"Switched target novel to [bold green]{escape(bname)}[/bold green]")
     pending = ctx.pipeline.queue_counts()["pending"]
     if pending:
         con.warn(f"{pending} page(s) scraped for the previous book are still pending and will be translated into this book.")
+
+
+def _book_new(ctx: ReplContext, args: list[str]) -> None:
+    name = " ".join(args).strip()
+    if not name:
+        con.warn("Usage: book new <name>")
+        return
+    try:
+        bpath, bname = create_book(ctx.cfg.library_dir, name)
+    except ValueError as e:
+        con.warn(escape(str(e)))
+        return
+    except OSError as e:
+        con.fail(f"Could not create '{escape(name)}': {escape(str(e))}")
+        return
+    con.ok(f"Created new book [bold green]{escape(bname)}[/bold green]")
+    _switch_book(ctx, bpath, bname)
+
+
+def cmd_book(ctx: ReplContext, args: list[str]) -> None:
+    """book -> picker (with a new-book row); book new <name> -> create and switch."""
+    if args and args[0].lower() == "new":
+        _book_new(ctx, args[1:])
+        return
+    res = select_book(ctx.cfg.library_dir)
+    if not res:
+        con.info("Book unchanged.")
+        return
+    _switch_book(ctx, *res)
 
 
 def _print_page_list(entries) -> None:

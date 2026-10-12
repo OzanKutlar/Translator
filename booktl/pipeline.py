@@ -14,7 +14,7 @@ import time
 from rich.markup import escape
 
 from . import console as con
-from . import arcs, prompts, parsing, storage, characters, glossary
+from . import activity, arcs, prompts, parsing, storage, characters, glossary
 from .tracker import ChapterTracker
 from .client import ApiClient, ApiError
 from .workpool import PageEntry, PendingPool, entry_sort_key, parse_selection
@@ -846,9 +846,17 @@ class Pipeline:
             msg += f", [yellow]{skipped} skipped[/yellow]"
         if saved:
             con.ok(msg)
+            self._record_activity(label, numbers)
         else:
             con.warn(msg)
         return numbers
+
+    def _record_activity(self, label: str, numbers: list[int]) -> None:
+        """Stamp the book as just translated so the book picker lists it first."""
+        try:
+            activity.record_translation(self.cfg.book_dir, numbers)
+        except (OSError, ValueError, TypeError) as e:
+            con.warn(f"{label}: could not update {activity.ACTIVITY_FILENAME}: {escape(str(e))}")
 
     def _record_translated(self, chapters: list, saved: int, skipped: int) -> list[int]:
         """Update counters and the tracker; returns the chapter numbers that were read."""

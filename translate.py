@@ -6,9 +6,11 @@ import sys
 import threading
 import time
 
+from rich.markup import escape
+
 from booktl import console as con
 from booktl.config import Config
-from booktl.library import select_book, ensure_book, discover_books
+from booktl.library import select_book, ensure_book, ordered_books
 from booktl.client import ApiClient
 from booktl.pipeline import Pipeline
 from booktl.ingest import create_ingest_app
@@ -88,13 +90,14 @@ def main():
 
     # Handle 'books' subcommand
     if sub == "books":
-        books = discover_books(cfg.library_dir)
+        books = ordered_books(cfg.library_dir)
         con.rule(f"Library: {os.path.abspath(cfg.library_dir)}")
         if not books:
-            con.warn("No book directories found.")
+            con.warn("No book directories found. Run 'python translate.py' to create one.")
         else:
             for b in books:
-                con.console.print(f"  • {b}")
+                hint = f"  [dim]({escape(b.hint)})[/dim]" if b.hint else ""
+                con.console.print(f"  • {escape(b.name)}{hint}")
         return
 
     # Handle 'models' subcommand
