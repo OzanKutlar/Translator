@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import socket
 import sys
 import threading
 import time
@@ -10,7 +11,7 @@ from rich.markup import escape
 
 from booktl import console as con
 from booktl.config import Config
-from booktl.library import select_book, ensure_book, ordered_books
+from booktl.library import select_book, ensure_book, ordered_books, ask_reopen, open_url
 from booktl.client import ApiClient
 from booktl.pipeline import Pipeline
 from booktl.ingest import create_ingest_app
@@ -18,6 +19,20 @@ from booktl.commands import ReplContext, run_repl, print_report
 from booktl.prompts import build_messages, build_scout_messages
 
 RETRY_DRAIN_TIMEOUT = 6 * 3600  # seconds the 'retry' subcommand waits for re-queued chapters
+SERVER_READY_TIMEOUT = 5.0      # seconds to wait for the ingest server before reopening a page
+SERVER_READY_POLL = 0.1
+
+
+def wait_for_server(host: str, port: int) -> bool:
+    """True once the ingest server accepts connections, bounded by SERVER_READY_TIMEOUT."""
+    target = {"0.0.0.0": "127.0.0.1", "": "127.0.0.1", "::": "::1"}.get(host, host)
+    for _ in range(int(SERVER_READY_TIMEOUT / SERVER_READY_POLL)):
+        try:
+            with socket.create_connection((target, port), timeout=SERVER_READY_POLL):
+                return True
+        except OSError:
+            time.sleep(SERVER_READY_POLL)
+    return False
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -160,6 +175,7 @@ def main():
     cfg.set_book(bpath, bname)
     ensure_book(bpath)
     con.ok(f"Target novel set to: [bold green]{bname}[/bold green]")
+    reopen_url = ask_reopen(bpath) if sub == "run" else None
 
     # 2. Model Selection
     if not cfg.model:
@@ -202,6 +218,10 @@ def main():
     )
     server_thread.start()
     con.ok(f"Ingest API ready for Tampermonkey at: [bold green]http://{cfg.host}:{cfg.port}/book-content[/bold green]")
+    if reopen_url:
+        if not wait_for_server(cfg.host, cfg.port):
+            con.warn("The ingest server is not answering yet; opening the page anyway.")
+        open_url(reopen_url)
 
     # 5. Interactive REPL
     ctx = ReplContext(cfg, pipeline, client)

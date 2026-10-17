@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         69shuba Content Auto-Sender
 // @namespace    http://tampermonkey.net/
-// @version      2.3
+// @version      2.4
 // @description  Scrapes novel chapter text from 69shuba and sends it to the translation server
 // @author       Gemini
 // @match        *://www.69shuba.com/txt/*
@@ -334,6 +334,7 @@
             data: JSON.stringify({
                 content: novelText,
                 title: document.title,
+                url: location.href,
                 isActive: isActive
             }),
             onload: function (response) {

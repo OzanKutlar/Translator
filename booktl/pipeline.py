@@ -14,7 +14,7 @@ import time
 from rich.markup import escape
 
 from . import console as con
-from . import activity, arcs, clipaccept, prompts, parsing, storage, characters, glossary, termlookup
+from . import activity, arcs, clipaccept, prompts, parsing, resume, storage, characters, glossary, termlookup
 from .tracker import ChapterTracker
 from .client import ApiClient, ApiError
 from .workpool import PageEntry, PendingPool, entry_sort_key, parse_selection
@@ -86,6 +86,7 @@ class Pipeline:
         self._last_accepted_key: str | None = None
         self._ignored_fps: list[str] = []    # text the translator copied itself ('manual' prompts)
         self._clip_watcher: clipaccept.ClipboardWatcher | None = None
+        self._skip_url: str | None = None    # last session's reopen address; its first page is ignored
 
         self.counters = {
             "pages_seen": 0,
@@ -106,6 +107,7 @@ class Pipeline:
         """Load queue state and spawn worker threads matching target concurrency."""
         self.sync_batch_seq()
         self.load_queue_state()
+        self.load_reopen_address()
         with self.lock:
             self.stop_event.clear()
             self._worker_target = self.cfg.concurrency
@@ -120,6 +122,7 @@ class Pipeline:
             self._last_accepted_key = None
         self.sync_batch_seq()
         self.load_queue_state()
+        self.load_reopen_address()
         if self.clipboard_watch_active():
             con.info("Clipboard watch is still on; newly copied pages now go to this book.")
 
@@ -147,6 +150,12 @@ class Pipeline:
                 f"Loaded {count} missing/failed chapter record(s) from {storage.QUEUE_STATE_FILENAME}. "
                 f"Type [bold cyan]missing[/bold cyan] to view them."
             )
+
+    def load_reopen_address(self) -> None:
+        """Remember the book's reopen address; the first page that arrives from it is ignored."""
+        point = resume.load_reopen(self.cfg.book_dir)
+        with self.lock:
+            self._skip_url = point.url if point else None
 
     def _persist_queue_state(self) -> None:
         """Write Missing/Failed to disk. Must not be called while holding self.lock."""
@@ -196,12 +205,33 @@ class Pipeline:
     # Scraper ingest
     # ------------------------------------------------------------------
 
-    def offer_page(self, content: str, is_active: bool, title: str | None = None) -> dict:
-        """Ingest a page from Tampermonkey and return the scraper directive."""
+    def offer_page(self, content: str, is_active: bool, title: str | None = None,
+                   url: str | None = None) -> dict:
+        """Ingest a page from Tampermonkey and return the scraper directive.
+
+        url is the page's own address and becomes the book's reopen address. The first page
+        that arrives from the previous session's reopen address is ignored: it was already scraped.
+        """
         if not isinstance(content, str) or not content.strip():
             return {"action": "wait", "retryAfter": 3, "reason": "Empty content received"}
         if not self.cfg.book_dir:
             return {"action": "wait", "retryAfter": 5, "reason": "No book directory selected"}
+        page_url = resume.clean_url(url)
+        if self._take_skip(page_url):
+            self._log_skipped(content, title)
+            directive = self.poll_status(is_active)
+        else:
+            directive = self._queue_scraped(content, title, page_url)
+        if directive.get("action") in ("wait", "stop"):
+            return directive
+
+        # Pacing delay to avoid hammering the source novel website
+        delay = 1.0 if is_active else random.uniform(1.0, 3.5)
+        time.sleep(delay)
+        return directive
+
+    def _queue_scraped(self, content: str, title: str | None, page_url: str | None) -> dict:
+        """Queue a scraped page, store its URL as the reopen address, return the directive."""
         with self.lock:
             entry, confidence, replaced, forgot = self._ingest_locked(content, title)
             pending = len(self.pool)
@@ -212,13 +242,44 @@ class Pipeline:
             )
             directive = self._scraper_directive_locked()
         self._after_ingest(entry, confidence, forgot)
-        if directive.get("action") in ("wait", "stop"):
-            return directive
-
-        # Pacing delay to avoid hammering the source novel website
-        delay = 1.0 if is_active else random.uniform(1.0, 3.5)
-        time.sleep(delay)
+        self._save_reopen(page_url, entry)
         return directive
+
+    def _take_skip(self, page_url: str | None) -> bool:
+        """True exactly once for the previous session's reopen address."""
+        if not page_url:
+            return False
+        with self.lock:
+            if page_url != self._skip_url:
+                return False
+            self._skip_url = None
+            return True
+
+    def _log_skipped(self, content: str, title: str | None) -> None:
+        """Explain why a page from the reopen address was not queued."""
+        chapter = parsing.parse_chapter_number(title if isinstance(title, str) else "")
+        if chapter is None:
+            chapter = parsing.parse_chapter_number(content)
+        label = f"Chapter {chapter}" if chapter else "The page"
+        con.info(
+            f"Ignored {escape(label)} from the reopen address (already scraped last session); "
+            "the scraper moves on to the next chapter."
+        )
+        if chapter and not self._has_translation(chapter):
+            con.dim(f"{escape(label)} has no translated file yet. If it still needs translating, run 'retry {chapter}'.")
+
+    def _has_translation(self, chapter: int) -> bool:
+        filename = storage.sanitize_filename(f"Chapter {chapter}.md")
+        return os.path.isfile(os.path.join(self.cfg.book_dir, filename))
+
+    def _save_reopen(self, page_url: str | None, entry: PageEntry) -> None:
+        """Make the page's URL the book's reopen address. Must not be called while holding self.lock."""
+        if not page_url:
+            return
+        try:
+            resume.save_reopen(self.cfg.book_dir, page_url, entry.chapter)
+        except (OSError, ValueError) as e:
+            con.warn(f"Could not save the reopen address to {resume.RESUME_FILENAME}: {escape(str(e))}")
 
     def _after_ingest(self, entry: PageEntry, confidence: str, forgot: int) -> None:
         """Disk work after a page joined the pool. Must not be called while holding self.lock."""

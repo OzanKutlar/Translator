@@ -6,6 +6,7 @@ alphabetically, and ends with a row for creating a new book.
 
 import json
 import os
+import webbrowser
 from dataclasses import dataclass
 
 from rich.markup import escape
@@ -13,6 +14,7 @@ from rich.markup import escape
 from . import activity
 from . import console as con
 from . import menu
+from . import resume
 from .parsing import parse_chapter_number
 
 MAX_NUMBERED_ATTEMPTS = 5
@@ -27,6 +29,9 @@ _RESERVED_NAMES = frozenset(
     + [f"lpt{i}" for i in range(1, 10)]
 )
 _NEW_BOOK = object()  # sentinel: the picker's new-book row was chosen
+MAX_REOPEN_ATTEMPTS = 3
+_REOPEN_YES = ("", "y", "yes")   # Enter means yes
+_REOPEN_NO = ("n", "no")
 
 
 @dataclass(frozen=True)
@@ -301,3 +306,51 @@ def _parse_book_answer(books: list[str], ans: str) -> str | None:
     except ValueError:
         return None
     return books[idx] if 0 <= idx < len(books) else None
+
+
+# ----------------------------------------------------------------------
+# Reopening the last scraped page
+# ----------------------------------------------------------------------
+
+def ask_reopen(book_dir: str) -> str | None:
+    """Offer the book's reopen address. Returns the URL to open, or None (no address, or declined).
+
+    Enter means yes. EOF and Ctrl+C mean no, so non-interactive runs never open a browser.
+    """
+    point = resume.load_reopen(book_dir)
+    if point is None:
+        return None
+    question = (
+        f"[bold]↪ Reopen {escape(point.label)} at [cyan]{escape(point.url)}[/cyan]? "
+        f"{escape('[Y/n]')}: [/bold]"
+    )
+    for _ in range(MAX_REOPEN_ATTEMPTS):
+        try:
+            ans = con.console.input(question).strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            return None
+        if ans in _REOPEN_YES:
+            return point.url
+        if ans in _REOPEN_NO:
+            return None
+        con.warn("Please answer y or n (Enter means yes).")
+    con.warn("No valid answer; the page was not reopened.")
+    return None
+
+
+def open_url(url) -> bool:
+    """Open a reopen address in the default browser. Returns True when a browser was launched."""
+    clean = resume.clean_url(url)
+    if clean is None:
+        con.warn(f"Refusing to open an unusable address: {escape(repr(url))}")
+        return False
+    try:
+        opened = webbrowser.open(clean, new=2)
+    except (webbrowser.Error, OSError) as e:
+        con.fail(f"Could not open the browser ({escape(str(e))}). Open this page yourself: {escape(clean)}")
+        return False
+    if not opened:
+        con.warn(f"No browser could be started. Open this page yourself: {escape(clean)}")
+        return False
+    con.ok("Reopened the last scraped page. It is skipped once; scraping continues with the next chapter.")
+    return True

@@ -12,7 +12,7 @@ from . import storage
 from . import termlookup
 from .client import ApiClient
 from .config import Config, ConfigError
-from .library import create_book, select_book
+from .library import ask_reopen, create_book, open_url, select_book
 from .parsing import format_chapter_ranges
 from .pipeline import Pipeline, HAS_CLIPBOARD, describe_entries
 from .progressbar import render_bars
@@ -347,6 +347,9 @@ def _switch_book(ctx: ReplContext, bpath: str, bname: str) -> None:
     pending = ctx.pipeline.queue_counts()["pending"]
     if pending:
         con.warn(f"{pending} page(s) scraped for the previous book are still pending and will be translated into this book.")
+    reopen_url = ask_reopen(bpath)
+    if reopen_url:
+        open_url(reopen_url)
 
 
 def _book_new(ctx: ReplContext, args: list[str]) -> None:

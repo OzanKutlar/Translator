@@ -40,6 +40,21 @@ The book picker lists the books you translated recently first, newest at the top
 
 Each time a batch saves chapters, the time and the highest chapter in that batch are written to `<Book>/_activity.json`. Books from before this file existed use the modification time of their newest chapter `.md` file instead. To count only a time window as recent, set `RECENT_WINDOW_DAYS` in `booktl/activity.py` (e.g. `30`); older books then sort alphabetically.
 
+## Reopening a Book
+
+The scraper sends the address of every page along with its content, and the latest one is saved as the book's **reopen address** in `<Book>/_resume.json`. When you open the book again, at startup or with `book`, the tool asks:
+
+    ↪ Reopen Chapter 1240 at https://www.69shuba.com/txt/12345/67890? [Y/n]:
+
+- Press Enter (yes) to open the page in your default browser. At startup it opens once the ingest server is ready.
+- Type `n` to skip. Non-interactive runs never open a browser.
+- The first page that arrives from the reopen address is ignored, because it was already scraped last session, and the scraper moves on to the next chapter. This also works when you open the page yourself.
+- Only that first request is ignored; refreshing the page later queues it normally.
+- If the ignored chapter has no translated file yet (for example, it was still pending when you quit), the log says so. Run `retry <n>` to translate it from its stored raw page.
+- Pages taken with `accept` have no address and never change the reopen address.
+
+This needs `bookContent.js` 2.4 or later.
+
 ## How Pages Flow
 
 Every scraped page goes into one **pending pool**. Batches are not formed in advance: a worker cuts a batch from the front of the pool only when it is free to send one, using the batch size set at that moment. Running `batch 5` therefore applies to the very next batch.
@@ -136,6 +151,7 @@ Each finished batch logs one chapter summary, such as `Batch #4: Saved 10 chapte
 - `_queue_state.json` — Missing and Failed chapter lists.
 - `Glossary.json` — Locked term renderings (see below).
 - `_activity.json` — When the book was last translated and the highest chapter in that batch; orders the book picker.
+- `_resume.json` — The reopen address: the URL and chapter of the last page the scraper sent.
 
 ### Translation Approach
 

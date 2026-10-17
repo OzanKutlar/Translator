@@ -26,12 +26,14 @@ def create_ingest_app(pipeline: Pipeline) -> Flask:
         title = data.get("title", "")
         title = title if isinstance(title, str) else ""
         is_active = bool(data.get("isActive", False))
+        url = data.get("url", "")
+        url = url if isinstance(url, str) else ""
 
         if not content.strip():
             return jsonify({"action": "wait", "retryAfter": 3, "message": "Empty content received"}), 400
 
         # Directive includes 'pending' and 'backlogLimit' (None while a goal is set)
-        directive = pipeline.offer_page(content, is_active, title=title)
+        directive = pipeline.offer_page(content, is_active, title=title, url=url)
         return jsonify(directive), 200
 
     @app.route("/book-status", methods=["GET"])
