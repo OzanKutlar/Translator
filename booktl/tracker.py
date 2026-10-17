@@ -9,6 +9,13 @@ MAX_CONSECUTIVE_INFERENCES = 25
 CLEAR_GOAL_VALUES = ("none", "clear", "off", "0", "")
 
 
+def _explicit_chapter(value) -> int | None:
+    """A positive int chapter number, else None (bools and other types are ignored)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
 class ChapterTracker:
     """Tracks scraped and translated chapters for the current session, plus the stop goal.
 
@@ -113,9 +120,14 @@ class ChapterTracker:
     # Observations
     # ------------------------------------------------------------------
 
-    def observe_page(self, title: str | None, content: str) -> tuple[int | None, str]:
-        """Process an incoming raw page. Returns (chapter_number, confidence)."""
-        parsed = parse_chapter_number(title) if title else None
+    def observe_page(self, title: str | None, content: str, chapter: int | None = None) -> tuple[int | None, str]:
+        """Process an incoming raw page. Returns (chapter_number, confidence).
+
+        A valid explicit chapter (from 'accept <n>') takes priority over the number in the text.
+        """
+        parsed = _explicit_chapter(chapter)
+        if parsed is None and title:
+            parsed = parse_chapter_number(title)
         if parsed is None:
             parsed = parse_chapter_number(content)
         with self._lock:

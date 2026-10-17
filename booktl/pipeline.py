@@ -14,7 +14,7 @@ import time
 from rich.markup import escape
 
 from . import console as con
-from . import activity, arcs, prompts, parsing, storage, characters, glossary, termlookup
+from . import activity, arcs, clipaccept, prompts, parsing, storage, characters, glossary, termlookup
 from .tracker import ChapterTracker
 from .client import ApiClient, ApiError
 from .workpool import PageEntry, PendingPool, entry_sort_key, parse_selection
@@ -82,6 +82,10 @@ class Pipeline:
         self.auto_dispatch = True
         self.manual_active = False
         self.manual_entries: list[PageEntry] | None = None
+        self._last_accepted_fp = ""          # clipboard text accepted last (see accept_text)
+        self._last_accepted_key: str | None = None
+        self._ignored_fps: list[str] = []    # text the translator copied itself ('manual' prompts)
+        self._clip_watcher: clipaccept.ClipboardWatcher | None = None
 
         self.counters = {
             "pages_seen": 0,
@@ -111,8 +115,13 @@ class Pipeline:
         """Reset session tracking and load the new book's Missing/Failed lists."""
         self.tracker.reset()
         self.corpus.clear()
+        with self.lock:
+            self._last_accepted_fp = ""
+            self._last_accepted_key = None
         self.sync_batch_seq()
         self.load_queue_state()
+        if self.clipboard_watch_active():
+            con.info("Clipboard watch is still on; newly copied pages now go to this book.")
 
     def sync_batch_seq(self) -> None:
         """Advance batch numbering past existing spool files so _raw/ entries are never overwritten."""
@@ -202,10 +211,7 @@ class Pipeline:
                 f"· pending [bold]{pending}[/bold]{note}"
             )
             directive = self._scraper_directive_locked()
-        if confidence == "parsed":
-            self._store_raw_page(entry)
-        if forgot:
-            self._persist_queue_state()
+        self._after_ingest(entry, confidence, forgot)
         if directive.get("action") in ("wait", "stop"):
             return directive
 
@@ -214,9 +220,17 @@ class Pipeline:
         time.sleep(delay)
         return directive
 
-    def _ingest_locked(self, content: str, title: str | None) -> tuple[PageEntry, str, int, int]:
+    def _after_ingest(self, entry: PageEntry, confidence: str, forgot: int) -> None:
+        """Disk work after a page joined the pool. Must not be called while holding self.lock."""
+        if confidence == "parsed":
+            self._store_raw_page(entry)
+        if forgot:
+            self._persist_queue_state()
+
+    def _ingest_locked(self, content: str, title: str | None,
+                       chapter: int | None = None) -> tuple[PageEntry, str, int, int]:
         self.counters["pages_seen"] += 1
-        ch_num, confidence = self.tracker.observe_page(title, content)
+        ch_num, confidence = self.tracker.observe_page(title, content, chapter)
         chapter = ch_num if confidence != "unknown" else None
         entry = self.pool.make_entry(chapter, self._chapter_label(ch_num, confidence), content)
         replaced = self.pool.add([entry])
@@ -304,6 +318,113 @@ class Pipeline:
         }
 
     # ------------------------------------------------------------------
+    # Manual chapter accept (clipboard)
+    # ------------------------------------------------------------------
+
+    def accept_text(self, text, chapter: int | None = None, force: bool = False,
+                    source: str = "clipboard", watch: bool = False) -> list[tuple[str, str]]:
+        """Queue copied text as a raw page, exactly like a scraped page. Returns (level, message) pairs.
+
+        chapter overrides the number found in the text. Copying the same text again is ignored,
+        unless a chapter is given: then the earlier pending copy is replaced under that number.
+        In watch mode every rejection is reported dimly, since most copies are not chapters.
+        """
+        if not self.cfg.book_dir:
+            return [("dim" if watch else "warn", "No book directory selected; the copied text was not queued.")]
+        if chapter is not None and (isinstance(chapter, bool) or not isinstance(chapter, int) or chapter <= 0):
+            return [("fail", f"Chapter must be a positive whole number, not {escape(repr(chapter))}.")]
+        with self.lock:
+            fingerprint = clipaccept.fingerprint(text)
+            relabel = chapter is not None and bool(fingerprint) and fingerprint == self._last_accepted_fp
+            check = clipaccept.check_clipboard_text(
+                text, "" if relabel else self._last_accepted_fp, self._ignored_fps, force
+            )
+            if not check.ok:
+                return [("dim" if check.quiet or watch else "warn", escape(check.reason))]
+            dropped = self.pool.remove([self._last_accepted_key]) if relabel and self._last_accepted_key else 0
+            entry, confidence, replaced, forgot = self._ingest_locked(text, None, chapter)
+            self._last_accepted_fp, self._last_accepted_key = fingerprint, entry.key
+            report = self._accept_report_locked(entry, confidence, replaced, source)
+        self._after_ingest(entry, confidence, forgot)
+        if dropped:
+            report.insert(1, ("info", "Removed the earlier pending copy of this text that had the wrong chapter number."))
+        return report
+
+    def _accept_report_locked(self, entry: PageEntry, confidence: str, replaced: int,
+                              source: str) -> list[tuple[str, str]]:
+        pending = len(self.pool)
+        note = " · replaced pending copy" if replaced else ""
+        report = [("ok", (
+            f"Accepted [bold cyan]{escape(entry.label)}[/bold cyan] from {escape(str(source))} "
+            f"({len(entry.content):,} chars) · pending [bold]{pending}[/bold]{note}"
+        ))]
+        if confidence != "parsed":
+            report.append(("warn", (
+                f"No chapter number found in the copied text, so it was queued as {escape(entry.label)}. "
+                "With the text still copied, run 'accept <n>' to set the number."
+            )))
+        if self.tracker.goal_reached():
+            self._goal_directive_locked()
+        elif self.tracker.goal_state() == "none" and pending > self.backlog_limit():
+            report.append(("info", (
+                f"{pending} pages pending, above the scraper's limit of {self.backlog_limit()}; "
+                "copied pages are accepted anyway."
+            )))
+        report.append(self._accept_dispatch_note_locked(pending))
+        return report
+
+    def _accept_dispatch_note_locked(self, pending: int) -> tuple[str, str]:
+        if not self._dispatch_enabled_locked():
+            return ("info", "Auto-dispatch is paused or a manual session is open; use 'manual' or 'flush' when ready.")
+        if self.pool.drain or pending >= self.cfg.batch_size:
+            return ("dim", "It goes out with the next batch.")
+        return ("dim", f"Sent once {self.cfg.batch_size} pages are pending; use 'flush' to send now.")
+
+    def _ignore_text_locked(self, text: str) -> None:
+        """Remember text the translator put on the clipboard so accept never queues it."""
+        fingerprint = clipaccept.fingerprint(text)
+        if fingerprint and fingerprint not in self._ignored_fps:
+            self._ignored_fps.append(fingerprint)
+            del self._ignored_fps[:-clipaccept.MAX_IGNORED_FINGERPRINTS]
+
+    def start_clipboard_watch(self, report) -> tuple[bool, str]:
+        """Queue every newly copied chapter page; report receives each accept_text result."""
+        if not callable(report):
+            raise TypeError("report must be callable")
+        if not HAS_CLIPBOARD:
+            return False, "pyperclip not available. Install it to watch the clipboard."
+        if self.clipboard_watch_active():
+            return False, "Clipboard watch is already on."
+        watcher = clipaccept.ClipboardWatcher(
+            pyperclip.paste,
+            lambda text: report(self.accept_text(text, source="clipboard watch", watch=True)),
+        )
+        try:
+            watcher.start()
+        except Exception as e:  # pyperclip raises platform-specific exception types
+            return False, f"Could not read the clipboard: {escape(str(e))}"
+        with self.lock:
+            previous, self._clip_watcher = self._clip_watcher, watcher
+        if previous is not None:
+            previous.stop()
+        book = escape(self.cfg.book_name or "(no book)")
+        return True, (
+            f"Clipboard watch on: every newly copied chapter page is queued for [bold green]{book}[/bold green]. "
+            "What is on the clipboard right now is skipped; use 'accept' to take it. 'accept off' stops watching."
+        )
+
+    def stop_clipboard_watch(self) -> bool:
+        """Stop the clipboard watcher. Returns True when it was running."""
+        with self.lock:
+            watcher, self._clip_watcher = self._clip_watcher, None
+        return watcher.stop() if watcher is not None else False
+
+    def clipboard_watch_active(self) -> bool:
+        with self.lock:
+            watcher = self._clip_watcher
+        return watcher is not None and watcher.is_running
+
+    # ------------------------------------------------------------------
     # Flush / manual mode
     # ------------------------------------------------------------------
 
@@ -337,6 +458,7 @@ class Pipeline:
                 raise
             self.manual_entries = entries
             self.manual_active = True
+            self._ignore_text_locked(prompt)
         span = describe_entries(entries)
 
         if not HAS_CLIPBOARD:
@@ -1118,6 +1240,7 @@ class Pipeline:
                 "json_mode": self.cfg.json_mode,
                 "temperature": self.cfg.temperature,
                 "term_lookup": self.cfg.term_lookup,
+                "clipboard_watch": self.clipboard_watch_active(),
                 "counters": dict(self.counters),
                 "tracker": self.tracker.snapshot(),
                 **counts,
@@ -1129,6 +1252,7 @@ class Pipeline:
 
     def shutdown(self, drain: bool = True, timeout: int = 600) -> None:
         """Send pending pages (if dispatch is enabled), wait for in-flight batches, then stop."""
+        self.stop_clipboard_watch()
         if drain:
             self._drain_before_shutdown(timeout)
         self.stop_event.set()

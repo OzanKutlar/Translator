@@ -139,6 +139,19 @@ class PendingPool:
             self._cond.notify_all()
             return replaced
 
+    def remove(self, keys) -> int:
+        """Drop pending pages by key. Returns how many were removed."""
+        wanted = {str(key) for key in (keys or ()) if key is not None}
+        if not wanted:
+            return 0
+        with self._cond:
+            kept = [entry for entry in self._pending if entry.key not in wanted]
+            removed = len(self._pending) - len(kept)
+            self._pending = kept
+            if not self._pending:
+                self._drain = False
+            return removed
+
     def _add_front(self, entries: list[PageEntry]) -> int:
         keys = {entry.key for entry in entries}
         rest = [entry for entry in self._pending if entry.key not in keys]

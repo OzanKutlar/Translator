@@ -83,6 +83,8 @@ Everything typed into the console is a command, so no `/` prefix is needed (a le
 - `recover [#batch|chapters]` — With no argument, lists spooled batches. `recover #8` loads spooled batch 8. `recover 112-115` puts those chapters at the front of the pool *without* forcing a send, for `manual` or `flush`.
 - `manual` — Copy the next batch of pending pages to clipboard for external translation.
 - `paste` — Ingest translated JSON from clipboard (missing chapters are detected here too).
+- `accept [force] [n]` — Take the text on the clipboard as a raw chapter page and queue it (aliases: `grab`, `clip`). See [Manual Chapter Accept](#manual-chapter-accept-clipboard).
+- `accept <on|off|status>` — Watch the clipboard and queue every newly copied chapter page.
 - `cancel` — Cancel manual mode or in-flight batches; their pages return to the front of the pool.
 - `terms [search]` — Table of glossary terms, optionally filtered (alias: `glossary`).
 - `term add <chinese> = <english> [type:<type>]` — Add or override a term and lock it as yours, e.g. `term add 秃鹫尊者 = Venerable Vulture type:title`.
@@ -96,6 +98,25 @@ Everything typed into the console is a command, so no `/` prefix is needed (a le
 
 `retry` and `recover` find source pages in this order: in-flight batches, `_raw/chapters/`, older `_raw/batch_XXXX_pages.json` spools (newest first), then `_failed/` records. Chapters with no source are reported, not silently skipped.
 
+### Manual Chapter Accept (Clipboard)
+
+Pages don't have to come from the scraper. Copy a raw chapter page from any site or reader app (including the `第…章` title line if you can) and run `accept`. The clipboard text is queued exactly like a scraped page: it gets the same chapter detection, is stored in `_raw/chapters/` so `retry` works later, counts toward the goal, and is batched and sent with everything else in the pending pool.
+
+- `accept` — Take what is on the clipboard now.
+- `accept 120` / `accept ch120` — Same, but use Chapter 120 whatever the text says. Use it when the copy has no title line. Running it while the same text is still copied replaces the copy that was just queued under the wrong number.
+- `accept force [n]` — Skip the Chinese-text check below.
+- `accept on` — Watch the clipboard: every newly copied text is checked and queued, so you can copy chapter after chapter without typing. Whatever is on the clipboard when you turn it on is skipped. `accept off` stops watching; `accept status` and `status` show whether it is on.
+- Aliases: `grab`, `clip`.
+
+Copied text is accepted only when it:
+
+- has at least 50 Chinese characters (unless `force`) and at most 200,000 characters;
+- is not a translation prompt. The text `manual` copies is always skipped, so watch mode and `manual` work together;
+- is not JSON. Copy a model reply and use `paste` as usual;
+- is not the same text that was accepted just before.
+
+In watch mode rejected copies only produce a dim log line, since most things you copy aren't chapters. Copied pages are accepted even when the pool is above the scraper's backlog limit. A page without a readable chapter number is queued as `Chapter ~N` (after the last chapter) or `Chapter ?` with a warning. Watch mode stops itself after 5 failed clipboard reads in a row. On Linux, `pyperclip` needs `xclip`, `xsel` or `wl-clipboard`.
+
 ### Goal progress
 
 Progress bars count from the first chapter the scraper sends after the program starts, and both ends are included. For example, if the session starts at chapter 10 and you run `goal 30`, scraping chapters 10–20 shows `11/21` on the Scraped bar. Each chapter is counted once, even when it is retried or re-scraped.
@@ -108,7 +129,7 @@ Each finished batch logs one chapter summary, such as `Batch #4: Saved 10 chapte
 
 ### Files Written per Book
 
-- `_raw/chapters/ch_000120.txt` — Latest raw page for each scraped chapter (source for `retry`).
+- `_raw/chapters/ch_000120.txt` — Latest raw page for each scraped or accepted chapter (source for `retry`).
 - `_raw/batch_XXXX_pages.json` — Pages of every batch sent, written before the API call.
 - `_raw/unsent_*.json` — Pending pages that were never sent when the program exited.
 - `_failed/` — Quarantined failed batches with the model reply and error.

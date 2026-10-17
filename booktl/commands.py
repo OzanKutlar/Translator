@@ -40,9 +40,11 @@ TERM_USAGE = (
 ALIASES = {
     "exit": "quit", "q": "quit", "?": "help", "setpage": "batch",
     "buffer": "pending", "queue": "pending", "retranslate": "retry", "rt": "retry",
-    "glossary": "terms",
+    "glossary": "terms", "grab": "accept", "clip": "accept",
 }
+ACCEPT_USAGE = "Usage: accept [force] [<chapter>] · accept <on|off|status>"
 _BATCH_REF_RE = re.compile(r"^(?:#|b(?:atch)?\s*#?)\s*(\d+)$", re.IGNORECASE)
+_ACCEPT_CHAPTER_RE = re.compile(r"^(?:ch(?:apter)?\.?\s*)?(\d{1,7})$", re.IGNORECASE)
 
 HELP_ROWS = (
     ("status", "Display live status, pipeline counters, and current settings."),
@@ -72,6 +74,8 @@ HELP_ROWS = (
     ("auto <on|off>", "Toggle auto-dispatching (turn off to keep pages pending for manual)."),
     ("manual", "Copy the next batch of pending pages to the clipboard for external translation."),
     ("paste", "Ingest translation JSON response from clipboard."),
+    ("accept [force] [n]", "Take the text on the clipboard as a raw chapter page and queue it. 'accept 120' sets the chapter number; 'force' skips the Chinese-text check (aliases: grab, clip)."),
+    ("accept <on|off|status>", "Watch the clipboard and queue every newly copied chapter page automatically."),
     ("cancel", "Abort manual mode and in-flight batches; their pages return to the front of the pending pool."),
     ("raw <on|off>", "Toggle saving raw model responses to _raw/."),
     ("clear", "Clear terminal screen."),
@@ -91,7 +95,7 @@ class ReplContext:
 # Display helpers
 # ----------------------------------------------------------------------
 
-_REPORT_PRINTERS = {"ok": con.ok, "info": con.info, "warn": con.warn, "fail": con.fail}
+_REPORT_PRINTERS = {"ok": con.ok, "info": con.info, "warn": con.warn, "fail": con.fail, "dim": con.dim}
 
 
 def print_report(report) -> None:
@@ -207,6 +211,7 @@ def print_status(ctx: ReplContext) -> None:
     table.add_row("Auto Dispatch", "[green]ON[/green]" if s["auto_dispatch"] else "[yellow]PAUSED[/yellow]")
     table.add_row("Term Lookup", "[green]ON[/green]" if s.get("term_lookup") else "[yellow]OFF[/yellow]")
     table.add_row("Manual Active", f"[yellow]YES ({s['manual']} pages)[/yellow]" if s["manual_active"] else "NO")
+    table.add_row("Clipboard Watch", "[green]ON[/green]" if s.get("clipboard_watch") else "OFF")
     table.add_row("Pending Pages", _pending_text(s))
     table.add_row("In-Flight", f"{s['in_flight_batches']} batch(es), {s['in_flight']} page(s)")
     table.add_row("Missing Chapters", f"[bold yellow]{s['missing']}[/bold yellow]" if s["missing"] else "0")
@@ -500,6 +505,57 @@ def cmd_cancel(ctx: ReplContext, args: list[str]) -> None:
         con.warn(msg)
 
 
+def _accept_chapter(args: list[str]) -> tuple[bool, int | None]:
+    """(True, chapter or None) for 'accept [n]' arguments; (False, None) when unreadable."""
+    if not args:
+        return True, None
+    match = _ACCEPT_CHAPTER_RE.match(" ".join(args).strip())
+    if not match or int(match.group(1)) <= 0:
+        return False, None
+    return True, int(match.group(1))
+
+
+def _accept_once(ctx: ReplContext, args: list[str]) -> None:
+    force = bool(args) and args[0].lower() == "force"
+    ok, chapter = _accept_chapter(args[1:] if force else args)
+    if not ok:
+        con.warn(escape(ACCEPT_USAGE))
+        return
+    if not HAS_CLIPBOARD:
+        con.fail("pyperclip not available. Install it to accept chapters from the clipboard.")
+        return
+    try:
+        text = pyperclip.paste()
+    except Exception as e:  # pyperclip raises platform-specific exception types
+        con.fail(f"Could not read clipboard: {escape(str(e))}")
+        return
+    print_report(ctx.pipeline.accept_text(text, chapter=chapter, force=force))
+
+
+def _accept_watch(ctx: ReplContext, mode: str) -> None:
+    if mode == "status":
+        state = "on" if ctx.pipeline.clipboard_watch_active() else "off"
+        con.info(f"Clipboard watch is {state}.")
+        return
+    if mode == "on":
+        ok, msg = ctx.pipeline.start_clipboard_watch(print_report)
+        (con.ok if ok else con.warn)(msg)
+        return
+    if ctx.pipeline.stop_clipboard_watch():
+        con.ok("Clipboard watch off.")
+    else:
+        con.info("Clipboard watch was not running.")
+
+
+def cmd_accept(ctx: ReplContext, args: list[str]) -> None:
+    """accept [force] [n] -> queue the clipboard as a raw page; accept on|off|status -> clipboard watch."""
+    mode = args[0].lower() if args else ""
+    if mode in ("on", "off", "status"):
+        _accept_watch(ctx, mode)
+        return
+    _accept_once(ctx, args)
+
+
 def cmd_retry(ctx: ReplContext, args: list[str]) -> None:
     """retry -> all failed chapters; retry <chapters|ranges|missing|failed|all> -> those, sent now."""
     if args:
@@ -693,6 +749,7 @@ HANDLERS = {
     "auto": cmd_auto,
     "manual": cmd_manual,
     "paste": cmd_paste,
+    "accept": cmd_accept,
     "cancel": cmd_cancel,
     "retry": cmd_retry,
     "recover": cmd_recover,
@@ -701,7 +758,7 @@ HANDLERS = {
     "term": cmd_term,
     "lookup": cmd_lookup,
 }
-COMMAND_WORDS = tuple(sorted(set(HANDLERS) | {"quit", "retranslate", "buffer", "queue", "glossary"}))
+COMMAND_WORDS = tuple(sorted(set(HANDLERS) | {"quit", "retranslate", "buffer", "queue", "glossary", "grab", "clip"}))
 
 
 def _normalise_command(token: str) -> str:
