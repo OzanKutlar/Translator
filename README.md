@@ -116,6 +116,20 @@ Each finished batch logs one chapter summary, such as `Batch #4: Saved 10 chapte
 - `Glossary.json` — Locked term renderings (see below).
 - `_activity.json` — When the book was last translated and the highest chapter in that batch; orders the book picker.
 
+### Translation Approach
+
+The model translates the author's meaning rather than word for word, so clumsy, ungrammatical or repetitive Chinese comes out as fluent English. It may restructure awkward sentences, fix grammar, resolve unclear subjects, and split or join sentences within a paragraph.
+
+The author's style is kept:
+
+- Paragraph breaks stay 1:1 with the source; short paragraphs are never merged.
+- Tone, register, pacing, tense, point of view and level of description stay the same, with no added flourishes or explanations.
+- Characteristic repetition, catchphrases and every character's voice are preserved. Only the author's clumsiness is fixed, never a character's.
+- Nothing is omitted or summarized, and the author's plot or continuity mistakes are translated as written (with a TN if they would confuse readers).
+- Puns still get a `*` and a TN, and locked terms and names always take priority over fluency.
+
+The 1:1 paragraph rule also keeps the term-drift check and the prior-usage excerpts accurate, because both rely on the English text lining up with the raw page. Edit the `TRANSLATION APPROACH` section of `SYSTEM_PROMPT` in `booktl/prompts.py` to adjust it.
+
 ### Glossary / Locked Terms
 
 Character files keep people's names consistent. Everything else that must stay the same across the book lives in `<Book>/Glossary.json`: titles and nicknames (秃鹫尊者 → "Venerable Vulture"), skills, buffs and debuffs, items, places, organizations and ranks.
