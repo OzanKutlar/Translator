@@ -16,11 +16,19 @@ from booktl.client import ApiClient
 from booktl.pipeline import Pipeline
 from booktl.ingest import create_ingest_app
 from booktl.commands import ReplContext, run_repl, print_report
-from booktl.prompts import build_messages, build_scout_messages
+from booktl.prompts import build_messages, build_scout_conversation, build_translation_followup
 
 RETRY_DRAIN_TIMEOUT = 6 * 3600  # seconds the 'retry' subcommand waits for re-queued chapters
 SERVER_READY_TIMEOUT = 5.0      # seconds to wait for the ingest server before reopening a page
 SERVER_READY_POLL = 0.1
+SAMPLE_SCOUT_REPLY = '{"candidateTerms": [{"Chinese": "血魔印", "ProposedEnglish": "Blood Fiend Mark", "Type": "item"}]}'
+SAMPLE_PRIOR_USAGE = (
+    "## 血魔印\n"
+    "Found in 1 translated chapter(s); excerpts from Chapter(s) 300.\n"
+    "- Chapter 300 (earliest) · anchors matched: Li Yao\n"
+    "  ZH: [Chinese sentence from the earlier chapter]\n"
+    "  EN: [Matching passage of its English translation]"
+)
 
 
 def wait_for_server(host: str, port: int) -> bool:
@@ -129,11 +137,17 @@ def main():
             return
         bpath, bname = book_res
         sample = "[Sample Chinese raw text page goes here...]"
+        con.rule("Single Translation Call (used when term lookup is off or the scout fails)")
         for m in build_messages(bpath, sample):
             con.panel(m["content"], title=f"Role: {m['role'].upper()}", style="cyan")
-        con.rule("Term Scout Call (sent first while term lookup is on)")
-        for m in build_scout_messages(bpath, sample):
+        con.rule("Term Scout Call (opens the batch conversation while term lookup is on)")
+        scout = build_scout_conversation(bpath, sample)
+        for m in scout:
             con.panel(escape(m["content"]), title=f"Scout Role: {m['role'].upper()}", style="magenta")
+        con.rule("Translation Call (continues the scout conversation; the turns above are repeated first)")
+        followup = build_translation_followup(scout, SAMPLE_SCOUT_REPLY, SAMPLE_PRIOR_USAGE)
+        for m in followup[len(scout):]:
+            con.panel(escape(m["content"]), title=f"Follow-up Role: {m['role'].upper()}", style="yellow")
         return
 
     # Handle 'check' subcommand

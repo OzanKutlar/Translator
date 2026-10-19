@@ -226,18 +226,53 @@ PRIOR_USAGE_INTRO = (
 
 SCOUT_REQUEST_LIMIT = 25   # the software keeps at most termlookup.MAX_CANDIDATES of these
 
-SCOUT_PROMPT = (
-    "You are preparing to translate Chinese novel pages into English. Do NOT translate anything yet.\n\n"
+# First user turn of the batch conversation (see build_scout_conversation).
+SCOUT_TURN = (
+    "Before translating, we first prepare the glossary for the pages below. For THIS reply only, do NOT "
+    "translate anything, and ignore the RESPONSE FORMAT in the system instructions.\n\n"
     "List the recurring proper nouns and coined terms in these pages that belong in the book's glossary: "
     "titles, nicknames and epithets, skills and techniques, buffs and debuffs, items and artifacts, places, "
     "sects and organizations, ranks and cultivation realms, currencies.\n"
     "Leave out people's real names, ordinary vocabulary, and every term listed under LOCKED TERMS.\n"
     f"List at most {SCOUT_REQUEST_LIMIT} terms, most important first. Copy the Chinese text exactly as it "
     "appears in the pages, without surrounding punctuation.\n\n"
-    "RESPONSE FORMAT - respond with ONLY a valid JSON object. No preamble, no explanation, no markdown code fences.\n"
+    "RESPONSE FORMAT FOR THIS REPLY - respond with ONLY a valid JSON object. No preamble, no explanation, "
+    "no markdown code fences.\n"
     '{"candidateTerms": [{"Chinese": "血魔印", "ProposedEnglish": "Blood Fiend Mark", "Type": "item"}]}\n'
     "Type is one of: title, skill, item, status, place, organization, rank, other. "
-    'If there are no such terms, respond with {"candidateTerms": []}.'
+    'If there are no such terms, respond with {"candidateTerms": []}.\n\n'
+    "After your list, I will show you how earlier chapters already rendered these terms, "
+    "and then ask you to translate the pages."
+)
+
+# Follow-up user turn when the lookup found earlier renderings (see build_translation_followup).
+PRIOR_USAGE_FOLLOWUP = (
+    "Here is how earlier chapters already rendered some of the candidates you listed. These terms were "
+    "translated before but never registered in the glossary. Each entry shows the Chinese sentence from an "
+    "earlier chapter and the matching passage of its existing English translation. Passages are located by "
+    "position, so one may be slightly off; 'anchors matched' lists names found near the term that confirm the spot.\n"
+    "You wrote your candidate list WITHOUT seeing these chapters, so your proposed renderings do not count "
+    "wherever an earlier rendering exists. For each term:\n"
+    "  1. Work out how the earlier English rendered it and reuse that rendering exactly, "
+    "including inside longer phrases, even if your proposal was different.\n"
+    "  2. Register it with AddTerm using that rendering. If earlier chapters disagree, the EARLIEST chapter "
+    "wins: use its rendering and put the other one in Note, e.g. 'also written as X in Chapter 612'.\n"
+    "  3. Only if the earlier rendering clearly does not fit the current context (for example the term means "
+    "something different here), use a better rendering, register that one, put 'previously written as X' in Note, "
+    "and after the paragraph where it first appears add: "
+    "(TN: This was written as X in earlier chapters, but Y fits the current context better.)\n"
+    "  4. If an excerpt does not show the term at all, ignore that excerpt."
+)
+
+NO_PRIOR_USAGE_FOLLOWUP = (
+    "No earlier renderings were found for the candidates you listed: they are new to this book, or already "
+    "locked. Choose renderings as usual and register the new terms with AddTerm."
+)
+
+TRANSLATE_NOW = (
+    "Now translate the pages from my previous message, following the system instructions exactly. "
+    'Respond with ONLY the JSON object with the four keys "chapters", "characterActions", '
+    '"arcEnds" and "termActions".'
 )
 
 
@@ -287,11 +322,60 @@ def build_manual_prompt(book_dir: str, pages_text: str) -> str:
     return "\n\n".join(parts)
 
 
-def build_scout_messages(book_dir: str, pages_text: str) -> list[dict]:
-    """Messages for the term-scout call: which glossary terms the model plans to register."""
-    messages = [{"role": "system", "content": SCOUT_PROMPT}]
-    locked = glossary.get_term_context(glossary.match_terms(book_dir, pages_text)) if book_dir else ""
-    if locked:
-        messages.append({"role": "system", "content": f"=== LOCKED TERMS ===\n{locked}\n=== END LOCKED TERMS ==="})
-    messages.append({"role": "user", "content": f"=== BEGIN PAGES ===\n\n{pages_text}\n\n=== END PAGES ==="})
+def build_scout_conversation(book_dir: str, pages_text: str) -> list[dict]:
+    """Messages 1-3 of a batch conversation: translation instructions, book context, scout request with the pages.
+
+    The translation call continues exactly these messages (see build_translation_followup), so both calls
+    share one prefix that endpoints with prompt caching can reuse.
+    """
+    if not isinstance(pages_text, str):
+        raise ValueError("pages_text must be a string")
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    context_blocks = _context_blocks(book_dir, pages_text)
+    if context_blocks:
+        messages.append({"role": "system", "content": "\n\n".join(context_blocks)})
+    messages.append({
+        "role": "user",
+        "content": f"{SCOUT_TURN}\n\n=== BEGIN PAGES ===\n\n{pages_text}\n\n=== END PAGES ==="
+    })
+    return messages
+
+
+# Kept for older callers; the scout call is now the opening of the batch conversation.
+build_scout_messages = build_scout_conversation
+
+_ROLES = ("system", "user", "assistant")
+
+
+def _is_message(message) -> bool:
+    return isinstance(message, dict) and message.get("role") in _ROLES and isinstance(message.get("content"), str)
+
+
+def _followup_text(prior_usage: str) -> str:
+    """The user turn after the scout reply: prior-usage results (if any), then the translation request."""
+    body = prior_usage.strip()
+    if not body:
+        return f"{NO_PRIOR_USAGE_FOLLOWUP}\n\n{TRANSLATE_NOW}"
+    return f"{PRIOR_USAGE_FOLLOWUP}\n\n=== PRIOR USAGE ===\n{body}\n=== END PRIOR USAGE ===\n\n{TRANSLATE_NOW}"
+
+
+def build_translation_followup(scout_messages, scout_reply, prior_usage: str = "") -> list[dict]:
+    """Translation call that continues the scout conversation.
+
+    Returns a new list: the scout messages unchanged, the scout reply as the assistant's turn, and a
+    user turn with the prior-usage results and the request to translate. Raises ValueError on bad input.
+    """
+    if not isinstance(scout_messages, list) or not scout_messages:
+        raise ValueError("scout_messages must be a non-empty list")
+    if not all(_is_message(m) for m in scout_messages):
+        raise ValueError("scout_messages contains a malformed message")
+    if scout_messages[-1]["role"] != "user":
+        raise ValueError("the scout conversation must end with the scout request")
+    if not isinstance(scout_reply, str) or not scout_reply.strip():
+        raise ValueError("scout_reply must be a non-empty string")
+    if prior_usage is not None and not isinstance(prior_usage, str):
+        raise ValueError("prior_usage must be a string")
+    messages = [dict(m) for m in scout_messages]
+    messages.append({"role": "assistant", "content": scout_reply.strip()})
+    messages.append({"role": "user", "content": _followup_text(prior_usage or "")})
     return messages

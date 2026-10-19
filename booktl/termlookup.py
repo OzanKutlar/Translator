@@ -455,12 +455,14 @@ def _occurrence_lines(occurrence: Occurrence, first: int, last: int) -> list[str
 
 
 def format_usage(usage: TermUsage) -> str:
-    """One PRIOR USAGE entry for the prompt."""
+    """One PRIOR USAGE entry for the prompt.
+
+    The scout's proposed rendering is left out on purpose: it anchors the model to its own guess.
+    """
     candidate = usage.candidate
-    proposed = f' (your proposed rendering: "{candidate.english}")' if candidate.english else ""
     shown = ", ".join(str(o.chapter) for o in usage.occurrences)
     lines = [
-        f"## {candidate.chinese}{proposed}",
+        f"## {candidate.chinese}",
         f"Found in {len(usage.chapters)} translated chapter(s); excerpts from Chapter(s) {shown}.",
     ]
     for occurrence in usage.occurrences:
@@ -524,3 +526,23 @@ def audit_term(corpus: TermCorpus, book_dir: str, chinese: str,
     candidate = Candidate(chinese, "", "")
     usage = _usage(corpus, book_dir, candidate, found, translated, _load_anchors(book_dir), limit, warnings)
     return usage, warnings
+
+
+def rendering_in_chapter(book_dir: str, chapter, english) -> bool | None:
+    """Whether a chapter's translated .md file contains english (case-insensitive).
+
+    None when it cannot be checked: bad arguments, no translated file, or an unreadable file.
+    """
+    if not book_dir or isinstance(chapter, bool) or not isinstance(chapter, int) or chapter <= 0:
+        return None
+    target = english.strip() if isinstance(english, str) else ""
+    if not target:
+        return None
+    try:
+        path = _translated_index(book_dir).get(chapter)
+        if path is None:
+            return None
+        content = _read_text(path)
+    except (OSError, ValueError):  # UnicodeDecodeError is a ValueError
+        return None
+    return target.casefold() in content.casefold()

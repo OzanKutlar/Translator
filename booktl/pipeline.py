@@ -10,6 +10,7 @@ import os
 import random
 import threading
 import time
+from dataclasses import dataclass, field
 
 from rich.markup import escape
 
@@ -62,6 +63,24 @@ def _describe_keys(keys) -> str:
     others = [str(k) for k in keys if not isinstance(k, int)]
     parts = [p for p in (_format_chapter_ranges(numbers), ", ".join(others)) if p]
     return "; ".join(parts)
+
+
+@dataclass
+class ScoutOutcome:
+    """What a batch's term scout produced.
+
+    messages are the exact scout messages sent and reply is the scout's raw answer; the translation
+    call continues that conversation. Both are empty when the scout was skipped or failed, which
+    means the batch goes out as a single translation call.
+    """
+
+    lookup: termlookup.LookupResult = field(default_factory=termlookup.LookupResult)
+    messages: list = field(default_factory=list)
+    reply: str = ""
+
+    @property
+    def usable(self) -> bool:
+        return bool(self.messages) and isinstance(self.reply, str) and bool(self.reply.strip())
 
 
 class Pipeline:
@@ -896,11 +915,11 @@ class Pipeline:
 
         label = f"Batch #{batch_id}"
         pages_text = PAGE_SEPARATOR.join(pages)
-        lookup = self._scout_terms(label, entries, pages_text)
+        scout = self._scout_terms(label, entries, pages_text)
         if self._is_cancelled(batch_id):
             con.warn(f"Batch #{batch_id} was cancelled during the term lookup; nothing sent (pages are already back in the pending pool).")
             return
-        messages = prompts.build_messages(book_dir, pages_text, prior_usage=lookup.context)
+        messages = self._translation_messages(label, book_dir, pages_text, scout)
         if cfg.dry_run:
             con.rule(f"Dry Run: Batch #{batch_id}")
             con.console.print(f"[dim]Constructed {len(messages)} messages for {escape(cfg.model or '(no model)')} · {len(pages)} pages · {span}[/dim]")
@@ -926,7 +945,7 @@ class Pipeline:
         if not reply.chapters:
             self._handle_batch_failure(batch_id, entries, raw_reply, "Reply contained no chapters")
             return
-        numbers = self._save_results(label, reply.chapters, reply, lookup.first_seen)
+        numbers = self._save_results(label, reply.chapters, reply, scout.lookup.first_seen)
         self._reconcile(label, batch_id, entries, reply.chapters, numbers)
         self._check_term_drift(label, entries, reply.chapters)
 
@@ -934,39 +953,52 @@ class Pipeline:
     # Prior-usage term lookup
     # ------------------------------------------------------------------
 
-    def _scout_terms(self, label: str, entries: list[PageEntry], pages_text: str) -> termlookup.LookupResult:
+    def _scout_terms(self, label: str, entries: list[PageEntry], pages_text: str) -> ScoutOutcome:
         """Ask the model which terms it will register, then find how earlier chapters rendered them.
 
-        Never raises: any failure is logged and the batch is translated without the lookup.
+        Never raises: any failure is logged and the batch is translated as a single call.
         """
         if not self.cfg.term_lookup:
-            return termlookup.LookupResult()
+            return ScoutOutcome()
         if self.cfg.dry_run:
-            scout = prompts.build_scout_messages(self.cfg.book_dir, pages_text)
-            con.dim(f"{label}: term scout would send {len(scout)} message(s) first (skipped in dry run)")
-            return termlookup.LookupResult()
+            scout = prompts.build_scout_conversation(self.cfg.book_dir, pages_text)
+            con.dim(
+                f"{label}: term scout would send {len(scout)} message(s) first and the translation call "
+                "would continue that conversation (skipped in dry run)"
+            )
+            return ScoutOutcome()
         try:
             return self._run_scout(label, entries, pages_text)
         except ApiError as e:
             con.warn(f"{label}: term scout call failed ({escape(str(e))}); translating without the prior-usage lookup.")
         except Exception as e:  # the lookup is an aid and must never fail a batch
             con.warn(f"{label}: prior-usage lookup failed ({escape(f'{type(e).__name__}: {e}')}); translating without it.")
-        return termlookup.LookupResult()
+        return ScoutOutcome()
 
-    def _run_scout(self, label: str, entries: list[PageEntry], pages_text: str) -> termlookup.LookupResult:
+    def _run_scout(self, label: str, entries: list[PageEntry], pages_text: str) -> ScoutOutcome:
         book_dir = self.cfg.book_dir
-        messages = prompts.build_scout_messages(book_dir, pages_text)
+        messages = prompts.build_scout_conversation(book_dir, pages_text)
         raw_reply, usage = self.client.chat(self.cfg, messages, max_tokens=SCOUT_MAX_TOKENS)
         self._record_usage(usage)
         proposed, err = parsing.parse_scout_reply(raw_reply)
         if err:
             con.warn(f"{label}: term scout reply unusable ({escape(err)}); translating without the prior-usage lookup.")
-            return termlookup.LookupResult()
+            return ScoutOutcome()
         candidates = termlookup.filter_candidates(book_dir, proposed, pages_text)
         batch_chapters = {e.chapter for e in entries if e.chapter is not None}
         result = termlookup.build_prior_usage(self.corpus, book_dir, candidates, batch_chapters)
         self._log_lookup(label, len(proposed), result)
-        return result
+        return ScoutOutcome(result, messages, raw_reply if isinstance(raw_reply, str) else "")
+
+    def _translation_messages(self, label: str, book_dir: str, pages_text: str,
+                              scout: ScoutOutcome) -> list[dict]:
+        """Continue the scout conversation when the scout worked; otherwise build one plain translation call."""
+        if scout.usable:
+            try:
+                return prompts.build_translation_followup(scout.messages, scout.reply, scout.lookup.context)
+            except ValueError as e:
+                con.warn(f"{label}: could not continue the scout conversation ({escape(str(e))}); sending a single translation call.")
+        return prompts.build_messages(book_dir, pages_text, prior_usage=scout.lookup.context)
 
     @staticmethod
     def _log_lookup(label: str, proposed: int, result: termlookup.LookupResult) -> None:
@@ -1178,6 +1210,27 @@ class Pipeline:
             con.fail(f"{label}: glossary update failed: {escape(str(e))}")
             return
         self._log_term_summary(label, summary)
+        self._verify_recovered(label, summary.get("recovered", []))
+
+    def _verify_recovered(self, label: str, recovered) -> None:
+        """Warn when a term registered from prior usage is missing from its first chapter's translation."""
+        if not isinstance(recovered, list):
+            return
+        for ev in recovered[:glossary.MAX_ACTIONS_PER_REPLY]:
+            if not isinstance(ev, dict):
+                continue
+            chapter = ev.get("chapter")
+            english = str(ev.get("english") or "")
+            chinese = str(ev.get("chinese") or "")
+            found = termlookup.rendering_in_chapter(self.cfg.book_dir, chapter, english)
+            if found is None:
+                con.dim(f"{label}: could not check “{escape(english)}” against Chapter {chapter} (no readable translation)")
+            elif not found:
+                con.warn(
+                    f"{label}: ⚠ Registered “{escape(english)}” for {escape(chinese)} as first seen in Chapter {chapter}, "
+                    f"but Chapter {chapter}'s translation doesn't contain it. If the model changed it on purpose (see its TN), "
+                    f"ignore this; otherwise check with 'terms audit {escape(chinese)}' and fix it with 'term add'."
+                )
 
     @staticmethod
     def _log_term_summary(label: str, summary: dict) -> None:

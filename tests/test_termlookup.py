@@ -75,7 +75,7 @@ class LookupTests(unittest.TestCase):
         self.assertIn("血魔印", occ.zh)
         self.assertIn("Li Yao", occ.anchors)
         self.assertIn("Azure Sect", occ.anchors)
-        self.assertIn("Blood Fiend Mark", result.context)
+        self.assertNotIn("Blood Fiend Mark", result.context)  # the proposal is never shown back
 
     def test_current_batch_is_excluded(self):
         candidates = [termlookup.Candidate("血魔印", "", "")]
@@ -107,6 +107,13 @@ class LookupTests(unittest.TestCase):
         usage, warnings = termlookup.audit_term(self.corpus, self.book, "血魔印")
         self.assertEqual(warnings, [])
         self.assertEqual(usage.chapters, (300,))
+
+    def test_rendering_in_chapter(self):
+        self.assertTrue(termlookup.rendering_in_chapter(self.book, 300, "blood demon seal"))
+        self.assertFalse(termlookup.rendering_in_chapter(self.book, 300, "Blood Fiend Mark"))
+        self.assertIsNone(termlookup.rendering_in_chapter(self.book, 301, "Blood Demon Seal"))
+        self.assertIsNone(termlookup.rendering_in_chapter(self.book, 300, "  "))
+        self.assertIsNone(termlookup.rendering_in_chapter(self.book, True, "Blood Demon Seal"))
 
 
 class ScoutParsingTests(unittest.TestCase):
