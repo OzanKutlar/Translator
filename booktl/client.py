@@ -1,5 +1,6 @@
 """OpenAI v1-compatible HTTP client."""
 
+import threading
 import time
 
 import requests
@@ -8,12 +9,63 @@ from rich.table import Table
 
 from . import console as con
 from . import menu
+from .cancel import ApiCancelled, CancelToken
 from .config import ConfigError
 
 MODEL_PAGE_SIZE = 15
 MAX_FALLBACK_ATTEMPTS = 10
 MANUAL_ENTRY_LABEL = "✎ Enter model ID manually…"
 _MANUAL = object()  # sentinel: the picker's manual-entry row was chosen
+POST_POLL_SECONDS = 0.25
+POST_GRACE_SECONDS = 5   # extra wait beyond the request timeout before giving up on the helper thread
+CANCEL_MESSAGE = "Request cancelled via console command"
+
+
+def _raise_if_cancelled(cancel) -> None:
+    if cancel is not None and cancel.is_cancelled:
+        raise ApiCancelled(CANCEL_MESSAGE)
+
+
+def _sleep(seconds: float, cancel) -> None:
+    """Sleep for backoff or rate limits; a cancelled token ends the sleep with ApiCancelled."""
+    if cancel is None:
+        time.sleep(seconds)
+        return
+    if cancel.wait(seconds):
+        raise ApiCancelled(CANCEL_MESSAGE)
+
+
+def _post_abortable(url: str, headers: dict, payload: dict, timeout: int, cancel):
+    """POST that the caller can abandon when cancel fires.
+
+    requests cannot interrupt a request that is already sent, so the call runs on a daemon
+    thread. On cancel the caller stops waiting and the late response is dropped.
+    """
+    if cancel is None:
+        return requests.post(url, headers=headers, json=payload, timeout=timeout)
+    outcome = {}
+    done = threading.Event()
+
+    def run():
+        try:
+            outcome["response"] = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        except Exception as e:  # handed back to the waiting worker below
+            outcome["error"] = e
+        finally:
+            done.set()
+
+    threading.Thread(target=run, daemon=True, name="booktl-http").start()
+    polls = max(1, int((timeout + POST_GRACE_SECONDS) / POST_POLL_SECONDS))
+    for _ in range(polls):
+        if cancel.is_cancelled:
+            raise ApiCancelled("Request abandoned after cancellation")
+        if done.wait(POST_POLL_SECONDS):
+            break
+    else:
+        raise requests.Timeout(f"No response within {timeout}s")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["response"]
 
 
 class ApiError(Exception):
@@ -194,11 +246,15 @@ class ApiClient:
     # Chat completions
     # ------------------------------------------------------------------
 
-    def chat(self, cfg, messages: list[dict], max_tokens: int | None = None) -> tuple[str, dict | None]:
+    def chat(self, cfg, messages: list[dict], max_tokens: int | None = None,
+             cancel: CancelToken | None = None) -> tuple[str, dict | None]:
         """Send chat completion request with exponential backoff.
 
         max_tokens limits this call only; when cfg.max_tokens is also set, the smaller one wins.
+        cancel, when set, stops the call (including retries and backoff) with ApiCancelled.
         """
+        if cancel is not None and not isinstance(cancel, CancelToken):
+            raise TypeError("cancel must be a CancelToken or None")
         if not cfg.model:
             raise ApiError("No model specified. Use the model command to configure one.")
 
@@ -222,13 +278,15 @@ class ApiClient:
         last_err = None
 
         for attempt in range(attempts):
+            _raise_if_cancelled(cancel)
             try:
-                resp = requests.post(url, headers=self._headers(cfg), json=payload, timeout=cfg.timeout)
+                resp = _post_abortable(url, self._headers(cfg), payload, cfg.timeout, cancel)
             except requests.Timeout:
                 last_err = ApiError(f"Request timed out after {cfg.timeout}s")
             except requests.RequestException as e:
                 last_err = ApiError(f"HTTP connection failed: {e}")
             else:
+                _raise_if_cancelled(cancel)  # a reply that arrives after cancel is dropped
                 if resp.status_code == 200:
                     try:
                         res_json = resp.json()
@@ -258,7 +316,7 @@ class ApiClient:
                         except ValueError:
                             pass
                     con.warn(f"Rate limited (HTTP 429). Retrying in {retry_after}s...")
-                    time.sleep(retry_after)
+                    _sleep(retry_after, cancel)
                     continue
 
                 last_err = ApiError(f"API returned HTTP {resp.status_code}: {body_sample}", resp.status_code)
@@ -266,6 +324,6 @@ class ApiClient:
             if attempt < attempts - 1:
                 backoff = min(30, 2 ** attempt)
                 con.warn(f"Attempt {attempt + 1} failed ({last_err}). Backing off {backoff}s...")
-                time.sleep(backoff)
+                _sleep(backoff, cancel)
 
         raise last_err or ApiError("All API completion attempts failed.")

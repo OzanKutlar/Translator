@@ -100,7 +100,7 @@ Everything typed into the console is a command, so no `/` prefix is needed (a le
 - `paste` — Ingest translated JSON from clipboard (missing chapters are detected here too).
 - `accept [force] [n]` — Take the text on the clipboard as a raw chapter page and queue it (aliases: `grab`, `clip`). See [Manual Chapter Accept](#manual-chapter-accept-clipboard).
 - `accept <on|off|status>` — Watch the clipboard and queue every newly copied chapter page.
-- `cancel` — Cancel manual mode or in-flight batches; their pages return to the front of the pool.
+- `cancel` — Cancel manual mode or in-flight batches; their pages return to the front of the pool. A cancelled batch leaves the in-flight count at once. Its request is abandoned, with no further retries, and the worker is free for the next batch. A request the endpoint already received may still finish on the endpoint's side; its reply is ignored.
 - `terms [search]` — Table of glossary terms, optionally filtered (alias: `glossary`).
 - `term add <chinese> = <english> [type:<type>]` — Add or override a term and lock it as yours, e.g. `term add 秃鹫尊者 = Venerable Vulture type:title`.
 - `term alias <chinese> = <term>` — Make another Chinese spelling render like an existing term (named by its Chinese or English).

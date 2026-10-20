@@ -18,6 +18,7 @@ from . import console as con
 from . import activity, arcs, clipaccept, prompts, parsing, resume, storage, characters, glossary, termlookup
 from .tracker import ChapterTracker
 from .client import ApiClient, ApiError
+from .cancel import ApiCancelled, CancelToken
 from .workpool import PageEntry, PendingPool, entry_sort_key, parse_selection
 
 try:
@@ -93,7 +94,8 @@ class Pipeline:
         self._workers: dict[int, threading.Thread] = {}
         self._worker_target = cfg.concurrency
         self._batch_seq = 0
-        self._active: dict[int, dict] = {}  # batch_id -> {'entries': [PageEntry], 'cancel': bool}
+        self._active: dict[int, dict] = {}  # batch_id -> {'entries': [PageEntry], 'token': CancelToken}
+        self._cancelled_ids: set[int] = set()  # cancelled batches whose worker has not finished yet
         self._state_io_lock = threading.Lock()  # always taken BEFORE self.lock, never while holding it
         self._backlog_full = False
         self.tracker = ChapterTracker()
@@ -589,13 +591,14 @@ class Pipeline:
         return self._describe_cancel(active, manual, auto_on)
 
     def _cancel_active_locked(self) -> list[tuple[int, list[PageEntry]]]:
-        """Flag in-flight batches as cancelled and return their pages. Late replies get discarded."""
+        """Abort in-flight batches, drop them from the in-flight list and return their pages."""
         recovered = []
         for bid in sorted(self._active):
-            info = self._active[bid]
-            if info.get("cancel"):
-                continue
-            info["cancel"] = True
+            info = self._active.pop(bid)
+            token = info.get("token")
+            if isinstance(token, CancelToken):
+                token.cancel()
+            self._cancelled_ids.add(bid)
             recovered.append((bid, list(info.get("entries", []))))
         return recovered
 
@@ -618,8 +621,8 @@ class Pipeline:
             ids = ", ".join(f"#{bid}" for bid, _ in active)
             count = sum(len(entries) for _, entries in active)
             messages.append(
-                f"Cancelled in-flight batch(es) {ids}: {count} page(s) returned to the front of the pending pool. "
-                f"Any late reply will be discarded."
+                f"Cancelled in-flight batch(es) {ids}: request aborted and {count} page(s) returned to the front of the pending pool. "
+                f"A reply that still arrives is discarded."
             )
         if not messages:
             return ["No active manual session or in-flight batches to cancel."]
@@ -800,8 +803,7 @@ class Pipeline:
         if not isinstance(batch_id, int) or batch_id <= 0:
             return False, "Batch id must be a positive integer."
         with self.lock:
-            info = self._active.get(batch_id)
-            if info is not None and not info.get("cancel"):
+            if batch_id in self._active:
                 return False, f"Batch #{batch_id} is still in flight. Use cancel to recover it instead."
 
         pages, err = storage.load_spooled(book_dir, batch_id)
@@ -860,14 +862,14 @@ class Pipeline:
             claimed = self._claim_batch()
             if claimed is None:
                 continue
-            batch_id, entries = claimed
+            batch_id, entries, token = claimed
             try:
-                self._process_batch(batch_id, entries)
+                self._process_batch(batch_id, entries, token)
             except Exception as e:  # one bad batch must never kill the worker
                 con.fail(f"Unexpected worker error on batch #{batch_id}: {escape(str(e))}")
         con.warn(f"Worker {worker_id} reached its iteration limit and stopped.")
 
-    def _claim_batch(self) -> tuple[int, list[PageEntry]] | None:
+    def _claim_batch(self) -> tuple[int, list[PageEntry], CancelToken] | None:
         """Cut a batch at the CURRENT batch size and register it as in flight, atomically."""
         with self.lock:
             if self.stop_event.is_set():
@@ -884,26 +886,30 @@ class Pipeline:
                 return None
             self._batch_seq += 1
             batch_id = self._batch_seq
-            self._active[batch_id] = {"entries": list(entries), "cancel": False}
+            token = CancelToken()
+            self._active[batch_id] = {"entries": list(entries), "token": token}
             self.counters["batches_sent"] += 1
-            return batch_id, entries
+            return batch_id, entries, token
 
-    def _process_batch(self, batch_id: int, entries: list[PageEntry]) -> None:
+    def _process_batch(self, batch_id: int, entries: list[PageEntry], token: CancelToken) -> None:
         try:
-            self._run_batch(batch_id, entries)
+            self._run_batch(batch_id, entries, token)
         except Exception as e:
             self._handle_batch_failure(batch_id, entries, "", f"Unexpected {type(e).__name__}: {e}")
         finally:
             with self.lock:
                 self._active.pop(batch_id, None)
+                self._cancelled_ids.discard(batch_id)
                 self.counters["batches_done"] += 1
                 self.pool.notify()
 
     def _is_cancelled(self, batch_id: int) -> bool:
         with self.lock:
-            return bool(self._active.get(batch_id, {}).get("cancel", False))
+            return batch_id in self._cancelled_ids
 
-    def _run_batch(self, batch_id: int, entries: list[PageEntry]) -> None:
+    def _run_batch(self, batch_id: int, entries: list[PageEntry], token: CancelToken) -> None:
+        if not isinstance(token, CancelToken):
+            raise TypeError("token must be a CancelToken")
         cfg = self.cfg
         book_dir = cfg.book_dir
         pages = [e.content for e in entries]
@@ -915,7 +921,7 @@ class Pipeline:
 
         label = f"Batch #{batch_id}"
         pages_text = PAGE_SEPARATOR.join(pages)
-        scout = self._scout_terms(label, entries, pages_text)
+        scout = self._scout_terms(label, entries, pages_text, token)
         if self._is_cancelled(batch_id):
             con.warn(f"Batch #{batch_id} was cancelled during the term lookup; nothing sent (pages are already back in the pending pool).")
             return
@@ -927,7 +933,10 @@ class Pipeline:
 
         con.info(f"Dispatching batch [bold cyan]#{batch_id}[/bold cyan] ({len(pages)} pages · {span}) to [bold green]{escape(cfg.model)}[/bold green]...")
         try:
-            raw_reply, usage = self.client.chat(cfg, messages)
+            raw_reply, usage = self.client.chat(cfg, messages, cancel=token)
+        except ApiCancelled:
+            con.dim(f"Batch #{batch_id} aborted; its pages are already back in the pending pool.")
+            return
         except ApiError as e:
             self._handle_batch_failure(batch_id, entries, "", f"API error: {e}")
             return
@@ -953,7 +962,8 @@ class Pipeline:
     # Prior-usage term lookup
     # ------------------------------------------------------------------
 
-    def _scout_terms(self, label: str, entries: list[PageEntry], pages_text: str) -> ScoutOutcome:
+    def _scout_terms(self, label: str, entries: list[PageEntry], pages_text: str,
+                     token: CancelToken | None = None) -> ScoutOutcome:
         """Ask the model which terms it will register, then find how earlier chapters rendered them.
 
         Never raises: any failure is logged and the batch is translated as a single call.
@@ -968,17 +978,20 @@ class Pipeline:
             )
             return ScoutOutcome()
         try:
-            return self._run_scout(label, entries, pages_text)
+            return self._run_scout(label, entries, pages_text, token)
+        except ApiCancelled:
+            return ScoutOutcome()  # the caller sees the cancellation and stops the batch
         except ApiError as e:
             con.warn(f"{label}: term scout call failed ({escape(str(e))}); translating without the prior-usage lookup.")
         except Exception as e:  # the lookup is an aid and must never fail a batch
             con.warn(f"{label}: prior-usage lookup failed ({escape(f'{type(e).__name__}: {e}')}); translating without it.")
         return ScoutOutcome()
 
-    def _run_scout(self, label: str, entries: list[PageEntry], pages_text: str) -> ScoutOutcome:
+    def _run_scout(self, label: str, entries: list[PageEntry], pages_text: str,
+                   token: CancelToken | None = None) -> ScoutOutcome:
         book_dir = self.cfg.book_dir
         messages = prompts.build_scout_conversation(book_dir, pages_text)
-        raw_reply, usage = self.client.chat(self.cfg, messages, max_tokens=SCOUT_MAX_TOKENS)
+        raw_reply, usage = self.client.chat(self.cfg, messages, max_tokens=SCOUT_MAX_TOKENS, cancel=token)
         self._record_usage(usage)
         proposed, err = parsing.parse_scout_reply(raw_reply)
         if err:
@@ -1308,7 +1321,7 @@ class Pipeline:
             return {
                 "pending": self.pool.entries(),
                 "in_flight": [
-                    (bid, list(info["entries"]), bool(info.get("cancel")))
+                    (bid, list(info["entries"]))
                     for bid, info in sorted(self._active.items())
                 ],
                 "manual": list(self.manual_entries or []),

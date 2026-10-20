@@ -400,9 +400,8 @@ def cmd_pending(ctx: ReplContext, args: list[str]) -> None:
         con.console.print(f"  Pending: [bold cyan]{escape(describe_entries(pending))}[/bold cyan]")
         if args and args[0].lower() == "all":
             _print_page_list(pending)
-    for bid, entries, cancelled in view["in_flight"]:
-        flag = " [yellow](cancelled)[/yellow]" if cancelled else ""
-        con.console.print(f"  In flight #{bid}: {escape(describe_entries(entries))} ({len(entries)} pages){flag}")
+    for bid, entries in view["in_flight"]:
+        con.console.print(f"  In flight #{bid}: {escape(describe_entries(entries))} ({len(entries)} pages)")
     if view["manual"]:
         con.console.print(f"  Manual session: {escape(describe_entries(view['manual']))} ({len(view['manual'])} pages)")
 
