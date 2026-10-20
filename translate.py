@@ -26,8 +26,10 @@ SAMPLE_PRIOR_USAGE = (
     "## 血魔印\n"
     "Found in 1 translated chapter(s); excerpts from Chapter(s) 300.\n"
     "- Chapter 300 (earliest) · anchors matched: Li Yao\n"
-    "  ZH: [Chinese sentence from the earlier chapter]\n"
-    "  EN: [Matching passage of its English translation]"
+    "  ZH: [Chinese line containing the term]\n"
+    "      [Up to 3 Chinese lines on each side]\n"
+    "  EN: [Matching English paragraph]\n"
+    "      [Up to 4 English paragraphs on each side]"
 )
 
 

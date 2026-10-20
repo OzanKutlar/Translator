@@ -11,6 +11,11 @@ Positions are estimated in two steps:
      English text (site header/footer, TN paragraphs and the next-chapter link removed).
   2. Names and locked terms found next to the hit ("anchors") are looked for in English
      windows around that estimate; the window with the most anchors wins, the closest on ties.
+
+Each excerpt carries surrounding context so the model can see how the term is used:
+the Chinese line with the hit plus up to ZH_CONTEXT_LINES lines on each side, and the English
+paragraph at the estimate plus up to EN_CONTEXT_PARAGRAPHS paragraphs on each side. A side stops
+growing at the first paragraph that would exceed the excerpt's character limit.
 """
 
 import bisect
@@ -28,9 +33,11 @@ AUDIT_OCCURRENCES = 5          # excerpts shown by 'terms audit'
 MAX_CHAPTER_SCAN = 50_000      # bounds every directory scan and chapter loop
 MAX_PARAGRAPHS = 4_000         # bounds paragraph splitting of one chapter
 MAX_CACHED_CHARS = 40_000_000  # cleaned raw text kept in memory; beyond this pages are re-read
-EXCERPT_CHARS = 600
-ZH_SENTENCE_CHARS = 120
-CONTEXT_BUDGET = 9_000         # characters of PRIOR USAGE text sent with one batch
+EXCERPT_CHARS = 1_600          # English characters per excerpt
+EN_CONTEXT_PARAGRAPHS = 4      # English paragraphs kept on each side of the matched one
+ZH_EXCERPT_CHARS = 700         # Chinese characters per excerpt
+ZH_CONTEXT_LINES = 3           # Chinese lines kept on each side of the line with the hit
+CONTEXT_BUDGET = 20_000         # characters of PRIOR USAGE text sent with one batch
 ANCHOR_SPREAD = 0.15           # English windows within +-15% of the estimate are scored
 ANCHOR_RADIUS = 2              # paragraphs on each side used for anchors and windows
 MAX_ANCHORS = 30
@@ -38,7 +45,6 @@ MIN_ANCHOR_LENGTH = 2
 HEADER_SCAN_LINES = 8          # the chapter title line is looked for in the first lines only
 MAX_FIELD_LENGTH = 120
 MAX_WARNINGS = 20
-SENTENCE_ENDS = "。！？"
 
 _HEADER_RE = re.compile(r"第\s*[零〇一二两三四五六七八九十百千万\d]+\s*[章回节集篇]")
 # Everything from the first line matching one of these is site text, not story.
@@ -64,11 +70,11 @@ class Candidate:
 
 @dataclass(frozen=True)
 class Occurrence:
-    """One earlier use of a term: the Chinese sentence and the matching English passage."""
+    """One earlier use of a term: the Chinese lines around it and the matching English passage."""
 
     chapter: int
-    zh: str
-    en: str
+    zh: str                    # line with the hit plus neighbouring lines, joined by '\n'
+    en: str                    # matched paragraph plus neighbouring paragraphs, joined by '\n'
     anchors: tuple[str, ...]   # English names/terms that confirmed the passage
 
 
@@ -225,29 +231,50 @@ def _trim_around(text: str, limit: int) -> str:
     return "…" + text[head: len(text) - (excess - head)].strip() + "…"
 
 
+def _trim_on_hit(paragraph: str, offset: int, length: int, limit: int) -> str:
+    """Cut a long paragraph to about limit characters, keeping the hit near the middle."""
+    if len(paragraph) <= limit:
+        return paragraph
+    start = max(0, min(offset + length // 2 - limit // 2, len(paragraph) - limit))
+    end = start + limit
+    head = "…" if start > 0 else ""
+    tail = "…" if end < len(paragraph) else ""
+    return head + paragraph[start:end].strip() + tail
+
+
+def _context_window(paragraphs: list[str], center: int, center_text: str, radius: int, limit: int) -> str:
+    """center_text plus whole neighbouring paragraphs, up to radius per side and limit characters.
+
+    A side stops growing at the first paragraph that would exceed limit, so the window has no gaps.
+    """
+    if not paragraphs or not 0 <= center < len(paragraphs):
+        return center_text
+    picked = {center: center_text}
+    size = len(center_text)
+    open_sides = [-1, 1]
+    for step in range(1, max(0, radius) + 1):
+        for side in tuple(open_sides):
+            index = center + side * step
+            if not 0 <= index < len(paragraphs) or size + len(paragraphs[index]) + 1 > limit:
+                open_sides.remove(side)
+                continue
+            picked[index] = paragraphs[index]
+            size += len(paragraphs[index]) + 1
+        if not open_sides:
+            break
+    return "\n".join(picked[i] for i in sorted(picked))
+
+
 def _excerpt(paragraphs: list[str], center: int) -> str:
-    picked = [center]
-    size = len(paragraphs[center])
-    for step in range(1, ANCHOR_RADIUS * 2 + 1):
-        for index in (center - step, center + step):
-            if size < EXCERPT_CHARS and 0 <= index < len(paragraphs):
-                picked.append(index)
-                size += len(paragraphs[index]) + 1
-    return _trim_around(" ".join(paragraphs[i] for i in sorted(picked)), EXCERPT_CHARS)
+    """The English paragraph at center plus up to EN_CONTEXT_PARAGRAPHS paragraphs on each side."""
+    center_text = _trim_around(paragraphs[center], EXCERPT_CHARS)
+    return _context_window(paragraphs, center, center_text, EN_CONTEXT_PARAGRAPHS, EXCERPT_CHARS)
 
 
-def _zh_sentence(paragraph: str, offset: int, length: int) -> str:
-    """The Chinese sentence around the hit, bounded by ZH_SENTENCE_CHARS."""
-    half = ZH_SENTENCE_CHARS // 2
-    low = max(0, offset - half)
-    high = min(len(paragraph), offset + length + half)
-    cut = max(paragraph.rfind(mark, low, offset) for mark in SENTENCE_ENDS)
-    if cut >= 0:
-        low = cut + 1
-    ends = [i for i in (paragraph.find(mark, offset + length, high) for mark in SENTENCE_ENDS) if i >= 0]
-    if ends:
-        high = min(ends) + 1
-    return paragraph[low:high].strip()
+def _zh_excerpt(paragraphs: list[str], index: int, offset: int, length: int) -> str:
+    """The Chinese line with the hit plus up to ZH_CONTEXT_LINES lines on each side."""
+    center_text = _trim_on_hit(paragraphs[index], offset, length, ZH_EXCERPT_CHARS)
+    return _context_window(paragraphs, index, center_text, ZH_CONTEXT_LINES, ZH_EXCERPT_CHARS)
 
 
 # ----------------------------------------------------------------------
@@ -373,7 +400,7 @@ def _locate(corpus: TermCorpus, book_dir: str, chapter: int, md_path: str, term:
     center, matched = _best_window(english, _fraction(raw_paragraphs, index, offset), present)
     return Occurrence(
         chapter=chapter,
-        zh=_zh_sentence(raw_paragraphs[index], offset, len(term)),
+        zh=_zh_excerpt(raw_paragraphs, index, offset, len(term)),
         en=_excerpt(english, center),
         anchors=matched,
     )
@@ -436,6 +463,13 @@ def filter_candidates(book_dir: str, proposed, pages_text: str) -> list[Candidat
     return kept
 
 
+def _labelled(label: str, text: str) -> list[str]:
+    """'  ZH: first line' followed by the remaining lines indented under it."""
+    lines = text.split("\n") if isinstance(text, str) and text else [""]
+    pad = " " * (len(label) + 4)
+    return [f"  {label}: {lines[0]}"] + [f"{pad}{line}" for line in lines[1:]]
+
+
 def _occurrence_lines(occurrence: Occurrence, first: int, last: int) -> list[str]:
     if occurrence.chapter == first:
         tag = " (earliest)"
@@ -449,8 +483,8 @@ def _occurrence_lines(occurrence: Occurrence, first: int, last: int) -> list[str
         confidence = "no anchors matched, position estimate only"
     return [
         f"- Chapter {occurrence.chapter}{tag} · {confidence}",
-        f"  ZH: {occurrence.zh}",
-        f"  EN: {occurrence.en}",
+        *_labelled("ZH", occurrence.zh),
+        *_labelled("EN", occurrence.en),
     ]
 
 

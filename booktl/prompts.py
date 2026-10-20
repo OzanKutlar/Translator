@@ -209,9 +209,11 @@ SYSTEM_PROMPT = (
 
 PRIOR_USAGE_INTRO = (
     "These candidate terms appear in this section and were already translated in earlier chapters, "
-    "but were never registered in the glossary. Each entry shows the Chinese sentence from an earlier chapter "
-    "and the matching passage of its existing English translation. Passages are located by position, so one "
-    "may be slightly off; 'anchors matched' lists names found near the term that confirm the spot.\n"
+    "but were never registered in the glossary. Each entry shows a Chinese passage from an earlier chapter "
+    "(the line with the term and the lines around it) and the matching passage of its existing English "
+    "translation, so you can see how the term was used. Use the surrounding lines to judge what the term means. "
+    "Passages are located by position, so the English may be shifted by a paragraph or two; "
+    "'anchors matched' lists names found near the term that confirm the spot.\n"
     "For each term:\n"
     "  1. Work out how the earlier English rendered it and reuse that rendering exactly, "
     "including inside longer phrases.\n"
@@ -248,9 +250,11 @@ SCOUT_TURN = (
 # Follow-up user turn when the lookup found earlier renderings (see build_translation_followup).
 PRIOR_USAGE_FOLLOWUP = (
     "Here is how earlier chapters already rendered some of the candidates you listed. These terms were "
-    "translated before but never registered in the glossary. Each entry shows the Chinese sentence from an "
-    "earlier chapter and the matching passage of its existing English translation. Passages are located by "
-    "position, so one may be slightly off; 'anchors matched' lists names found near the term that confirm the spot.\n"
+    "translated before but never registered in the glossary. Each entry shows a Chinese passage from an "
+    "earlier chapter (the line with the term and the lines around it) and the matching passage of its existing "
+    "English translation, so you can see how the term was used. Use the surrounding lines to judge what the term "
+    "means. Passages are located by position, so the English may be shifted by a paragraph or two; "
+    "'anchors matched' lists names found near the term that confirm the spot.\n"
     "You wrote your candidate list WITHOUT seeing these chapters, so your proposed renderings do not count "
     "wherever an earlier rendering exists. For each term:\n"
     "  1. Work out how the earlier English rendered it and reuse that rendering exactly, "

@@ -108,12 +108,53 @@ class LookupTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(usage.chapters, (300,))
 
+    def _occurrence(self):
+        candidates = [termlookup.Candidate("血魔印", "", "item")]
+        result = termlookup.build_prior_usage(self.corpus, self.book, candidates, set())
+        return result.usages[0].occurrences[0]
+
+    def test_chinese_excerpt_includes_neighbouring_lines(self):
+        zh = self._occurrence().zh.split("\n")
+        self.assertIn("李耀只觉胸口一烫，那枚血魔印竟然再次亮了起来。", zh)
+        self.assertIn("苍穹宗的长老看着他。", zh)
+        self.assertIn("众人大惊。", zh)
+        self.assertNotIn("(本章完)", zh)
+        self.assertLess(zh.index("苍穹宗的长老看着他。"), zh.index("众人大惊。"))
+
+    def test_english_excerpt_includes_neighbouring_paragraphs(self):
+        en = self._occurrence().en
+        self.assertIn("An elder of the Azure Sect looked at him.", en)
+        self.assertIn("Everyone was shocked.", en)
+        self.assertNotIn("(TN:", en)
+
     def test_rendering_in_chapter(self):
         self.assertTrue(termlookup.rendering_in_chapter(self.book, 300, "blood demon seal"))
         self.assertFalse(termlookup.rendering_in_chapter(self.book, 300, "Blood Fiend Mark"))
         self.assertIsNone(termlookup.rendering_in_chapter(self.book, 301, "Blood Demon Seal"))
         self.assertIsNone(termlookup.rendering_in_chapter(self.book, 300, "  "))
         self.assertIsNone(termlookup.rendering_in_chapter(self.book, True, "Blood Demon Seal"))
+
+
+class WindowTests(unittest.TestCase):
+    def test_long_hit_line_is_trimmed_around_the_term(self):
+        line = "甲" * 2000 + "血魔印" + "乙" * 2000
+        zh = termlookup._zh_excerpt([line], 0, 2000, 3)
+        self.assertIn("血魔印", zh)
+        self.assertLessEqual(len(zh), termlookup.ZH_EXCERPT_CHARS + 2)
+
+    def test_window_stops_at_limit_without_gaps(self):
+        paragraphs = ["short", "x" * 50, "center", "y", "z"]
+        text = termlookup._context_window(paragraphs, 2, "center", 3, 20)
+        self.assertEqual(text, "center\ny\nz")
+
+    def test_format_usage_indents_continuation_lines(self):
+        occ = termlookup.Occurrence(300, "第一行\n第二行", "Line one\nLine two", ())
+        usage = termlookup.TermUsage(termlookup.Candidate("血魔印", "", ""), (300,), (occ,))
+        lines = termlookup.format_usage(usage).split("\n")
+        self.assertIn("  ZH: 第一行", lines)
+        self.assertIn("      第二行", lines)
+        self.assertIn("  EN: Line one", lines)
+        self.assertIn("      Line two", lines)
 
 
 class ScoutParsingTests(unittest.TestCase):

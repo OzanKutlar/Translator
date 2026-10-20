@@ -68,7 +68,7 @@ HELP_ROWS = (
     ("term add <chinese> = <english> [type:<type>]", "Add or override a term and lock it as yours; the model never changes your terms."),
     ("term alias <chinese> = <term>", "Make another Chinese spelling render like an existing term (named by its Chinese or English)."),
     ("term rm <chinese>", "Remove a term together with its aliases, or remove a single alias."),
-    ("terms audit <chinese>", "Show every translated chapter whose raw page contains a term, with the Chinese sentence and the matching English passage."),
+    ("terms audit <chinese>", "Show every translated chapter whose raw page contains a term, with the surrounding Chinese lines and the matching English passage."),
     ("lookup <on|off>", "Toggle the prior-usage term lookup: a short scout call before each batch so new terms reuse earlier renderings."),
     ("flush", "Send all pending pages now, including a final partial batch."),
     ("auto <on|off>", "Toggle auto-dispatching (turn off to keep pages pending for manual)."),
