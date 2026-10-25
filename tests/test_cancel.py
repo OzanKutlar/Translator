@@ -42,7 +42,7 @@ class BlockingClient:
         self.started = threading.Event()
         self.calls = 0
 
-    def chat(self, cfg, messages, max_tokens=None, cancel=None):
+    def chat(self, cfg, messages, max_tokens=None, cancel=None, label=None):
         self.calls += 1
         self.started.set()
         if cancel is None or not cancel.wait(5):

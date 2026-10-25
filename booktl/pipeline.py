@@ -16,6 +16,7 @@ from rich.markup import escape
 
 from . import console as con
 from . import activity, arcs, clipaccept, prompts, parsing, resume, storage, characters, glossary, termlookup
+from .batchlog import BatchLog
 from .tracker import ChapterTracker
 from .client import ApiClient, ApiError
 from .cancel import ApiCancelled, CancelToken
@@ -35,6 +36,10 @@ IDLE_POLL_SECONDS = 0.5
 MAX_REPORTED_WARNINGS = 5
 MISSING_REASON = "Not in model reply"
 SCOUT_MAX_TOKENS = 4096        # the scout only returns a short term list
+SCOUT_ATTEMPTS = 2             # a failed term query is re-sent once, then the batch is marked Failed
+MAX_LISTED_NAMES = 5           # names listed in one log line before "…"
+MAX_LISTED_TERMS = 3           # terms listed in one warning line before "N more"
+ONE_LINE_CHARS = 160           # longest error text shown on the console
 
 
 def _is_saveable(entry) -> bool:
@@ -45,6 +50,86 @@ def _is_saveable(entry) -> bool:
 
 
 _format_chapter_ranges = parsing.format_chapter_ranges
+
+
+def _one_line(text, limit: int = ONE_LINE_CHARS) -> str:
+    """Text collapsed to one line and cut to limit characters, for console display."""
+    flat = " ".join(str(text or "").split())
+    if limit < 2 or len(flat) <= limit:
+        return flat
+    return flat[:limit - 1].rstrip() + "…"
+
+
+def _error_summary(error) -> str:
+    """Short form of an API error; ApiError carries one, anything else is collapsed to one line."""
+    return _one_line(getattr(error, "summary", "") or str(error))
+
+
+def _tokens_text(usage) -> str:
+    total = usage.get("total_tokens") if isinstance(usage, dict) else None
+    if isinstance(total, bool) or not isinstance(total, (int, float)):
+        return ""
+    return f" · {int(total):,} tokens"
+
+
+def _plural(count: int, singular: str, plural: str) -> str:
+    return f"{count} {singular if count == 1 else plural}"
+
+
+def _more_text(total: int) -> str:
+    extra = total - MAX_LISTED_TERMS
+    return f" · {extra} more" if extra > 0 else ""
+
+
+def _reused_text(recovered) -> str:
+    """'reused 2 earlier renderings: 地法 → Earth Law (Ch 477), …' or ''."""
+    items = [ev for ev in recovered if isinstance(ev, dict)] if isinstance(recovered, list) else []
+    if not items:
+        return ""
+    shown = [
+        f"{escape(str(ev.get('chinese') or ''))} → {escape(str(ev.get('english') or ''))} (Ch {ev.get('chapter')})"
+        for ev in items[:MAX_LISTED_NAMES]
+    ]
+    more = ", …" if len(items) > MAX_LISTED_NAMES else ""
+    return f"reused {_plural(len(items), 'earlier rendering', 'earlier renderings')}: {', '.join(shown)}{more}"
+
+
+def _conflicts_text(conflicts) -> str:
+    """One warning naming locked terms the model tried to render differently, or ''."""
+    items = [ev for ev in conflicts if isinstance(ev, dict)] if isinstance(conflicts, list) else []
+    if not items:
+        return ""
+    shown = [
+        f"{escape(str(ev.get('chinese') or ''))} stays “{escape(str(ev.get('current') or ''))}” "
+        f"(model suggested “{escape(str(ev.get('suggested') or ''))}”)"
+        for ev in items[:MAX_LISTED_TERMS]
+    ]
+    return "Kept locked terms: " + "; ".join(shown) + _more_text(len(items))
+
+
+def _unconfirmed_text(missing: list) -> str:
+    """One warning naming reused renderings that their first chapter does not contain."""
+    shown = [
+        f"“{escape(str(ev.get('english') or ''))}” ({escape(str(ev.get('chinese') or ''))}, Ch {ev.get('chapter')})"
+        for ev in missing[:MAX_LISTED_TERMS]
+    ]
+    return (
+        f"Reused but not in its first chapter: {', '.join(shown)}{_more_text(len(missing))} "
+        "· check with 'terms audit <chinese>'"
+    )
+
+
+def _drift_text(groups) -> str:
+    """One warning for a batch's term drift: each term once, with the chapters it is missing from."""
+    if not groups:
+        return ""
+    shown = [
+        f"“{escape(english)}” ({escape(forms)}) missing from {_format_chapter_ranges(chapters)}"
+        for (english, forms), chapters in groups[:MAX_LISTED_TERMS]
+    ]
+    extra = len(groups) - MAX_LISTED_TERMS
+    tail = f" · {_plural(extra, 'more term', 'more terms')}" if extra > 0 else ""
+    return "Term drift: " + " · ".join(shown) + tail
 
 
 def describe_entries(entries) -> str:
@@ -78,10 +163,24 @@ class ScoutOutcome:
     lookup: termlookup.LookupResult = field(default_factory=termlookup.LookupResult)
     messages: list = field(default_factory=list)
     reply: str = ""
+    ran: bool = False   # True when a term query was actually sent and answered
 
     @property
     def usable(self) -> bool:
         return bool(self.messages) and isinstance(self.reply, str) and bool(self.reply.strip())
+
+
+class ScoutFailed(Exception):
+    """The term query did not produce usable results; the batch must not be translated without them.
+
+    retryable is False when re-sending the query cannot help (e.g. the local search failed).
+    """
+
+    def __init__(self, reason: str, reply: str = "", retryable: bool = True):
+        super().__init__(reason)
+        self.reason = str(reason)
+        self.reply = reply if isinstance(reply, str) else ""
+        self.retryable = bool(retryable)
 
 
 class Pipeline:
@@ -563,18 +662,22 @@ class Pipeline:
             return "No target book folder selected."
 
         chapters = reply.chapters or []
-        numbers = self._save_results("Manual paste", chapters, reply)
-        with self.lock:
-            entries = self.manual_entries if self.manual_active else None
-            self.manual_active = False
-            self.manual_entries = None
-            self.pool.notify()
-        if entries:
-            self._reconcile("Manual paste", "manual", entries, chapters, numbers)
-            self._check_term_drift("Manual paste", entries, chapters)
-            return "Manual session closed."
-        self._resolve_returned(numbers)
-        return "Pasted translation processed."
+        log = BatchLog("Manual paste")
+        try:
+            numbers = self._save_results(log, chapters, reply)
+            with self.lock:
+                entries = self.manual_entries if self.manual_active else None
+                self.manual_active = False
+                self.manual_entries = None
+                self.pool.notify()
+            if entries:
+                self._reconcile(log, "manual", entries, chapters, numbers)
+                self._check_term_drift(log, entries, chapters)
+                return "Manual session closed."
+            self._resolve_returned(numbers)
+            return "Pasted translation processed."
+        finally:
+            log.emit()
 
     # ------------------------------------------------------------------
     # Cancellation
@@ -910,43 +1013,67 @@ class Pipeline:
     def _run_batch(self, batch_id: int, entries: list[PageEntry], token: CancelToken) -> None:
         if not isinstance(token, CancelToken):
             raise TypeError("token must be a CancelToken")
-        cfg = self.cfg
-        book_dir = cfg.book_dir
-        pages = [e.content for e in entries]
-        span = escape(describe_entries(entries))
-        try:
-            storage.spool_pages(book_dir, batch_id, pages)
-        except OSError as e:
-            con.warn(f"Could not spool batch #{batch_id} to _raw/ ({escape(str(e))}); continuing without backup.")
-
         label = f"Batch #{batch_id}"
+        pages = [e.content for e in entries]
+        self._spool_batch(batch_id, pages)
         pages_text = PAGE_SEPARATOR.join(pages)
-        scout = self._scout_terms(label, entries, pages_text, token)
-        if self._is_cancelled(batch_id):
-            con.warn(f"Batch #{batch_id} was cancelled during the term lookup; nothing sent (pages are already back in the pending pool).")
-            return
-        messages = self._translation_messages(label, book_dir, pages_text, scout)
-        if cfg.dry_run:
-            con.rule(f"Dry Run: Batch #{batch_id}")
-            con.console.print(f"[dim]Constructed {len(messages)} messages for {escape(cfg.model or '(no model)')} · {len(pages)} pages · {span}[/dim]")
-            return
-
-        con.info(f"Dispatching batch [bold cyan]#{batch_id}[/bold cyan] ({len(pages)} pages · {span}) to [bold green]{escape(cfg.model)}[/bold green]...")
+        cancelled_note = f"{label}: cancelled during the term query; nothing was translated (pages are back in the pending pool)."
         try:
-            raw_reply, usage = self.client.chat(cfg, messages, cancel=token)
+            scout = self._scout_terms(label, entries, pages_text, token)
+            messages = self._translation_messages(pages_text, scout)
         except ApiCancelled:
-            con.dim(f"Batch #{batch_id} aborted; its pages are already back in the pending pool.")
+            con.dim(cancelled_note)
+            return
+        except ScoutFailed as e:
+            self._handle_batch_failure(batch_id, entries, e.reply, f"Term query failed: {e.reason}")
+            return
+        if self._is_cancelled(batch_id):
+            con.dim(cancelled_note)
+            return
+        if self.cfg.dry_run:
+            self._log_dry_run(label, entries, messages)
+            return
+        self._send_translation(batch_id, entries, messages, scout.lookup.first_seen, token)
+
+    def _spool_batch(self, batch_id: int, pages: list[str]) -> None:
+        """Back up the batch's pages to _raw/ before any API call."""
+        try:
+            storage.spool_pages(self.cfg.book_dir, batch_id, pages)
+        except OSError as e:
+            con.warn(f"Batch #{batch_id}: could not back up pages to _raw/ ({escape(str(e))}); continuing without backup.")
+
+    def _log_dry_run(self, label: str, entries: list[PageEntry], messages: list[dict]) -> None:
+        model = escape(self.cfg.model or "(no model)")
+        con.dim(
+            f"{label}: dry run · built {len(messages)} message(s) for {model} · "
+            f"{len(entries)} pages · {escape(describe_entries(entries))}"
+        )
+
+    def _send_translation(self, batch_id: int, entries: list[PageEntry], messages: list[dict],
+                          first_seen: dict, token: CancelToken) -> None:
+        """Send the translation call and process its reply."""
+        label = f"Batch #{batch_id}"
+        con.sent(f"{label}: Translation sent to [bold]{escape(self.cfg.model)}[/bold]")
+        started = time.monotonic()
+        try:
+            raw_reply, usage = self.client.chat(self.cfg, messages, cancel=token, label=f"{label}: Translation")
+        except ApiCancelled:
+            con.dim(f"{label}: aborted; its pages are already back in the pending pool.")
             return
         except ApiError as e:
-            self._handle_batch_failure(batch_id, entries, "", f"API error: {e}")
+            self._handle_batch_failure(batch_id, entries, "", f"API error: {e}", summary=f"API error: {_error_summary(e)}")
             return
-
         self._record_usage(usage)
         self._save_raw_reply(batch_id, raw_reply)
         if self._is_cancelled(batch_id):
-            con.warn(f"Batch #{batch_id} finished after cancellation — reply discarded (pages are already back in the pending pool).")
+            con.dim(f"{label}: reply arrived after cancellation and was discarded (pages are already back in the pending pool).")
             return
+        timing = f"in {time.monotonic() - started:.0f}s{_tokens_text(usage)}"
+        self._process_reply(batch_id, entries, raw_reply, first_seen, timing)
 
+    def _process_reply(self, batch_id: int, entries: list[PageEntry], raw_reply: str,
+                       first_seen: dict, timing: str) -> None:
+        """Parse, save and check a translation reply, then print it as one block."""
         reply = parsing.parse_reply(raw_reply)
         if reply.error:
             self._handle_batch_failure(batch_id, entries, raw_reply, f"JSON error: {reply.error}")
@@ -954,9 +1081,13 @@ class Pipeline:
         if not reply.chapters:
             self._handle_batch_failure(batch_id, entries, raw_reply, "Reply contained no chapters")
             return
-        numbers = self._save_results(label, reply.chapters, reply, scout.lookup.first_seen)
-        self._reconcile(label, batch_id, entries, reply.chapters, numbers)
-        self._check_term_drift(label, entries, reply.chapters)
+        log = BatchLog(f"Batch #{batch_id}")
+        try:
+            numbers = self._save_results(log, reply.chapters, reply, first_seen, timing)
+            self._reconcile(log, batch_id, entries, reply.chapters, numbers)
+            self._check_term_drift(log, entries, reply.chapters)
+        finally:
+            log.emit()
 
     # ------------------------------------------------------------------
     # Prior-usage term lookup
@@ -964,73 +1095,95 @@ class Pipeline:
 
     def _scout_terms(self, label: str, entries: list[PageEntry], pages_text: str,
                      token: CancelToken | None = None) -> ScoutOutcome:
-        """Ask the model which terms it will register, then find how earlier chapters rendered them.
+        """Run the term query, re-sending it once if it fails.
 
-        Never raises: any failure is logged and the batch is translated as a single call.
+        Returns an empty outcome when the lookup is off or in a dry run. Raises ScoutFailed when no
+        attempt produced usable results, and ApiCancelled when the batch was cancelled.
         """
         if not self.cfg.term_lookup:
             return ScoutOutcome()
         if self.cfg.dry_run:
-            scout = prompts.build_scout_conversation(self.cfg.book_dir, pages_text)
-            con.dim(
-                f"{label}: term scout would send {len(scout)} message(s) first and the translation call "
-                "would continue that conversation (skipped in dry run)"
-            )
+            con.dim(f"{label}: dry run · term query skipped")
             return ScoutOutcome()
-        try:
-            return self._run_scout(label, entries, pages_text, token)
-        except ApiCancelled:
-            return ScoutOutcome()  # the caller sees the cancellation and stops the batch
-        except ApiError as e:
-            con.warn(f"{label}: term scout call failed ({escape(str(e))}); translating without the prior-usage lookup.")
-        except Exception as e:  # the lookup is an aid and must never fail a batch
-            con.warn(f"{label}: prior-usage lookup failed ({escape(f'{type(e).__name__}: {e}')}); translating without it.")
-        return ScoutOutcome()
+        span = escape(describe_entries(entries))
+        last: ScoutFailed | None = None
+        for attempt in range(1, SCOUT_ATTEMPTS + 1):
+            again = f" [dim](attempt {attempt}/{SCOUT_ATTEMPTS})[/dim]" if attempt > 1 else ""
+            con.sent(f"{label}: Term query sent ({len(entries)} pages · {span}){again}")
+            try:
+                return self._scout_once(label, entries, pages_text, token)
+            except ScoutFailed as e:
+                if not e.retryable:
+                    raise
+                last = e
+            if attempt < SCOUT_ATTEMPTS:
+                con.warn(f"{label}: Term query failed ({escape(_one_line(last.reason))}); sending it once more")
+        reason = last.reason if last is not None else "no attempt was made"
+        reply = last.reply if last is not None else ""
+        raise ScoutFailed(f"sent {SCOUT_ATTEMPTS} times, last error: {reason}", reply, retryable=False)
 
-    def _run_scout(self, label: str, entries: list[PageEntry], pages_text: str,
-                   token: CancelToken | None = None) -> ScoutOutcome:
-        book_dir = self.cfg.book_dir
-        messages = prompts.build_scout_conversation(book_dir, pages_text)
-        raw_reply, usage = self.client.chat(self.cfg, messages, max_tokens=SCOUT_MAX_TOKENS, cancel=token)
+    def _scout_once(self, label: str, entries: list[PageEntry], pages_text: str,
+                    token: CancelToken | None) -> ScoutOutcome:
+        """One term-query call plus the prior-usage search. Raises ScoutFailed or ApiCancelled."""
+        messages = prompts.build_scout_conversation(self.cfg.book_dir, pages_text)
+        try:
+            raw_reply, usage = self.client.chat(
+                self.cfg, messages, max_tokens=SCOUT_MAX_TOKENS, cancel=token, label=f"{label}: Term query"
+            )
+        except ApiError as e:
+            raise ScoutFailed(f"API error: {_error_summary(e)}") from e
         self._record_usage(usage)
-        proposed, err = parsing.parse_scout_reply(raw_reply)
+        reply_text = raw_reply if isinstance(raw_reply, str) else ""
+        proposed, err = parsing.parse_scout_reply(reply_text)
         if err:
-            con.warn(f"{label}: term scout reply unusable ({escape(err)}); translating without the prior-usage lookup.")
-            return ScoutOutcome()
+            raise ScoutFailed(f"unusable reply: {err}", reply_text)
+        try:
+            result = self._lookup_prior_usage(entries, pages_text, proposed)
+        except Exception as e:  # a local search problem; re-sending the query cannot fix it
+            raise ScoutFailed(f"prior-usage search failed: {type(e).__name__}: {e}", reply_text, retryable=False) from e
+        self._log_lookup(label, len(proposed), result)
+        return ScoutOutcome(result, messages, reply_text, ran=True)
+
+    def _lookup_prior_usage(self, entries: list[PageEntry], pages_text: str,
+                            proposed: list) -> termlookup.LookupResult:
+        book_dir = self.cfg.book_dir
         candidates = termlookup.filter_candidates(book_dir, proposed, pages_text)
         batch_chapters = {e.chapter for e in entries if e.chapter is not None}
-        result = termlookup.build_prior_usage(self.corpus, book_dir, candidates, batch_chapters)
-        self._log_lookup(label, len(proposed), result)
-        return ScoutOutcome(result, messages, raw_reply if isinstance(raw_reply, str) else "")
+        return termlookup.build_prior_usage(self.corpus, book_dir, candidates, batch_chapters)
 
-    def _translation_messages(self, label: str, book_dir: str, pages_text: str,
-                              scout: ScoutOutcome) -> list[dict]:
-        """Continue the scout conversation when the scout worked; otherwise build one plain translation call."""
-        if scout.usable:
-            try:
-                return prompts.build_translation_followup(scout.messages, scout.reply, scout.lookup.context)
-            except ValueError as e:
-                con.warn(f"{label}: could not continue the scout conversation ({escape(str(e))}); sending a single translation call.")
-        return prompts.build_messages(book_dir, pages_text, prior_usage=scout.lookup.context)
+    def _translation_messages(self, pages_text: str, scout: ScoutOutcome) -> list[dict]:
+        """Continue the term-query conversation, or build one plain call when no term query ran.
+
+        Raises ScoutFailed when a term query ran but its conversation cannot be continued.
+        """
+        if not scout.ran:
+            return prompts.build_messages(self.cfg.book_dir, pages_text)
+        if not scout.usable:
+            raise ScoutFailed("the term query left no conversation to continue", scout.reply, retryable=False)
+        try:
+            return prompts.build_translation_followup(scout.messages, scout.reply, scout.lookup.context)
+        except ValueError as e:
+            raise ScoutFailed(f"could not continue the term-query conversation: {e}", scout.reply, retryable=False) from e
 
     @staticmethod
     def _log_lookup(label: str, proposed: int, result: termlookup.LookupResult) -> None:
-        for warning in result.warnings[:MAX_REPORTED_WARNINGS]:
-            con.dim(f"{label}: lookup: {escape(warning)}")
+        """One line summing up the term query's answer and the prior-usage search."""
         if not result.candidates:
-            con.dim(f"{label}: 🔎 Term scout proposed {proposed} term(s); none are new")
-            return
-        found = [f"{u.candidate.chinese} ← Ch {u.chapters[0]}" for u in result.usages]
-        detail = ""
-        if found:
-            more = ", …" if len(found) > MAX_REPORTED_WARNINGS else ""
-            detail = f" ({escape(', '.join(found[:MAX_REPORTED_WARNINGS]))}{more})"
-        con.info(
-            f"{label}: 🔎 Term scout found {result.candidates} new candidate(s), "
-            f"{len(result.usages)} with prior usage{detail}"
-        )
+            text = f"{label}: Term query returned {proposed} term(s), none new"
+        else:
+            text = f"{label}: Term query returned {result.candidates} new term(s), {len(result.usages)} used before"
+            found = [f"{u.candidate.chinese} ← Ch {u.chapters[0]}" for u in result.usages]
+            if found:
+                more = ", …" if len(found) > MAX_LISTED_NAMES else ""
+                text += f" ({escape(', '.join(found[:MAX_LISTED_NAMES]))}{more})"
+        notes = []
         if result.truncated:
-            con.dim(f"{label}: {result.truncated} more term(s) with prior usage left out to keep the prompt small")
+            notes.append(f"{result.truncated} left out to keep the prompt small")
+        if result.warnings:
+            notes.append(f"{len(result.warnings)} lookup warning(s), e.g. {_one_line(result.warnings[0], 80)}")
+        if notes:
+            text += f" [dim]· {escape(' · '.join(notes))}[/dim]"
+        con.received(text)
 
     def _save_raw_reply(self, batch_id: int, raw_reply: str) -> None:
         if not self.cfg.save_raw:
@@ -1048,51 +1201,59 @@ class Pipeline:
             with self.lock:
                 self.counters["tokens"] += int(toks)
 
-    def _handle_batch_failure(self, batch_id: int, entries: list[PageEntry], reply: str, error: str) -> None:
-        """Quarantine a failed batch and list its chapters as Failed. Never re-queued automatically."""
+    def _handle_batch_failure(self, batch_id: int, entries: list[PageEntry], reply: str, error: str,
+                              summary: str | None = None) -> None:
+        """Quarantine a failed batch and list its chapters as Failed. Never re-queued automatically.
+
+        error is stored in full in _failed/; summary (default: error) is what the console shows.
+        """
+        label = f"Batch #{batch_id}"
+        shown = escape(_one_line(summary or error))
         if self._is_cancelled(batch_id):
-            con.warn(f"Batch #{batch_id} ended after cancellation ({escape(error)}). Pages are already back in the pending pool.")
+            con.dim(f"{label}: ended after cancellation ({shown}); its pages are already back in the pending pool.")
             return
         with self.lock:
             self.counters["failures"] += 1
         pages = [e.content for e in entries]
         chapters = [e.chapter for e in entries if e.chapter is not None]
+        log = BatchLog(label)
+        log.head("fail", f"Failed: {shown}")
         try:
             qpath = storage.quarantine_failure(self.cfg.book_dir, batch_id, pages, reply, error, chapters=chapters)
         except OSError as qe:
             with self.lock:
                 self.pool.add(entries, front=True)
-            con.fail(
-                f"Batch #{batch_id} failed ({escape(error)}) and could not be quarantined ({escape(str(qe))}). "
-                f"{len(pages)} page(s) returned to the pending pool."
-            )
+            log.fail(f"Could not quarantine it ({escape(str(qe))}); {len(pages)} page(s) returned to the pending pool")
+            log.emit()
             return
         with self.lock:
             self.pool.mark_failed(entries, batch_id, error)
         self._persist_queue_state()
-        con.fail(f"Batch #{batch_id} failed: {escape(error)}")
-        con.info(
-            f"Quarantined {len(pages)} page(s) to [cyan]{escape(os.path.basename(qpath))}[/cyan]. "
-            f"{escape(describe_entries(entries))} marked Failed (not re-queued — use 'retry' or 'retry <chapters>')."
+        log.detail(
+            f"{escape(describe_entries(entries))} marked Failed · saved to [cyan]{escape(os.path.basename(qpath))}[/cyan] "
+            "· not re-queued, use 'retry failed'"
         )
+        log.emit()
 
     # ------------------------------------------------------------------
     # Results
     # ------------------------------------------------------------------
 
-    def _save_results(self, label: str, chapters: list, reply: parsing.ParsedReply,
-                      first_seen: dict | None = None) -> list[int]:
+    def _save_results(self, log: BatchLog, chapters: list, reply: parsing.ParsedReply,
+                      first_seen: dict | None = None, timing: str = "") -> list[int]:
         """Store chapters, apply character, term and arc updates. Returns translated chapter numbers.
 
         first_seen (from the prior-usage lookup) maps Chinese terms to their earliest earlier chapter.
+        Every outcome is added to log; the caller prints it.
         """
-        numbers = self._store_chapters(label, chapters)
-        self._apply_character_actions(label, reply.character_actions)
-        self._apply_term_actions(label, reply.term_actions, numbers, first_seen)
-        self._apply_arc_ends(label, reply.arc_ends, chapters)
+        numbers = self._store_chapters(log, chapters, timing)
+        self._apply_character_actions(log, reply.character_actions)
+        self._apply_term_actions(log, reply.term_actions, numbers, first_seen)
+        self._apply_arc_ends(log, reply.arc_ends, chapters)
         return numbers
 
-    def _reconcile(self, label: str, batch_ref, entries: list[PageEntry], chapters: list, numbers: list[int]) -> None:
+    def _reconcile(self, log: BatchLog, batch_ref, entries: list[PageEntry], chapters: list,
+                   numbers: list[int]) -> None:
         """Compare sent chapters with the reply; list anything left out as Missing (not re-queued)."""
         returned = set(numbers)
         missing, matched_unnumbered = self._find_missing(entries, chapters, returned)
@@ -1104,9 +1265,9 @@ class Pipeline:
         if changed or missing:
             self._persist_queue_state()
         if missing:
-            con.warn(
-                f"{label}: ⚠ Missing {escape(describe_entries(missing))} "
-                f"(not re-queued — use 'retry missing' or 'retry <chapters>')"
+            log.warn(
+                f"Missing {escape(describe_entries(missing))}: left out of the reply "
+                "(not re-queued; use 'retry missing')"
             )
 
     @staticmethod
@@ -1129,31 +1290,31 @@ class Pipeline:
         if changed:
             self._persist_queue_state()
 
-    def _store_chapters(self, label: str, chapters: list) -> list[int]:
-        """Write chapters to disk, update counters and tracker, log one summary line."""
+    def _store_chapters(self, log: BatchLog, chapters: list, timing: str = "") -> list[int]:
+        """Write chapters to disk, update counters and tracker, and set the block's headline."""
         saved, skipped, _written = storage.save_chapters(chapters, self.cfg.book_dir)
         numbers = self._record_translated(chapters, saved, skipped)
         noun = "chapter" if saved == 1 else "chapters"
-        msg = f"{label}: Saved [bold green]{saved}[/bold green] {noun}"
+        msg = f"Saved [bold green]{saved}[/bold green] {noun}"
         span = _format_chapter_ranges(numbers)
         if span:
             msg += f" ({span})"
         msg += f" to '{escape(self.cfg.book_name)}'"
         if skipped:
             msg += f", [yellow]{skipped} skipped[/yellow]"
+        if timing:
+            msg += f" [dim]{escape(timing)}[/dim]"
+        log.head("ok" if saved else "warn", msg)
         if saved:
-            con.ok(msg)
-            self._record_activity(label, numbers)
-        else:
-            con.warn(msg)
+            self._record_activity(log, numbers)
         return numbers
 
-    def _record_activity(self, label: str, numbers: list[int]) -> None:
+    def _record_activity(self, log: BatchLog, numbers: list[int]) -> None:
         """Stamp the book as just translated so the book picker lists it first."""
         try:
             activity.record_translation(self.cfg.book_dir, numbers)
         except (OSError, ValueError, TypeError) as e:
-            con.warn(f"{label}: could not update {activity.ACTIVITY_FILENAME}: {escape(str(e))}")
+            log.warn(f"Could not update {activity.ACTIVITY_FILENAME}: {escape(str(e))}")
 
     def _record_translated(self, chapters: list, saved: int, skipped: int) -> list[int]:
         """Update counters and the tracker; returns the chapter numbers that were read."""
@@ -1169,124 +1330,124 @@ class Pipeline:
                     numbers.append(num)
         return numbers
 
-    def _apply_arc_ends(self, label: str, arc_ends: list, chapters: list) -> None:
-        """Record author-declared arc/volume endings in Arcs.json and log every change."""
+    def _apply_arc_ends(self, log: BatchLog, arc_ends: list, chapters: list) -> None:
+        """Record author-declared arc/volume endings in Arcs.json and note every change."""
         if not arc_ends:
             return
         valid = arcs.chapter_numbers([entry for entry in chapters if _is_saveable(entry)])
         try:
             summary = arcs.record_arc_ends(self.cfg.book_dir, arc_ends, valid)
         except (OSError, ValueError, TypeError) as e:
-            con.fail(f"{label}: arc/volume update failed: {escape(str(e))}")
+            log.fail(f"Arc/volume update failed: {escape(str(e))}")
             return
-        self._log_arc_summary(label, summary)
+        self._log_arc_summary(log, summary)
 
     @staticmethod
-    def _log_arc_summary(label: str, summary: dict) -> None:
-        """One log line per arc event; failures are never silent."""
+    def _log_arc_summary(log: BatchLog, summary: dict) -> None:
+        """One detail line per recorded change; skipped entries and failures are never silent."""
         for ev in summary.get("recorded", []):
             kind = "Volume" if ev["type"] == "volume" else "Arc"
-            con.ok(f"{label}: 📕 {kind} end recorded at Chapter {ev['chapter']} — “{escape(ev['name'])}”")
+            log.detail(f"{kind} end recorded at Chapter {ev['chapter']}: “{escape(str(ev['name']))}”")
         for ev in summary.get("extended", []):
-            con.ok(f"{label}: 📕 Afterword Chapter {ev['to']} added to “{escape(ev['name'])}” (was ending at {ev['from']})")
-        for ev in summary.get("unchanged", []):
-            con.dim(f"{label}: ending at Chapter {ev['chapter']} already recorded as “{escape(ev['name'])}”")
-        for reason in summary.get("skipped", []):
-            con.warn(f"{label}: arc/volume entry skipped: {escape(reason)}")
+            log.detail(f"Afterword Chapter {ev['to']} added to “{escape(str(ev['name']))}” (was ending at {ev['from']})")
+        for reason in summary.get("skipped", [])[:MAX_REPORTED_WARNINGS]:
+            log.warn(f"Arc/volume entry skipped: {escape(str(reason))}")
         for err in summary.get("failed", []):
-            con.fail(f"{label}: arc/volume update failed: {escape(err)}")
+            log.fail(f"Arc/volume update failed: {escape(str(err))}")
 
-    def _apply_character_actions(self, label: str, char_actions: list) -> None:
-        """Apply character mutations and log one combined summary line."""
+    def _apply_character_actions(self, log: BatchLog, char_actions: list) -> None:
+        """Apply character mutations and add one combined summary line."""
         if not char_actions:
             return
         try:
             summary = characters.process_character_actions(self.cfg.book_dir, char_actions)
         except (OSError, ValueError) as e:
-            con.fail(f"{label}: character updates failed: {escape(str(e))}")
+            log.fail(f"Character updates failed: {escape(str(e))}")
             return
         for err in summary.get("failed", []):
-            con.fail(f"{label}: character update failed: {escape(err)}")
+            log.fail(f"Character update failed: {escape(str(err))}")
         line = characters.format_summary(summary)
         if line:
-            con.ok(f"{label}: {escape(line)}")
+            log.detail(escape(line))
 
-    def _apply_term_actions(self, label: str, term_actions: list, numbers: list[int],
+    def _apply_term_actions(self, log: BatchLog, term_actions: list, numbers: list[int],
                             first_seen: dict | None = None) -> None:
-        """Register new glossary terms; a different rendering for a locked term is only logged."""
+        """Register new glossary terms; a different rendering for a locked term is only reported."""
         if not term_actions:
             return
         first = min(numbers) if numbers else None
         try:
             summary = glossary.record_term_actions(self.cfg.book_dir, term_actions, first, first_seen)
         except (OSError, ValueError, TypeError) as e:
-            con.fail(f"{label}: glossary update failed: {escape(str(e))}")
+            log.fail(f"Glossary update failed: {escape(str(e))}")
             return
-        self._log_term_summary(label, summary)
-        self._verify_recovered(label, summary.get("recovered", []))
+        self._log_term_summary(log, summary)
+        self._verify_recovered(log, summary.get("recovered", []))
 
-    def _verify_recovered(self, label: str, recovered) -> None:
-        """Warn when a term registered from prior usage is missing from its first chapter's translation."""
+    def _verify_recovered(self, log: BatchLog, recovered) -> None:
+        """One warning naming terms registered from prior usage that their first chapter does not contain."""
         if not isinstance(recovered, list):
             return
+        missing, unchecked = [], 0
         for ev in recovered[:glossary.MAX_ACTIONS_PER_REPLY]:
             if not isinstance(ev, dict):
                 continue
-            chapter = ev.get("chapter")
             english = str(ev.get("english") or "")
-            chinese = str(ev.get("chinese") or "")
-            found = termlookup.rendering_in_chapter(self.cfg.book_dir, chapter, english)
+            found = termlookup.rendering_in_chapter(self.cfg.book_dir, ev.get("chapter"), english)
             if found is None:
-                con.dim(f"{label}: could not check “{escape(english)}” against Chapter {chapter} (no readable translation)")
+                unchecked += 1
             elif not found:
-                con.warn(
-                    f"{label}: ⚠ Registered “{escape(english)}” for {escape(chinese)} as first seen in Chapter {chapter}, "
-                    f"but Chapter {chapter}'s translation doesn't contain it. If the model changed it on purpose (see its TN), "
-                    f"ignore this; otherwise check with 'terms audit {escape(chinese)}' and fix it with 'term add'."
-                )
+                missing.append(ev)
+        if missing:
+            log.warn(_unconfirmed_text(missing))
+        if unchecked:
+            log.detail(f"[dim]{_plural(unchecked, 'reused rendering', 'reused renderings')} could not be checked (no readable translation)[/dim]")
 
     @staticmethod
-    def _log_term_summary(label: str, summary: dict) -> None:
-        """Conflicts and failures get one line each; everything else one summary line."""
-        for ev in summary.get("conflicts", []):
-            con.warn(
-                f"{label}: ⚠ Term conflict: {escape(ev['chinese'])} is locked as “{escape(ev['current'])}” "
-                f"but the model suggested “{escape(ev['suggested'])}”; kept “{escape(ev['current'])}”"
-            )
-        for reason in summary.get("skipped", [])[:MAX_REPORTED_WARNINGS]:
-            con.dim(f"{label}: term action skipped: {escape(reason)}")
+    def _log_term_summary(log: BatchLog, summary: dict) -> None:
+        """Failures one line each; additions and reused renderings one line; conflicts one warning."""
         for err in summary.get("failed", []):
-            con.fail(f"{label}: glossary update failed: {escape(err)}")
-        for ev in summary.get("recovered", []):
-            con.ok(
-                f"{label}: 📖 Registered “{escape(str(ev['english']))}” for {escape(str(ev['chinese']))}, "
-                f"first seen in Chapter {ev['chapter']}"
-            )
+            log.fail(f"Glossary update failed: {escape(str(err))}")
+        parts = []
         line = glossary.format_summary(summary)
         if line:
-            con.ok(f"{label}: {escape(line)}")
+            parts.append(escape(line))
+        reused = _reused_text(summary.get("recovered", []))
+        if reused:
+            parts.append(reused)
+        if parts:
+            log.detail(" · ".join(parts))
+        conflicts = _conflicts_text(summary.get("conflicts", []))
+        if conflicts:
+            log.warn(conflicts)
 
-    def _check_term_drift(self, label: str, entries: list[PageEntry], chapters: list) -> None:
-        """Warn when a raw page contains a locked term but its translation lacks the English rendering."""
+    def _check_term_drift(self, log: BatchLog, entries: list[PageEntry], chapters: list) -> None:
+        """One warning listing locked terms whose English is missing from the translation, grouped by term."""
         try:
-            drift = self._find_term_drift(entries, chapters)
+            groups = self._find_term_drift(entries, chapters)
         except Exception as e:  # a checker bug must never fail a batch that is already saved
-            con.warn(f"{label}: term drift check failed: {escape(str(e))}")
+            log.warn(f"Term drift check failed: {escape(str(e))}")
             return
-        for ev in drift[:MAX_REPORTED_WARNINGS]:
-            con.warn(
-                f"{label}: ⚠ Term drift in {escape(ev['label'])}: expected “{escape(ev['english'])}” "
-                f"for {escape(ev['forms'])}, not found in the translation"
-            )
-        if len(drift) > MAX_REPORTED_WARNINGS:
-            con.warn(f"{label}: ... and {len(drift) - MAX_REPORTED_WARNINGS} more term drift warning(s).")
+        text = _drift_text(groups)
+        if text:
+            log.warn(text)
 
-    def _find_term_drift(self, entries: list[PageEntry], chapters: list) -> list[dict]:
+    def _find_term_drift(self, entries: list[PageEntry], chapters: list) -> list:
+        """[((english, forms), [chapters])] for drifted terms, the term missing from most chapters first."""
         translated = self._translated_by_number(chapters)
-        pairs = [(e.label, e.content, translated[e.chapter]) for e in entries if e.chapter in translated]
-        if not pairs:
+        if not translated:
             return []
-        return glossary.check_term_usage(glossary.load_terms(self.cfg.book_dir), pairs)
+        terms = glossary.load_terms(self.cfg.book_dir)
+        if not terms:
+            return []
+        groups: dict[tuple[str, str], list[int]] = {}
+        for entry in entries:
+            if entry.chapter not in translated:
+                continue
+            pair = (entry.label, entry.content, translated[entry.chapter])
+            for ev in glossary.check_term_usage(terms, [pair]):
+                groups.setdefault((ev["english"], ev["forms"]), []).append(entry.chapter)
+        return sorted(groups.items(), key=lambda item: (-len(item[1]), item[0][0].casefold()))
 
     @staticmethod
     def _translated_by_number(chapters: list) -> dict[int, str]:

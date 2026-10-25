@@ -1,5 +1,6 @@
 """OpenAI v1-compatible HTTP client."""
 
+import json
 import threading
 import time
 
@@ -19,6 +20,48 @@ _MANUAL = object()  # sentinel: the picker's manual-entry row was chosen
 POST_POLL_SECONDS = 0.25
 POST_GRACE_SECONDS = 5   # extra wait beyond the request timeout before giving up on the helper thread
 CANCEL_MESSAGE = "Request cancelled via console command"
+SHORT_ERROR_CHARS = 100     # error text shown in retry lines
+ERROR_PARSE_CHARS = 20_000  # most of an error body read when looking for its message
+
+
+def _clip(text, limit: int = SHORT_ERROR_CHARS) -> str:
+    """Text collapsed to one line and cut to at most limit characters."""
+    flat = " ".join(str(text or "").split())
+    if limit < 2 or len(flat) <= limit:
+        return flat
+    return flat[:limit - 1].rstrip() + "…"
+
+
+def _error_message(body) -> str:
+    """The human-readable message inside an error body ('error.message' or 'message'), else the body."""
+    if not isinstance(body, str) or not body.strip():
+        return ""
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return body
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"])
+        if isinstance(err, str) and err.strip():
+            return err
+        if data.get("message"):
+            return str(data["message"])
+    return body
+
+
+def _short_error(status, body) -> str:
+    """'HTTP 503 · The model is overloaded.' instead of the raw JSON body."""
+    detail = _clip(_error_message(body))
+    return f"HTTP {status} · {detail}" if detail else f"HTTP {status}"
+
+
+def _labelled(label, text: str) -> str:
+    """Prefix a client log line with the caller's label, e.g. 'Batch #7: Term query attempt 1/3 failed'."""
+    if label:
+        return f"{escape(label)} {text}"
+    return text[:1].upper() + text[1:]
 
 
 def _raise_if_cancelled(cancel) -> None:
@@ -69,9 +112,12 @@ def _post_abortable(url: str, headers: dict, payload: dict, timeout: int, cancel
 
 
 class ApiError(Exception):
-    def __init__(self, message: str, status: int = None):
+    """API failure. str() is the full message; summary is a short one-line form for the console."""
+
+    def __init__(self, message: str, status: int = None, summary: str | None = None):
         super().__init__(message)
         self.status = status
+        self.summary = summary or _clip(message)
 
 
 class ApiClient:
@@ -247,14 +293,17 @@ class ApiClient:
     # ------------------------------------------------------------------
 
     def chat(self, cfg, messages: list[dict], max_tokens: int | None = None,
-             cancel: CancelToken | None = None) -> tuple[str, dict | None]:
+             cancel: CancelToken | None = None, label: str | None = None) -> tuple[str, dict | None]:
         """Send chat completion request with exponential backoff.
 
         max_tokens limits this call only; when cfg.max_tokens is also set, the smaller one wins.
         cancel, when set, stops the call (including retries and backoff) with ApiCancelled.
+        label, e.g. 'Batch #7: Term query', prefixes every retry and rate-limit log line.
         """
         if cancel is not None and not isinstance(cancel, CancelToken):
             raise TypeError("cancel must be a CancelToken or None")
+        if label is not None and not isinstance(label, str):
+            raise TypeError("label must be a string or None")
         if not cfg.model:
             raise ApiError("No model specified. Use the model command to configure one.")
 
@@ -284,7 +333,7 @@ class ApiClient:
             except requests.Timeout:
                 last_err = ApiError(f"Request timed out after {cfg.timeout}s")
             except requests.RequestException as e:
-                last_err = ApiError(f"HTTP connection failed: {e}")
+                last_err = ApiError(f"HTTP connection failed: {e}", summary=_clip(f"connection failed: {e}"))
             else:
                 _raise_if_cancelled(cancel)  # a reply that arrives after cancel is dropped
                 if resp.status_code == 200:
@@ -302,7 +351,7 @@ class ApiClient:
                 if resp.status_code in (400, 422) and "response_format" in body_sample and cfg.json_mode == "auto":
                     self._no_json_format_models.add(cfg.model)
                     payload.pop("response_format", None)
-                    con.warn(f"Model '{cfg.model}' rejected response_format, retrying without it...")
+                    con.warn(_labelled(label, f"hit a response_format error on '{escape(cfg.model)}' · retrying without it"))
                     continue
 
                 if resp.status_code in (401, 403):
@@ -315,15 +364,19 @@ class ApiClient:
                             retry_after = int(resp.headers["Retry-After"])
                         except ValueError:
                             pass
-                    con.warn(f"Rate limited (HTTP 429). Retrying in {retry_after}s...")
+                    con.warn(_labelled(label, f"rate limited (HTTP 429) · retrying in {retry_after}s"))
                     _sleep(retry_after, cancel)
                     continue
 
-                last_err = ApiError(f"API returned HTTP {resp.status_code}: {body_sample}", resp.status_code)
+                last_err = ApiError(
+                    f"API returned HTTP {resp.status_code}: {body_sample}", resp.status_code,
+                    summary=_short_error(resp.status_code, resp.text[:ERROR_PARSE_CHARS]),
+                )
 
             if attempt < attempts - 1:
                 backoff = min(30, 2 ** attempt)
-                con.warn(f"Attempt {attempt + 1} failed ({last_err}). Backing off {backoff}s...")
+                short = escape(last_err.summary) if last_err else "unknown error"
+                con.warn(_labelled(label, f"attempt {attempt + 1}/{attempts} failed: {short} · retrying in {backoff}s"))
                 _sleep(backoff, cancel)
 
         raise last_err or ApiError("All API completion attempts failed.")

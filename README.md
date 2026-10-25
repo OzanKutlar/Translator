@@ -68,7 +68,7 @@ Partial batches are only sent in *drain mode*, which turns on when the goal is r
 
 After each reply, the chapters that were sent are compared with the chapters that came back.
 
-- **Missing**: a chapter that was sent but not returned. It is logged, e.g. `Batch #7: ⚠ Missing Chapters 123, 125 (not re-queued …)`.
+- **Missing**: a chapter that was sent but not returned. It is logged under the batch, e.g. `⚠ Missing Chapters 123, 125: left out of the reply (not re-queued; use 'retry missing')`.
 - **Failed**: every chapter in a batch that hit an API or JSON error. The batch is also quarantined to `_failed/`.
 
 Neither list is re-queued automatically. Use `missing` to see them, and `retry` to send them again. A chapter leaves both lists once it is translated successfully or re-queued. The lists are stored in `<Book>/_queue_state.json`, so they survive restarts.
@@ -140,7 +140,17 @@ Progress bars count from the first chapter the scraper sends after the program s
 
 ### Logs
 
-Each finished batch logs one chapter summary, such as `Batch #4: Saved 10 chapters (Chapters 10–19)`, and one character summary, such as `Modified 2 characters, added 1 character, associated 3 characters`. If the reply left chapters out, one extra line lists them as Missing.
+Each batch prints a few short lines: `→` marks a request going out, `←` the term query's answer. Everything about the reply is then printed as one block, a headline plus indented details, so batches finishing at the same time never interleave:
+
+    → Batch #78: Term query sent (15 pages · Chapters 846–860)
+    ← Batch #78: Term query returned 15 new term(s), 3 used before (梦魇圣车 ← Ch 844, …)
+    → Batch #78: Translation sent to Gemini Studio
+    ✔ Batch #78: Saved 15 chapters (Chapters 846–860) to 'SuperBase Evolution' in 84s · 23,410 tokens
+       Added 1 character
+       Added 21 terms (…) · reused 3 earlier renderings: 梦魇圣车 → Nightmare holy carriage (Ch 844), …
+       ⚠ Term drift: “Seraphim” (炽天使) missing from Chapters 847–849 · “Earth Law” (地法) missing from Chapter 851
+
+Only problems get a ⚠, and they are grouped: one Term drift line per batch (up to 3 terms, each with its chapters), one line for reused renderings missing from their first chapter, one for kept locked terms, and one for Missing chapters. API retries print one short line such as `Batch #7: Term query attempt 1/3 failed: HTTP 503 · The model is overloaded. · retrying in 1s`; the full error body is kept in the `_failed/` record. `paste` prints the same block under `Manual paste`.
 
 ### Files Written per Book
 
@@ -180,9 +190,9 @@ Character files keep people's names consistent. Everything else that must stay t
 
 - Before each batch, every term whose Chinese text or one of its `aliases` appears in the pages is sent to the model as **LOCKED TERMS**, which it must use exactly. Longer spellings are matched first, so 小丑印记 wins over 小丑.
 - The model registers new terms with `AddTerm` and links other spellings with `AliasTerm`. If it adds a new spelling with an English rendering that already exists, the spelling becomes an alias of that term.
-- The model can never change an existing term. A different rendering is logged as `⚠ Term conflict … kept “Joker's Mark”`.
+- The model can never change an existing term. A different rendering is logged under the batch as `⚠ Kept locked terms: 小丑印记 stays “Joker's Mark” (model suggested …)`.
 - Terms you add with `term add` are marked `"source": "user"`. The model never edits them, not even to add an alias; it logs a hint instead.
-- After each reply, every chapter whose raw page contains a locked term is checked for that term's English. If it is missing, a `⚠ Term drift` warning names the chapter; use `retry <chapter>` if the translation really drifted. Text the model skips (site headers, recommendations) can occasionally cause a false warning.
+- After each reply, every chapter whose raw page contains a locked term is checked for that term's English. If it is missing, the batch's single `⚠ Term drift` line lists the term with the chapters it is missing from, e.g. `“Joker's Mark” (小丑印记) missing from Chapters 831–845`; use `retry <chapter>` if the translation really drifted. A term reported in every chapter usually means the locked English is not what the model writes; check it with `terms audit <chinese>`. Text the model skips (site headers, recommendations) can occasionally cause a false warning.
 - Chinese keys and aliases must be 2–40 characters; one-character keys would match almost every page.
 
 ### Prior-Usage Lookup
@@ -191,12 +201,12 @@ A term the model never registered may still have been translated before, e.g. �
 
 1. **Term scout.** The batch opens a conversation with the model: the full translation instructions and book context, then a user turn asking it to list the glossary terms it plans to register for these pages (`candidateTerms`). Nothing is translated yet.
 2. **Lookup.** Candidates that are already locked, known characters, or not in the pages are dropped, and at most 15 are kept. Each one is searched in `_raw/chapters/` among chapters that already have a translated `.md` file; the current batch is skipped. For up to 3 hits (earliest, most recent and one in between) an excerpt is cut out with surrounding context: the Chinese line with the term plus up to 3 lines on each side (at most 700 characters), and the matching English paragraph plus up to 4 paragraphs on each side (at most 1,600 characters). Adjust `ZH_CONTEXT_LINES`, `ZH_EXCERPT_CHARS`, `EN_CONTEXT_PARAGRAPHS`, `EXCERPT_CHARS` and `CONTEXT_BUDGET` in `booktl/termlookup.py` to change this. The passage is placed by position in the chapter, then moved onto the paragraphs that mention the names and locked terms found next to the hit ("anchors").
-3. **Translation.** The translation call continues the same conversation. The scout's reply goes back in as the model's own turn, followed by a user turn with the **PRIOR USAGE** results and the request to translate the pages. The model therefore sees both what it proposed and what earlier chapters actually wrote, and is told that its proposals were made without seeing those chapters: wherever an earlier rendering exists, it replaces the proposal. The model reuses it and registers it with `AddTerm`; `firstChapter` becomes the earliest chapter found, and the log shows `📖 Registered “Blood Demon Seal” for 血魔印, first seen in Chapter 300`.
+3. **Translation.** The translation call continues the same conversation. The scout's reply goes back in as the model's own turn, followed by a user turn with the **PRIOR USAGE** results and the request to translate the pages. The model therefore sees both what it proposed and what earlier chapters actually wrote, and is told that its proposals were made without seeing those chapters: wherever an earlier rendering exists, it replaces the proposal. The model reuses it and registers it with `AddTerm`; `firstChapter` becomes the earliest chapter found, and the batch's terms line shows `reused 1 earlier rendering: 血魔印 → Blood Demon Seal (Ch 300)`.
 
 - If earlier chapters disagree, the earliest rendering wins and the other one is put in the term's note.
 - If the model decides the old rendering does not fit the current context, it uses a new one, notes `previously written as X`, and adds `(TN: This was written as X in earlier chapters, but Y fits the current context better.)` to the chapter.
-- After a term is registered this way, the translation of its `firstChapter` is checked for the registered English. If it is not there, the log warns, e.g. `⚠ Registered “Fire Seed” for 火种 as first seen in Chapter 1, but Chapter 1's translation doesn't contain it`. Check with `terms audit <chinese>` and fix it with `term add`. A deliberate change (the TN case above) triggers the same warning and can be ignored.
-- If the scout call fails or its reply is not usable JSON, the batch is translated with a single call as before, with a warning. The lookup never fails a batch.
+- After a term is registered this way, the translation of its `firstChapter` is checked for the registered English. If it is not there, the batch warns, e.g. `⚠ Reused but not in its first chapter: “Fire Seed” (火种, Ch 1)`. Check with `terms audit <chinese>` and fix it with `term add`. A deliberate change (the TN case above) triggers the same warning and can be ignored.
+- If the term query fails or its reply is not usable JSON, it is re-sent once (the normal HTTP retries still apply inside each attempt). If that fails too, the batch is not translated: it is quarantined to `_failed/` and its chapters are listed as Failed, so `retry failed` sends them again later. If the local search itself fails, the batch is marked Failed at once, because re-sending cannot fix it. With `lookup off`, batches go out as a single translation call.
 - Both calls start with the same messages: the scout call carries the full system prompt and book context, and the translation call repeats them plus the two scout turns. The pages are therefore sent twice per batch, and the scout call is a few thousand tokens larger than a bare term list would need. Endpoints with prompt caching (for example Gemini's implicit caching) can bill the repeated prefix at the cached rate. Turn the lookup off with `lookup off`, `--no-term-lookup` or `TL_TERM_LOOKUP=off`.
 - `python translate.py prompt -b <BookName>` shows the single-call messages, the scout conversation, and a sample of the follow-up turn.
 - Only chapters with a stored raw page in `_raw/chapters/` are searched. `manual` / `paste` and `--dry-run` skip the lookup.
@@ -221,4 +231,4 @@ When the author explicitly marks a chapter as the end of an arc or volume (for e
 - An author's afterword ("Thoughts on Volume 1", 卷末感言) up to 5 chapters after an ending is folded into that volume. `endChapter` moves to the afterword and `storyEndChapter` keeps the chapter where the story ended.
 - `bookName` and `author` are left empty by the translator; the PDF tool fills them in. Arcs you define yourself (`"source": "user"`) are never moved.
 - Recorded endings are sent to the model as context so afterwords reuse the exact same name.
-- Every change is logged, e.g. `Batch #4: 📕 Volume end recorded at Chapter 2000 — “Volume 1: Above the Ruins”`.
+- Every change is logged under the batch, e.g. `Volume end recorded at Chapter 2000: “Volume 1: Above the Ruins”`.

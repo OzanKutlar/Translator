@@ -1,6 +1,7 @@
 """Thread-safe Rich console logging helpers."""
 
 import threading
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.rule import Rule
@@ -29,6 +30,27 @@ def fail(message: str) -> None:
         console.print(f"[bold red]✘[/bold red] {message}")
 
 
+def sent(message: str) -> None:
+    """A request going out to the API."""
+    with _lock:
+        console.print(f"[cyan]→[/cyan] {message}")
+
+
+def received(message: str) -> None:
+    """An answer that came back from the API."""
+    with _lock:
+        console.print(f"[green]←[/green] {message}")
+
+
+def block(lines) -> None:
+    """Print several lines together so other threads' output cannot land in between."""
+    if isinstance(lines, str):
+        lines = [lines]
+    with _lock:
+        for line in lines or ():
+            console.print(line)
+
+
 def rule(title: str = "") -> None:
     with _lock:
         console.print(Rule(f"[bold blue]{title}[/bold blue]" if title else ""))
@@ -40,6 +62,8 @@ def banner(title: str, subtitle: str = "") -> None:
         text += f"\n[dim]{subtitle}[/dim]"
     with _lock:
         console.print(Panel(text, border_style="blue"))
+
+
 def dim(message: str) -> None:
     with _lock:
         console.print(f"[dim]{message}[/dim]")
