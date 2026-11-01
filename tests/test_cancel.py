@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 from booktl.cancel import ApiCancelled, CancelToken
-from booktl.client import ApiClient
+from booktl.client import ApiClient, ApiError
 from booktl.config import Config
 from booktl.pipeline import Pipeline
 
@@ -155,6 +155,14 @@ class ClientCancelTests(unittest.TestCase):
             content, _usage = ApiClient().chat(_cfg(), [{"role": "user", "content": "x"}])
         self.assertEqual(content, "ok")
         self.assertEqual(post.call_count, 2)
+
+    def test_truncated_reply_raises_without_retry(self):
+        body = json.dumps({"choices": [{"message": {"content": "{"}, "finish_reason": "length"}]})
+        with mock.patch("booktl.client.requests.post", return_value=FakeResponse(200, body)) as post:
+            with self.assertRaises(ApiError) as ctx:
+                ApiClient().chat(_cfg(), [{"role": "user", "content": "x"}])
+        self.assertEqual(post.call_count, 1)
+        self.assertIn("cut off", ctx.exception.summary)
 
     def test_rejects_non_token(self):
         with self.assertRaises(TypeError):

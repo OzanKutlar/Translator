@@ -5,7 +5,7 @@ import os
 import tempfile
 import unittest
 
-from booktl import glossary, parsing, termlookup
+from booktl import glossary, parsing, segments, termlookup
 
 RAW_300 = "\n".join([
     "某某书名",
@@ -126,6 +126,25 @@ class LookupTests(unittest.TestCase):
         self.assertIn("An elder of the Azure Sect looked at him.", en)
         self.assertIn("Everyone was shocked.", en)
         self.assertNotIn("(TN:", en)
+
+    def test_aligned_paragraph_is_preferred(self):
+        parts = segments.split_page(RAW_300)
+        english = {
+            "0": "# Chapter 300: Blood Red",
+            "1": "Li Yao walked into the great hall.",
+            "2": "An elder of the Azure Sect looked at him.",
+            "3": "Li Yao felt a burn as the Crimson Seal flared.",
+            "4": "Everyone was shocked.",
+        }
+        record = {"version": segments.ALIGN_VERSION, "chapter": 300,
+                  "zh": [parts.title, *parts.body], "en": english}
+        segments.save_alignment(self.book, 300, record)
+        candidates = [termlookup.Candidate("血魔印", "", "item")]
+        result = termlookup.build_prior_usage(self.corpus, self.book, candidates, set())
+        occ = result.usages[0].occurrences[0]
+        self.assertTrue(occ.aligned)
+        self.assertIn("Crimson Seal", occ.en)
+        self.assertIn("exact aligned paragraph", result.context)
 
     def test_rendering_in_chapter(self):
         self.assertTrue(termlookup.rendering_in_chapter(self.book, 300, "blood demon seal"))

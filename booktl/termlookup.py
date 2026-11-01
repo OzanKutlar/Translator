@@ -24,7 +24,7 @@ import re
 import threading
 from dataclasses import dataclass, field
 
-from . import characters, glossary, storage
+from . import characters, glossary, segments, storage
 from .parsing import parse_chapter_number
 
 MAX_CANDIDATES = 15            # candidates looked up per batch
@@ -46,15 +46,9 @@ HEADER_SCAN_LINES = 8          # the chapter title line is looked for in the fir
 MAX_FIELD_LENGTH = 120
 MAX_WARNINGS = 20
 
-_HEADER_RE = re.compile(r"第\s*[零〇一二两三四五六七八九十百千万\d]+\s*[章回节集篇]")
-# Everything from the first line matching one of these is site text, not story.
-END_MARKERS = (
-    re.compile(r"^[（(]?\s*本章完\s*[)）]?$"),
-)
-# Single lines dropped anywhere in the page.
-BOILERPLATE = (
-    re.compile(r"69书吧|69shu|https?://|www\.", re.IGNORECASE),
-)
+# Site-text rules live in segments.py; they are re-exported here for older callers.
+END_MARKERS = segments.END_MARKERS
+BOILERPLATE = segments.BOILERPLATE
 _TN_RE = re.compile(r"^\(\s*TN\s*:", re.IGNORECASE)
 _LINK_RE = re.compile(r"^\[\[[^\]]*\]\]$")
 
@@ -76,6 +70,7 @@ class Occurrence:
     zh: str                    # line with the hit plus neighbouring lines, joined by '\n'
     en: str                    # matched paragraph plus neighbouring paragraphs, joined by '\n'
     anchors: tuple[str, ...]   # English names/terms that confirmed the passage
+    aligned: bool = False      # True when the English comes from the chapter's alignment file
 
 
 @dataclass(frozen=True)
@@ -127,23 +122,9 @@ def _lines(text) -> list[str]:
     return [line for line in stripped if line][:MAX_PARAGRAPHS]
 
 
-def _header_index(lines: list[str]) -> int:
-    for index, line in enumerate(lines[:HEADER_SCAN_LINES]):
-        if _HEADER_RE.search(line):
-            return index
-    return 0
-
-
 def clean_raw(text) -> list[str]:
-    """Story paragraphs of a raw page: from the chapter title line up to the end marker, minus site lines."""
-    lines = _lines(text)
-    body = []
-    for line in lines[_header_index(lines):]:
-        if any(pattern.search(line) for pattern in END_MARKERS):
-            break
-        if not any(pattern.search(line) for pattern in BOILERPLATE):
-            body.append(line)
-    return body
+    """Story paragraphs of a raw page: the chapter title line, then the body (see segments.split_page)."""
+    return segments.clean_raw(text)
 
 
 def clean_english(text) -> list[str]:
@@ -386,8 +367,31 @@ def _spread(chapters: list[int], limit: int) -> list[int]:
     return sorted({chapters[round(i * step)] for i in range(limit)})
 
 
+def _aligned_occurrence(book_dir: str, chapter: int, term: str) -> Occurrence | None:
+    """The exact English paragraph for the term's first hit, from the chapter's alignment file."""
+    data = segments.load_alignment(book_dir, chapter)
+    if data is None:
+        return None
+    zh, en = segments.alignment_texts(data)
+    index, offset = _find_in_paragraphs(zh, term)
+    if index is None or index not in en:
+        return None  # the hit's paragraph was skipped or missing: fall back to the estimate
+    ids = sorted(en)
+    english = [en[i] for i in ids]
+    return Occurrence(
+        chapter=chapter,
+        zh=_zh_excerpt(zh, index, offset, len(term)),
+        en=_excerpt(english, ids.index(index)),
+        anchors=(),
+        aligned=True,
+    )
+
+
 def _locate(corpus: TermCorpus, book_dir: str, chapter: int, md_path: str, term: str,
             anchors: dict) -> Occurrence | None:
+    aligned = _aligned_occurrence(book_dir, chapter, term)
+    if aligned is not None:
+        return aligned
     body = corpus.body(book_dir, chapter)
     raw_paragraphs = body.split("\n") if body else []
     index, offset = _find_in_paragraphs(raw_paragraphs, term)
@@ -477,7 +481,9 @@ def _occurrence_lines(occurrence: Occurrence, first: int, last: int) -> list[str
         tag = " (most recent)"
     else:
         tag = ""
-    if occurrence.anchors:
+    if occurrence.aligned:
+        confidence = "exact aligned paragraph"
+    elif occurrence.anchors:
         confidence = "anchors matched: " + ", ".join(occurrence.anchors)
     else:
         confidence = "no anchors matched, position estimate only"

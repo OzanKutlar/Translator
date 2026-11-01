@@ -88,7 +88,7 @@ Partial batches are only sent in *drain mode*, which turns on when the goal is r
 After each reply, the chapters that were sent are compared with the chapters that came back.
 
 - **Missing**: a chapter that was sent but not returned. It is logged under the batch, e.g. `⚠ Missing Chapters 123, 125: left out of the reply (not re-queued; use 'retry missing')`.
-- **Failed**: every chapter in a batch that hit an API or JSON error. The batch is also quarantined to `_failed/`.
+- **Failed**: every chapter in a batch that hit an API or JSON error. The batch is also quarantined to `_failed/`. A reply cut off at the token limit (`finish_reason: length`) counts as an API error; lower `batch` or raise `maxtokens` and retry.
 
 Neither list is re-queued automatically. Use `missing` to see them, and `retry` to send them again. A chapter leaves both lists once it is translated successfully or re-queued. The lists are stored in `<Book>/_queue_state.json`, so they survive restarts.
 
@@ -181,6 +181,7 @@ Only problems get a ⚠, and they are grouped: one Term drift line per batch (up
 - `Glossary.json` — Locked term renderings (see below).
 - `_activity.json` — When the book was last translated and the highest chapter in that batch; orders the book picker.
 - `_resume.json` — The reopen address: the URL and chapter of the last page the scraper sent.
+- `_align/ch_000120.json` — Paragraph alignment: the Chinese paragraphs by marker, the English paragraph for each marker, declared skips and TNs (see below).
 
 ### Translation Approach
 
@@ -195,6 +196,24 @@ The author's style is kept:
 - Puns still get a `*` and a TN, and locked terms and names always take priority over fluency.
 
 The 1:1 paragraph rule also keeps the term-drift check and the prior-usage excerpts accurate, because both rely on the English text lining up with the raw page. Edit the `TRANSLATION APPROACH` section of `SYSTEM_PROMPT` in `booktl/prompts.py` to adjust it.
+
+### Paragraph Markers
+
+Before a batch is sent, each page is split into its title line, its story paragraphs and anything after `(本章完)`. Site text is removed: the lines above the `第…章` title, lines with site names or URLs, and the end marker itself. The title becomes `⟦0⟧` and the story paragraphs `⟦1⟧`, `⟦2⟧`, … The model starts every English paragraph with the marker it translates:
+
+    ⟦0⟧ # Chapter 120: Blood Red
+    ⟦1⟧ Li Yao walked into the great hall.
+    (TN: Translator's Notes sit on their own unmarked line right after their paragraph.)
+    ⟦2⟧ An elder looked at him.
+
+- The send line shows how many paragraphs went out and how many site lines were removed, e.g. `→ Batch #12: Translation sent to … · 152 paragraphs · 18 site lines removed`.
+- A paragraph the model leaves out on purpose (an author's note, a site notice that slipped through) must be written as `⟦31⟧ [SKIP: reason]`. Declared skips are listed under the batch, e.g. `Declared skips: Chapter 120 ⟦31⟧ (author's note)`.
+- Lines after `(本章完)` are sent under `[After the chapter, not for translation]`, only as evidence for arc and volume endings.
+- After the reply arrives, every chapter is checked against the paragraphs that were sent. Problems are listed under the batch as one line, e.g. `⚠ Anchors: Chapter 812 missing ⟦14–17⟧ · Chapter 815 2 unmarked paragraphs`. A reply without markers (for example a manual `paste` that lost them) is still saved and reported as not checkable. For now problems are reported only; nothing is retranslated automatically.
+- The markers are removed before the chapter is saved, so the `.md` files look the same as before. The pairing is kept in `<Book>/_align/ch_000120.json`. A chapter translated again without markers loses its old alignment file, and the batch log says so.
+- The prior-usage lookup and `terms audit` use the alignment file when a chapter has one and show the exact paragraph (`exact aligned paragraph`) instead of a position estimate.
+- `manual` copies the marked pages; `paste` checks the reply against the open manual session's pages, or against the stored raw page when no session is open.
+- Extend `END_MARKERS` / `BOILERPLATE` in `booktl/segments.py` for other sites.
 
 ### Glossary / Locked Terms
 
@@ -219,7 +238,7 @@ Character files keep people's names consistent. Everything else that must stay t
 A term the model never registered may still have been translated before, e.g. 血魔印 as "Blood Demon Seal" in Chapter 300. To stop Chapter 900 from coining a second rendering, each batch makes two calls while the lookup is on:
 
 1. **Term scout.** The batch opens a conversation with the model: the full translation instructions and book context, then a user turn asking it to list the glossary terms it plans to register for these pages (`candidateTerms`). Nothing is translated yet.
-2. **Lookup.** Candidates that are already locked, known characters, or not in the pages are dropped, and at most 15 are kept. Each one is searched in `_raw/chapters/` among chapters that already have a translated `.md` file; the current batch is skipped. For up to 3 hits (earliest, most recent and one in between) an excerpt is cut out with surrounding context: the Chinese line with the term plus up to 3 lines on each side (at most 700 characters), and the matching English paragraph plus up to 4 paragraphs on each side (at most 1,600 characters). Adjust `ZH_CONTEXT_LINES`, `ZH_EXCERPT_CHARS`, `EN_CONTEXT_PARAGRAPHS`, `EXCERPT_CHARS` and `CONTEXT_BUDGET` in `booktl/termlookup.py` to change this. The passage is placed by position in the chapter, then moved onto the paragraphs that mention the names and locked terms found next to the hit ("anchors").
+2. **Lookup.** Candidates that are already locked, known characters, or not in the pages are dropped, and at most 15 are kept. Each one is searched in `_raw/chapters/` among chapters that already have a translated `.md` file; the current batch is skipped. For up to 3 hits (earliest, most recent and one in between) an excerpt is cut out with surrounding context: the Chinese line with the term plus up to 3 lines on each side (at most 700 characters), and the matching English paragraph plus up to 4 paragraphs on each side (at most 1,600 characters). Adjust `ZH_CONTEXT_LINES`, `ZH_EXCERPT_CHARS`, `EN_CONTEXT_PARAGRAPHS`, `EXCERPT_CHARS` and `CONTEXT_BUDGET` in `booktl/termlookup.py` to change this. Chapters with an alignment file (see [Paragraph Markers](#paragraph-markers)) give the exact paragraph. For older chapters the passage is placed by position in the chapter, then moved onto the paragraphs that mention the names and locked terms found next to the hit ("anchors").
 3. **Translation.** The translation call continues the same conversation. The scout's reply goes back in as the model's own turn, followed by a user turn with the **PRIOR USAGE** results and the request to translate the pages. The model therefore sees both what it proposed and what earlier chapters actually wrote, and is told that its proposals were made without seeing those chapters: wherever an earlier rendering exists, it replaces the proposal. The model reuses it and registers it with `AddTerm`; `firstChapter` becomes the earliest chapter found, and the batch's terms line shows `reused 1 earlier rendering: 血魔印 → Blood Demon Seal (Ch 300)`.
 
 - If earlier chapters disagree, the earliest rendering wins and the other one is put in the term's note.
@@ -229,7 +248,7 @@ A term the model never registered may still have been translated before, e.g. �
 - Both calls start with the same messages: the scout call carries the full system prompt and book context, and the translation call repeats them plus the two scout turns. The pages are therefore sent twice per batch, and the scout call is a few thousand tokens larger than a bare term list would need. Endpoints with prompt caching (for example Gemini's implicit caching) can bill the repeated prefix at the cached rate. Turn the lookup off with `lookup off`, `--no-term-lookup` or `TL_TERM_LOOKUP=off`.
 - `python translate.py prompt -b <BookName>` shows the single-call messages, the scout conversation, and a sample of the follow-up turn.
 - Only chapters with a stored raw page in `_raw/chapters/` are searched. `manual` / `paste` and `--dry-run` skip the lookup.
-- Site text is ignored: everything above the `第…章` title line, everything from `(本章完)` on, and lines with site names or URLs. Extend `END_MARKERS` / `BOILERPLATE` in `booktl/termlookup.py` for other sites.
+- Site text is ignored: everything above the `第…章` title line, everything from `(本章完)` on, and lines with site names or URLs. Extend `END_MARKERS` / `BOILERPLATE` in `booktl/segments.py` for other sites.
 - `terms audit <chinese>` uses the same search, so you can check a rendering before `term add`.
 
 ### Arc / Volume Tracking

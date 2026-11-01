@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from rich.markup import escape
 
 from . import console as con
-from . import activity, arcs, clipaccept, prompts, parsing, resume, storage, characters, glossary, termlookup
+from . import activity, arcs, clipaccept, prompts, parsing, resume, segments, storage, characters, glossary, termlookup
 from .batchlog import BatchLog
 from .tracker import ChapterTracker
 from .client import ApiClient, ApiError
@@ -168,6 +168,22 @@ class ScoutOutcome:
     @property
     def usable(self) -> bool:
         return bool(self.messages) and isinstance(self.reply, str) and bool(self.reply.strip())
+
+
+def _more_items(total: int, shown: int, singular: str, plural: str) -> str:
+    """' · 3 more chapters' when total exceeds shown, else ''."""
+    extra = total - shown
+    return f" · {extra} more {singular if extra == 1 else plural}" if extra > 0 else ""
+
+
+@dataclass
+class AnchorCheck:
+    """Paragraph-marker check of one returned chapter."""
+
+    chapter: int | None
+    parsed: segments.MarkedOutput
+    parts: segments.PageParts | None
+    findings: list = field(default_factory=list)
 
 
 class ScoutFailed(Exception):
@@ -632,7 +648,7 @@ class Pipeline:
                 return None, "Nothing is pending. No pages to translate."
             try:
                 prompt = prompts.build_manual_prompt(
-                    self.cfg.book_dir, PAGE_SEPARATOR.join(e.content for e in entries)
+                    self.cfg.book_dir, self._mark_entries(entries)[0]
                 )
             except Exception:
                 self.pool.add(entries, front=True)  # never lose pages if prompt building fails
@@ -661,10 +677,13 @@ class Pipeline:
         if not self.cfg.book_dir:
             return "No target book folder selected."
 
-        chapters = reply.chapters or []
         log = BatchLog("Manual paste")
         try:
+            with self.lock:
+                session = list(self.manual_entries or []) if self.manual_active else []
+            chapters, anchors = self._strip_and_check(session, reply.chapters or [])
             numbers = self._save_results(log, chapters, reply)
+            self._record_anchors(log, anchors, numbers)
             with self.lock:
                 entries = self.manual_entries if self.manual_active else None
                 self.manual_active = False
@@ -1016,7 +1035,10 @@ class Pipeline:
         label = f"Batch #{batch_id}"
         pages = [e.content for e in entries]
         self._spool_batch(batch_id, pages)
-        pages_text = PAGE_SEPARATOR.join(pages)
+        pages_text, paragraphs, dropped = self._mark_entries(entries)
+        sent_note = f" · {_plural(paragraphs, 'paragraph', 'paragraphs')}"
+        if dropped:
+            sent_note += f" · {_plural(dropped, 'site line', 'site lines')} removed"
         cancelled_note = f"{label}: cancelled during the term query; nothing was translated (pages are back in the pending pool)."
         try:
             scout = self._scout_terms(label, entries, pages_text, token)
@@ -1031,9 +1053,9 @@ class Pipeline:
             con.dim(cancelled_note)
             return
         if self.cfg.dry_run:
-            self._log_dry_run(label, entries, messages)
+            self._log_dry_run(label, entries, messages, sent_note)
             return
-        self._send_translation(batch_id, entries, messages, scout.lookup.first_seen, token)
+        self._send_translation(batch_id, entries, messages, scout.lookup.first_seen, token, sent_note)
 
     def _spool_batch(self, batch_id: int, pages: list[str]) -> None:
         """Back up the batch's pages to _raw/ before any API call."""
@@ -1042,18 +1064,18 @@ class Pipeline:
         except OSError as e:
             con.warn(f"Batch #{batch_id}: could not back up pages to _raw/ ({escape(str(e))}); continuing without backup.")
 
-    def _log_dry_run(self, label: str, entries: list[PageEntry], messages: list[dict]) -> None:
+    def _log_dry_run(self, label: str, entries: list[PageEntry], messages: list[dict], sent_note: str = "") -> None:
         model = escape(self.cfg.model or "(no model)")
         con.dim(
             f"{label}: dry run · built {len(messages)} message(s) for {model} · "
-            f"{len(entries)} pages · {escape(describe_entries(entries))}"
+            f"{len(entries)} pages · {escape(describe_entries(entries))}{escape(sent_note)}"
         )
 
     def _send_translation(self, batch_id: int, entries: list[PageEntry], messages: list[dict],
-                          first_seen: dict, token: CancelToken) -> None:
+                          first_seen: dict, token: CancelToken, sent_note: str = "") -> None:
         """Send the translation call and process its reply."""
         label = f"Batch #{batch_id}"
-        con.sent(f"{label}: Translation sent to [bold]{escape(self.cfg.model)}[/bold]")
+        con.sent(f"{label}: Translation sent to [bold]{escape(self.cfg.model)}[/bold]{escape(sent_note)}")
         started = time.monotonic()
         try:
             raw_reply, usage = self.client.chat(self.cfg, messages, cancel=token, label=f"{label}: Translation")
@@ -1083,11 +1105,108 @@ class Pipeline:
             return
         log = BatchLog(f"Batch #{batch_id}")
         try:
-            numbers = self._save_results(log, reply.chapters, reply, first_seen, timing)
-            self._reconcile(log, batch_id, entries, reply.chapters, numbers)
-            self._check_term_drift(log, entries, reply.chapters)
+            chapters, anchors = self._strip_and_check(entries, reply.chapters)
+            numbers = self._save_results(log, chapters, reply, first_seen, timing)
+            self._record_anchors(log, anchors, numbers)
+            self._reconcile(log, batch_id, entries, chapters, numbers)
+            self._check_term_drift(log, entries, chapters)
         finally:
             log.emit()
+
+    # ------------------------------------------------------------------
+    # Paragraph anchors
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mark_entries(entries: list[PageEntry]) -> tuple[str, int, int]:
+        """Pages joined for the model with ⟦n⟧ markers. Returns (text, marked paragraphs, removed site lines)."""
+        texts, paragraphs, dropped = [], 0, 0
+        for entry in entries:
+            parts = segments.split_page(entry.content)
+            count = len(segments.expected_ids(parts))
+            if not count:
+                texts.append(entry.content)  # nothing recognisable as story: the page goes out unchanged
+                continue
+            texts.append(segments.mark_page(parts))
+            paragraphs += count
+            dropped += parts.dropped
+        return PAGE_SEPARATOR.join(texts), paragraphs, dropped
+
+    def _strip_and_check(self, entries, chapters) -> tuple[list, list[AnchorCheck]]:
+        """Returned chapters with their markers removed, plus the marker check of each one."""
+        by_chapter = {e.chapter: e for e in (entries or []) if e.chapter is not None}
+        cleaned, checks = [], []
+        for entry in chapters if isinstance(chapters, list) else []:
+            if not isinstance(entry, dict) or not isinstance(entry.get("content"), str):
+                cleaned.append(entry)
+                continue
+            parsed = segments.parse_marked(entry["content"])
+            cleaned.append({**entry, "content": segments.strip_markers(entry["content"])})
+            number = parsing.parse_chapter_number(str(entry.get("chapterNo") or ""))
+            checks.append(self._anchor_check(number, parsed, by_chapter))
+        return cleaned, checks
+
+    def _anchor_check(self, number, parsed: segments.MarkedOutput, by_chapter: dict) -> AnchorCheck:
+        parts = self._source_parts(number, by_chapter)
+        findings = segments.check_anchors(segments.expected_ids(parts), parsed) if parts else []
+        return AnchorCheck(number, parsed, parts, findings)
+
+    def _source_parts(self, number, by_chapter: dict) -> segments.PageParts | None:
+        """The raw page a returned chapter translates, split as it was when sent; None when unknown."""
+        if number is None:
+            return None
+        entry = by_chapter.get(number)
+        content = entry.content if entry is not None else self._stored_page(number)
+        parts = segments.split_page(content) if content else None
+        return parts if parts is not None and segments.expected_ids(parts) else None
+
+    def _stored_page(self, number: int) -> str | None:
+        """Stored raw page; None when unreadable (the chapter is then reported as unchecked)."""
+        try:
+            return storage.load_scraped_page(self.cfg.book_dir, number)
+        except (OSError, ValueError):
+            return None
+
+    def _record_anchors(self, log: BatchLog, checks: list, numbers: list[int]) -> None:
+        """Update alignment files of saved chapters and log marker problems and declared skips."""
+        saved = set(numbers or [])
+        problems, skips, unchecked = [], [], 0
+        for check in checks or []:
+            if check.chapter is not None and check.chapter not in saved:
+                continue
+            if check.chapter is None or check.parts is None:
+                unchecked += 1
+                continue
+            if check.findings:
+                problems.append(f"Chapter {check.chapter} {segments.describe_findings(check.findings)}")
+            if check.parsed.skips:
+                skips.append(f"Chapter {check.chapter} {segments.describe_skips(check.parsed.skips)}")
+            self._update_alignment(log, check)
+        self._log_anchor_lines(log, problems, skips, unchecked)
+
+    def _update_alignment(self, log: BatchLog, check: AnchorCheck) -> None:
+        """Write the chapter's alignment file; a chapter translated without markers loses its old one."""
+        book_dir = self.cfg.book_dir
+        try:
+            if check.parsed.marked:
+                data = segments.build_alignment(check.chapter, check.parts, check.parsed)
+                segments.save_alignment(book_dir, check.chapter, data)
+            elif segments.remove_alignment(book_dir, check.chapter):
+                log.detail(f"Removed the old paragraph alignment of Chapter {check.chapter} (the new translation has no markers)")
+        except (OSError, ValueError, TypeError) as e:
+            log.warn(f"Could not update the paragraph alignment of Chapter {check.chapter}: {escape(str(e))}")
+
+    @staticmethod
+    def _log_anchor_lines(log: BatchLog, problems: list[str], skips: list[str], unchecked: int) -> None:
+        """One warning for marker problems, one line for declared skips, one dim line for unchecked chapters."""
+        if problems:
+            shown = escape(" · ".join(problems[:MAX_LISTED_NAMES]))
+            log.warn(f"Anchors: {shown}{_more_items(len(problems), MAX_LISTED_NAMES, 'chapter', 'chapters')}")
+        if skips:
+            shown = escape(" · ".join(skips[:MAX_LISTED_NAMES]))
+            log.detail(f"Declared skips: {shown}{_more_items(len(skips), MAX_LISTED_NAMES, 'chapter', 'chapters')}")
+        if unchecked:
+            log.detail(f"[dim]Markers not checked for {_plural(unchecked, 'chapter', 'chapters')}: no raw page to compare with[/dim]")
 
     # ------------------------------------------------------------------
     # Prior-usage term lookup

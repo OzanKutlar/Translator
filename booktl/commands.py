@@ -626,7 +626,10 @@ def cmd_terms(ctx: ReplContext, args: list[str]) -> None:
 
 
 def _print_occurrence(occ) -> None:
-    anchors = ", ".join(occ.anchors) if occ.anchors else "no anchors, position estimate only"
+    if getattr(occ, "aligned", False):
+        anchors = "exact aligned paragraph"
+    else:
+        anchors = ", ".join(occ.anchors) if occ.anchors else "no anchors, position estimate only"
     body = f"[dim]ZH:[/dim] {escape(occ.zh)}\n\n[dim]EN:[/dim] {escape(occ.en)}"
     con.panel(body, title=escape(f"Chapter {occ.chapter} · {anchors}"), style="magenta")
 

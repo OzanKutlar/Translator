@@ -57,6 +57,27 @@ def _short_error(status, body) -> str:
     return f"HTTP {status} · {detail}" if detail else f"HTTP {status}"
 
 
+TRUNCATED_MESSAGE = (
+    "The reply was cut off at the token limit (finish_reason: length). "
+    "Lower the batch size with 'batch <n>' or raise 'maxtokens', then retry."
+)
+TRUNCATED_SUMMARY = "reply cut off at the token limit; try a smaller batch"
+
+
+def _completion(resp) -> tuple[str, dict | None]:
+    """Content and usage of a 200 reply. Raises ApiError for a bad schema or a cut-off reply."""
+    try:
+        res_json = resp.json()
+        choice = res_json["choices"][0]
+        content = choice["message"]["content"]
+    except (KeyError, IndexError, TypeError, ValueError) as err:
+        raise ApiError(f"Invalid completion schema in response: {err}")
+    if isinstance(choice, dict) and choice.get("finish_reason") == "length":
+        raise ApiError(TRUNCATED_MESSAGE, summary=TRUNCATED_SUMMARY)
+    usage = res_json.get("usage") if isinstance(res_json, dict) else None
+    return content, usage
+
+
 def _labelled(label, text: str) -> str:
     """Prefix a client log line with the caller's label, e.g. 'Batch #7: Term query attempt 1/3 failed'."""
     if label:
@@ -337,14 +358,7 @@ class ApiClient:
             else:
                 _raise_if_cancelled(cancel)  # a reply that arrives after cancel is dropped
                 if resp.status_code == 200:
-                    try:
-                        res_json = resp.json()
-                        choice = res_json["choices"][0]
-                        content = choice["message"]["content"]
-                        usage = res_json.get("usage")
-                        return content, usage
-                    except (KeyError, IndexError, ValueError) as err:
-                        raise ApiError(f"Invalid completion schema in response: {err}")
+                    return _completion(resp)  # a cut-off reply raises here and is not retried
 
                 body_sample = resp.text[:300]
                 # Fallback for models not supporting response_format in auto mode
