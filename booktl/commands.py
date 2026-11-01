@@ -10,12 +10,14 @@ from . import console as con
 from . import glossary
 from . import storage
 from . import termlookup
+from . import qalog, termlint, termrename
 from .client import ApiClient
 from .config import Config, ConfigError
 from .library import ask_reopen, create_book, open_url, select_book
 from .parsing import format_chapter_ranges
 from .pipeline import Pipeline, HAS_CLIPBOARD, describe_entries
 from .progressbar import render_bars
+from .workpool import parse_selection
 
 if HAS_CLIPBOARD:
     import pyperclip
@@ -35,8 +37,13 @@ MAX_TERM_ROWS = 300
 MAX_AUDIT_WARNINGS = 5
 TERM_USAGE = (
     "Usage: term add <chinese> = <english> [type:<type>] · "
-    "term alias <chinese> = <term> · term rm <chinese>"
+    "term alias <chinese> = <term> · term same <term> = <term> · "
+    "term exempt <chinese> [off] · term rm <chinese>"
 )
+RENAME_USAGE = "Usage: terms rename <chinese> = <new english> [--apply]"
+QA_USAGE = "Usage: qa source [chapters], e.g. qa source or qa source 120-140"
+RENAME_PREVIEW = 5
+PREVIEW_CHARS = 300
 ALIASES = {
     "exit": "quit", "q": "quit", "?": "help", "setpage": "batch",
     "buffer": "pending", "queue": "pending", "retranslate": "retry", "rt": "retry",
@@ -69,6 +76,11 @@ HELP_ROWS = (
     ("term alias <chinese> = <term>", "Make another Chinese spelling render like an existing term (named by its Chinese or English)."),
     ("term rm <chinese>", "Remove a term together with its aliases, or remove a single alias."),
     ("terms audit <chinese>", "Show every translated chapter whose raw page contains a term, with the surrounding Chinese lines and the matching English passage."),
+    ("terms lint [N]", "Check the whole glossary: names inside terms without their English, terms sharing an English rendering, broken links, one English word for unrelated Chinese, and English used where its Chinese is absent (last N aligned chapters, default 300). Reports only."),
+    ("terms rename <chinese> = <english> [--apply]", "Show which aligned paragraphs would get the new rendering; --apply writes them (with backups) and locks the term as yours."),
+    ("term same <term> = <term>", "Mark two terms as the same entity (two titles of one person, two names of one place)."),
+    ("term exempt <chinese> [off]", "Stop (or resume) checking that names inside this term keep their English."),
+    ("qa source [chapters]", "Show the typos the model fixed and the author mistakes it kept as written."),
     ("lookup <on|off>", "Toggle the prior-usage term lookup: a short scout call before each batch so new terms reuse earlier renderings."),
     ("repair <on|off>", "Toggle paragraph repair: paragraphs a reply left out are asked for again (at most 2 rounds) before the chapter is saved."),
     ("flush", "Send all pending pages now, including a final partial batch."),
@@ -590,7 +602,7 @@ def cmd_recover(ctx: ReplContext, args: list[str]) -> None:
 
 def _term_table(rows: list[dict], title: str) -> Table:
     table = Table(title=title, border_style="magenta")
-    for column in ("Chinese", "English", "Type", "Aliases", "Refers To", "Source", "First Ch."):
+    for column in ("Chinese", "English", "Type", "Aliases", "Refers To", "Same As", "Source", "First Ch."):
         table.add_column(column)
     for row in rows[:MAX_TERM_ROWS]:
         first = row.get("firstChapter")
@@ -600,6 +612,7 @@ def _term_table(rows: list[dict], title: str) -> Table:
             escape(row["type"]),
             escape(", ".join(row["aliases"])),
             escape(row["refersTo"]),
+            escape(", ".join(row.get("sameAs", []))),
             escape(row["source"]),
             str(first) if first else "",
         )
@@ -613,6 +626,12 @@ def cmd_terms(ctx: ReplContext, args: list[str]) -> None:
         return
     if args and args[0].lower() == "audit":
         _terms_audit(ctx, args[1:])
+        return
+    if args and args[0].lower() == "lint":
+        _terms_lint(ctx, args[1:])
+        return
+    if args and args[0].lower() == "rename":
+        _terms_rename(ctx, args[1:])
         return
     query = " ".join(args).strip()
     rows, err = glossary.search_terms(ctx.cfg.book_dir, query)
@@ -666,6 +685,130 @@ def _terms_audit(ctx: ReplContext, args: list[str]) -> None:
         _print_occurrence(occ)
 
 
+def _print_table(title: str, columns, rows: list) -> None:
+    table = Table(title=escape(title), border_style="magenta")
+    for column in columns:
+        table.add_column(column)
+    for row in rows[:MAX_TERM_ROWS]:
+        table.add_row(*(escape(str(cell)) for cell in row))
+    con.console.print(table)
+    if len(rows) > MAX_TERM_ROWS:
+        con.dim(f"Showing {MAX_TERM_ROWS} of {len(rows)} rows.")
+
+
+def _group_text(part: str, keys) -> str:
+    items = list(keys)
+    listed = ", ".join(items[:6]) + (", …" if len(items) > 6 else "")
+    return f"{part}: {listed}" if part else listed
+
+
+def _print_lint_glossary(report) -> None:
+    if report.containment:
+        rows = [(p["chinese"], p["english"], p["part"], p["partEnglish"]) for p in report.containment]
+        _print_table("Names inside terms without their English", ("Term", "English", "Contains", "Expected in English"), rows)
+    if report.same_english:
+        rows = [(english, ", ".join(keys)) for english, keys in report.same_english]
+        _print_table("Different terms with the same English", ("English", "Terms"), rows)
+    if report.broken_links:
+        _print_table("Same-entity links to removed terms", ("Term", "Links to"), list(report.broken_links))
+
+
+def _print_lint_collisions(report) -> None:
+    if report.splits:
+        rows = [(s.word, _group_text(s.first_part, s.first_terms), _group_text(s.second_part, s.second_terms))
+                for s in report.splits]
+        _print_table("One English word, unrelated Chinese", ("Word", "Group A", "Group B"), rows)
+    if report.corpus:
+        rows = [(c.english, c.key, f"{c.unexplained}/{c.total}", c.likely or "?", format_chapter_ranges(list(c.chapters)))
+                for c in report.corpus]
+        columns = ("English", "Term", "Unexplained", "Likely Chinese", "Sample chapters")
+        _print_table("English used where its Chinese is absent", columns, rows)
+
+
+def _terms_lint(ctx: ReplContext, args: list[str]) -> None:
+    """terms lint [N] -> every glossary problem in the book; nothing is changed."""
+    recent = termlint.DEFAULT_RECENT_CHAPTERS
+    if args:
+        if not args[0].isdigit() or int(args[0]) <= 0:
+            con.warn("Usage: terms lint [N] (N = recent aligned chapters to scan, default 300)")
+            return
+        recent = min(int(args[0]), termlint.MAX_RECENT_CHAPTERS)
+    try:
+        report = termlint.lint(ctx.cfg.book_dir, recent)
+    except (OSError, ValueError) as e:
+        con.fail(f"Lint failed: {escape(str(e))}")
+        return
+    for warning in report.warnings[:MAX_AUDIT_WARNINGS]:
+        con.warn(escape(warning))
+    scanned = f"{report.chapters_scanned} aligned chapter(s) scanned"
+    if report.empty:
+        con.ok(f"No glossary problems found ({scanned}).")
+        return
+    _print_lint_glossary(report)
+    _print_lint_collisions(report)
+    con.dim(f"{scanned}. Lint only reports; nothing was changed.")
+
+
+def _short(text, limit: int = PREVIEW_CHARS) -> str:
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[:limit - 1].rstrip() + "…"
+
+
+def _print_rename_plan(plan) -> None:
+    con.info(
+        f"{escape(plan.key)} “{escape(plan.old)}” → “{escape(plan.new)}”: "
+        f"{len(plan.changes)} paragraph(s) in {len(plan.chapters)} chapter(s)."
+    )
+    for change in plan.changes[:RENAME_PREVIEW]:
+        body = f"[dim]Before:[/dim] {escape(_short(change.before))}\n\n[dim]After:[/dim] {escape(_short(change.after))}"
+        con.panel(body, title=escape(f"Chapter {change.chapter} ⟦{change.marker}⟧"), style="magenta")
+    if len(plan.changes) > RENAME_PREVIEW:
+        con.dim(f"… and {len(plan.changes) - RENAME_PREVIEW} more paragraph(s).")
+    if plan.untouched:
+        chapters = format_chapter_ranges([c for c, _m in plan.untouched])
+        con.warn(f"{len(plan.untouched)} paragraph(s) contain the Chinese but not “{escape(plan.old)}”; left alone: {escape(chapters)}")
+    if plan.unaligned:
+        con.warn(f"Not changed, no alignment file: {escape(format_chapter_ranges(plan.unaligned))}")
+    for warning in plan.warnings[:MAX_AUDIT_WARNINGS]:
+        con.dim(escape(warning))
+
+
+def _print_rename_result(result) -> None:
+    if result.changed_chapters:
+        chapters = format_chapter_ranges(result.changed_chapters)
+        con.ok(f"Changed {result.changed_paragraphs} paragraph(s) in {escape(chapters)}. Originals copied to {escape(result.backup_dir)}.")
+    else:
+        con.info("No chapter files were changed.")
+    for reason in result.skipped[:MAX_AUDIT_WARNINGS]:
+        con.warn(escape(reason))
+    if len(result.skipped) > MAX_AUDIT_WARNINGS:
+        con.dim(f"… and {len(result.skipped) - MAX_AUDIT_WARNINGS} more skipped paragraph(s).")
+    (con.ok if result.glossary_ok else con.warn)(escape(result.glossary_message))
+
+
+def _terms_rename(ctx: ReplContext, args: list[str]) -> None:
+    """terms rename <chinese> = <english> [--apply] -> preview, or write, a new rendering in past chapters."""
+    apply = bool(args) and args[-1].lower() == "--apply"
+    pair = _split_assignment(args[:-1] if apply else args)
+    if pair is None:
+        con.warn(escape(RENAME_USAGE))
+        return
+    plan, err = termrename.plan_rename(ctx.cfg.book_dir, pair[0], pair[1])
+    if err:
+        con.warn(escape(err))
+        return
+    _print_rename_plan(plan)
+    if not apply:
+        con.info("Nothing was changed. Run the same command with --apply to write it.")
+        return
+    try:
+        result = termrename.apply_rename(ctx.cfg.book_dir, plan)
+    except (OSError, ValueError, TypeError) as e:
+        con.fail(f"Rename failed: {escape(str(e))}")
+        return
+    _print_rename_result(result)
+
+
 def cmd_lookup(ctx: ReplContext, args: list[str]) -> None:
     """lookup on|off -> toggle the term-scout call and prior-usage lookup before each batch."""
     if not args or args[0].lower() not in ("on", "off"):
@@ -677,6 +820,61 @@ def cmd_lookup(ctx: ReplContext, args: list[str]) -> None:
         con.ok("Term lookup on: each batch first asks the model for glossary candidates and shows it how earlier chapters rendered them.")
     else:
         con.ok("Term lookup off: batches go out as a single translation call.")
+
+
+def _source_row(record: dict, fixes: bool) -> tuple:
+    after = record.get("afterId")
+    where = f"⟦{after}⟧" if isinstance(after, int) and not isinstance(after, bool) else ""
+    if fixes:
+        detail = f"{record.get('zh', '')} → {record.get('correction', '')}"
+    else:
+        detail = f"{record.get('zh', '')}: {record.get('issue', '')}"
+    return (
+        str(record.get("chapter")), where, escape(detail), escape(str(record.get("status") or "")),
+        escape(str(record.get("reason") or "")), _when_text(record.get("time")),
+    )
+
+
+def _print_source_log(book_dir: str, title: str, filename: str, wanted, fixes: bool) -> None:
+    records, err = qalog.read_records(book_dir, filename)
+    if err:
+        con.warn(escape(err))
+    rows = []
+    for record in reversed(records):
+        if wanted is None or record.get("chapter") in wanted:
+            rows.append(_source_row(record, fixes))
+        if len(rows) >= MAX_PROBLEM_ROWS:
+            break
+    if not rows:
+        scope = " for those chapters" if wanted is not None else ""
+        con.info(f"{title}: nothing recorded{scope}.")
+        return
+    table = Table(title=f"{title} (newest first)", border_style="magenta")
+    for column in ("Chapter", "Para.", "Text", "Status", "Reason", "Recorded"):
+        table.add_column(column)
+    for row in rows:
+        table.add_row(*row)
+    con.console.print(table)
+
+
+def cmd_qa(ctx: ReplContext, args: list[str]) -> None:
+    """qa source [chapters] -> typos the model fixed and author mistakes it kept, from _qa/*.jsonl."""
+    if not ctx.cfg.book_dir:
+        con.warn("No book directory selected.")
+        return
+    if not args or args[0].lower() != "source":
+        con.warn(escape(QA_USAGE))
+        return
+    wanted = None
+    if len(args) > 1:
+        selection = parse_selection(args[1:])
+        if selection.errors or not selection.chapters:
+            for error in selection.errors or ["Name chapters, e.g. 120-140."]:
+                con.fail(escape(error))
+            return
+        wanted = set(selection.chapters)
+    _print_source_log(ctx.cfg.book_dir, "Source fixes", qalog.SOURCE_FIXES_FILENAME, wanted, True)
+    _print_source_log(ctx.cfg.book_dir, "Kept as written", qalog.CONTINUITY_FILENAME, wanted, False)
 
 
 def cmd_repair(ctx: ReplContext, args: list[str]) -> None:
@@ -724,7 +922,22 @@ def _term_remove(book_dir: str, args: list[str]) -> tuple[bool, str]:
     return glossary.remove_term(book_dir, " ".join(args).strip())
 
 
+def _term_same(book_dir: str, args: list[str]) -> tuple[bool, str]:
+    pair = _split_assignment(args)
+    if pair is None:
+        return False, TERM_USAGE
+    return glossary.add_user_link(book_dir, pair[0], pair[1])
+
+
+def _term_exempt(book_dir: str, args: list[str]) -> tuple[bool, str]:
+    off = bool(args) and args[-1].lower() == "off"
+    name = " ".join(args[:-1] if off else args).strip()
+    return glossary.set_containment_exempt(book_dir, name, not off)
+
+
 _TERM_SUBCOMMANDS = {
+    "same": _term_same,
+    "exempt": _term_exempt,
     "add": _term_add, "set": _term_add,
     "alias": _term_alias, "link": _term_alias,
     "rm": _term_remove, "remove": _term_remove, "del": _term_remove, "delete": _term_remove,
@@ -782,6 +995,7 @@ HANDLERS = {
     "term": cmd_term,
     "lookup": cmd_lookup,
     "repair": cmd_repair,
+    "qa": cmd_qa,
 }
 COMMAND_WORDS = tuple(sorted(set(HANDLERS) | {"quit", "retranslate", "buffer", "queue", "glossary", "grab", "clip"}))
 

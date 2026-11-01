@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from rich.markup import escape
 
 from . import console as con
-from . import activity, arcs, clipaccept, prompts, parsing, qa, repair, resume, segments, storage, characters, glossary, termlookup
+from . import activity, arcs, clipaccept, prompts, parsing, qa, qalog, repair, resume, segments, storage, characters, glossary, termlookup
 from .batchlog import BatchLog
 from .tracker import ChapterTracker
 from .client import ApiClient, ApiError
@@ -130,6 +130,57 @@ def _drift_text(groups) -> str:
     extra = len(groups) - MAX_LISTED_TERMS
     tail = f" · {_plural(extra, 'more term', 'more terms')}" if extra > 0 else ""
     return "Term drift: " + " · ".join(shown) + tail
+
+
+def _collisions_text(collisions) -> str:
+    """One warning for new terms not added because another term already has their English."""
+    items = [ev for ev in collisions if isinstance(ev, dict)] if isinstance(collisions, list) else []
+    if not items:
+        return ""
+    shown = [
+        f"{escape(str(ev.get('chinese') or ''))} “{escape(str(ev.get('english') or ''))}” "
+        f"matches {escape(str(ev.get('existing') or ''))}"
+        for ev in items[:MAX_LISTED_TERMS]
+    ]
+    return (
+        "Not added, same English as a registered term: " + "; ".join(shown) + _more_text(len(items))
+        + " · if it is the same term link it with 'term alias', otherwise it needs its own rendering"
+    )
+
+
+def _containment_text(problems) -> str:
+    """One warning for new terms whose English drops a name they contain."""
+    items = [ev for ev in problems if isinstance(ev, dict)] if isinstance(problems, list) else []
+    if not items:
+        return ""
+    shown = [
+        f"{escape(str(ev.get('chinese') or ''))} “{escape(str(ev.get('english') or ''))}” contains "
+        f"{escape(str(ev.get('part') or ''))} but not “{escape(str(ev.get('partEnglish') or ''))}”"
+        for ev in items[:MAX_LISTED_TERMS]
+    ]
+    return (
+        "Name inside a term not carried over: " + "; ".join(shown) + _more_text(len(items))
+        + " · see 'terms lint'; 'term exempt <chinese>' if this is intended"
+    )
+
+
+def _name_drift_text(groups) -> str:
+    """One warning for characters named on the page but never in the English."""
+    if not groups:
+        return ""
+    shown = [
+        f"“{escape(english)}” ({escape(forms)}) never named in the English of {_format_chapter_ranges(chapters)}"
+        for (english, forms), chapters in groups[:MAX_LISTED_TERMS]
+    ]
+    extra = len(groups) - MAX_LISTED_TERMS
+    tail = f" · {_plural(extra, 'more name', 'more names')}" if extra > 0 else ""
+    return "Name drift: " + " · ".join(shown) + tail
+
+
+def _listing(items) -> str:
+    """Up to MAX_LISTED_NAMES items joined with ' · ', escaped, with a count of the rest."""
+    values = [str(item) for item in (items or [])]
+    return escape(" · ".join(values[:MAX_LISTED_NAMES])) + _more_items(len(values), MAX_LISTED_NAMES, "entry", "entries")
 
 
 def describe_entries(entries) -> str:
@@ -677,6 +728,7 @@ class Pipeline:
             chapters = self._finish_chapters(log, works, extras)
             numbers = self._save_results(log, chapters, reply)
             self._after_save(log, works, numbers)
+            self._record_source_reports(log, works, reply, numbers, "manual")
             with self.lock:
                 entries = self.manual_entries if self.manual_active else None
                 self.manual_active = False
@@ -1112,6 +1164,7 @@ class Pipeline:
             chapters = self._finish_chapters(log, works, extras)
             numbers = self._save_results(log, chapters, reply, first_seen, timing)
             self._after_save(log, works, numbers)
+            self._record_source_reports(log, works, reply, numbers, batch_id)
             self._reconcile(log, batch_id, entries, chapters, numbers)
             self._mark_incomplete(log, batch_id, works, numbers, repaired)
             self._check_term_drift(log, entries, chapters)
@@ -1181,9 +1234,74 @@ class Pipeline:
             log.warn(f"Removed notes: {shown}{_more_items(len(report.removed), MAX_LISTED_NAMES, 'note', 'notes')}")
 
     def _after_save(self, log: BatchLog, works: list, numbers: list[int]) -> None:
-        """Checks that need the saved chapters: alignment files and paragraph lengths."""
+        """Checks that need the saved chapters: alignment files, paragraph lengths and character names."""
         self._record_anchors(log, works, numbers)
         self._check_lengths(log, works, numbers)
+        self._check_name_drift(log, works, numbers)
+
+    def _check_name_drift(self, log: BatchLog, works: list, numbers: list[int]) -> None:
+        """Warn when a character named on the page never appears by name in the English."""
+        try:
+            groups = self._find_name_drift(works, numbers)
+        except Exception as e:  # a checker bug must never fail a batch that is already saved
+            log.warn(f"Name drift check failed: {escape(str(e))}")
+            return
+        text = _name_drift_text(groups)
+        if text:
+            log.warn(text)
+
+    def _find_name_drift(self, works: list, numbers: list[int]) -> list:
+        """[((english, forms), [chapters])], the name missing from most chapters first."""
+        char_map = characters.load_characters(self.cfg.book_dir)
+        if not char_map:
+            return []
+        saved = set(numbers or [])
+        groups: dict[tuple[str, str], list[int]] = {}
+        for work in works:
+            if work.chapter not in saved or work.parts is None:
+                continue
+            english = segments.strip_markers(work.text)
+            for ev in characters.name_drift(char_map, "\n".join(work.zh), english):
+                groups.setdefault((ev["english"], ev["forms"]), []).append(work.chapter)
+        return sorted(groups.items(), key=lambda item: (-len(item[1]), item[0][0].casefold()))
+
+    def _record_source_reports(self, log: BatchLog, works: list, reply, numbers: list[int], batch_ref) -> None:
+        """Check, log and store the typos the model fixed and the author mistakes it kept."""
+        fixes_in = getattr(reply, "source_fixes", None) or []
+        kept_in = getattr(reply, "continuity", None) or []
+        if not fixes_in and not kept_in:
+            return
+        zh_by_chapter = {w.chapter: w.zh for w in works if w.chapter is not None}
+        saved = set(numbers or [])
+        fixes, skipped = qalog.check_fixes(fixes_in, zh_by_chapter, saved, batch_ref)
+        kept, skipped_kept = qalog.check_continuity(kept_in, zh_by_chapter, saved, batch_ref)
+        self._store_source_reports(log, qalog.SOURCE_FIXES_FILENAME, fixes)
+        self._store_source_reports(log, qalog.CONTINUITY_FILENAME, kept)
+        self._log_source_reports(log, fixes, kept, skipped + skipped_kept)
+
+    def _store_source_reports(self, log: BatchLog, filename: str, records: list) -> None:
+        try:
+            qalog.append_records(self.cfg.book_dir, filename, records)
+        except (OSError, ValueError) as e:
+            log.warn(f"Could not write {qa.QA_DIRNAME}/{filename}: {escape(str(e))}")
+
+    @staticmethod
+    def _log_source_reports(log: BatchLog, fixes: list, kept: list, skipped: list) -> None:
+        """Verified fixes and kept mistakes as details; unverified fixes and ignored entries as warnings."""
+        verified = [qalog.describe_fix(r) for r in fixes if r.get("status") == "verified"]
+        unverified = [f"{qalog.describe_fix(r)} ({r.get('reason')})" for r in fixes if r.get("status") != "verified"]
+        on_page = [qalog.describe_continuity(r) for r in kept if r.get("status") == "on page"]
+        off_page = [f"{qalog.describe_continuity(r)} ({r.get('reason')})" for r in kept if r.get("status") != "on page"]
+        if verified:
+            log.detail(f"Source fixes: {_listing(verified)}")
+        if unverified:
+            log.warn(f"Unverified source fixes, check the translation: {_listing(unverified)}")
+        if on_page:
+            log.detail(f"Kept as written: {_listing(on_page)}")
+        if off_page:
+            log.warn(f"Kept as written, quote not found: {_listing(off_page)}")
+        if skipped:
+            log.warn(f"Ignored source reports: {_listing(skipped)}")
 
     def _check_lengths(self, log: BatchLog, works: list, numbers: list[int]) -> None:
         """Report paragraphs far shorter or longer than this book usually translates to; nothing is changed."""
@@ -1656,9 +1774,14 @@ class Pipeline:
             parts.append(reused)
         if parts:
             log.detail(" · ".join(parts))
-        conflicts = _conflicts_text(summary.get("conflicts", []))
-        if conflicts:
-            log.warn(conflicts)
+        warnings = (
+            _conflicts_text(summary.get("conflicts", [])),
+            _collisions_text(summary.get("collisions", [])),
+            _containment_text(summary.get("containment", [])),
+        )
+        for text in warnings:
+            if text:
+                log.warn(text)
 
     def _check_term_drift(self, log: BatchLog, entries: list[PageEntry], chapters: list) -> None:
         """One warning listing locked terms whose English is missing from the translation, grouped by term."""

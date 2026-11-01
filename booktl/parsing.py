@@ -124,6 +124,7 @@ _VALID_JSON_KEYS = [
     "termActions", "Type", "RefersTo", "Note", "Aliases",
     "candidateTerms", "ProposedEnglish",
     "notes", "afterId", "kind", "zh", "correction", "text", "paragraphs", "id",
+    "sourceFixes", "continuity", "issue", "SameAs",
 ]
 
 
@@ -226,6 +227,8 @@ class ParsedReply:
     character_actions: list = field(default_factory=list)
     arc_ends: list = field(default_factory=list)
     term_actions: list = field(default_factory=list)
+    source_fixes: list = field(default_factory=list)   # typos the model corrected
+    continuity: list = field(default_factory=list)     # author mistakes the model kept as written
     error: str | None = None
 
 
@@ -250,6 +253,8 @@ def parse_reply(raw_response: str) -> ParsedReply:
         character_actions=_list_field(parsed, "characterActions"),
         arc_ends=_list_field(parsed, "arcEnds"),
         term_actions=_list_field(parsed, "termActions"),
+        source_fixes=_list_field(parsed, "sourceFixes"),
+        continuity=_list_field(parsed, "continuity"),
     )
 
 

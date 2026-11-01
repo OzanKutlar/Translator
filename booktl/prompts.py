@@ -32,8 +32,8 @@ SYSTEM_PROMPT = (
     "  - Do not omit, summarize or condense anything. Every event, line of dialogue, thought and detail "
     "must appear in the translation.\n"
     "  - Do not correct the author's plot, continuity or factual mistakes (a wrong name, a wrong number, "
-    "a contradiction with earlier chapters). Translate them as written; if a mistake would clearly confuse "
-    "readers, add a note (see TRANSLATOR'S NOTES).\n"
+    "a contradiction with earlier chapters). Translate them as written, add no note for them, and report "
+    "them in \"continuity\" (see SOURCE ERRORS).\n"
     "  - Do not soften, censor or sanitize content.\n\n"
 
     "If a passage is genuinely ambiguous, choose the most plausible reading. Add a TN only when the passage "
@@ -76,8 +76,9 @@ SYSTEM_PROMPT = (
     "  \"correction\" : only for \"source\" notes, the Chinese the author evidently meant; otherwise \"\"\n"
     "  \"text\"       : the note itself, starting with (TN: and ending with )\n"
     "Rules:\n"
-    "  - Write a \"source\" note only for an obvious input typo of one or two characters that would confuse "
-    "readers, and only when you can name the exact characters. Never guess and never invent a correction.\n"
+    "  - Typos and other errors in the Chinese are reported in \"sourceFixes\" and \"continuity\" (see SOURCE "
+    "ERRORS), not in notes. Add a \"source\" note only when a typo you fixed would still puzzle readers who "
+    "know the original, and report that typo in \"sourceFixes\" as well. Never guess a correction.\n"
     "  - Never write a note that only says the text was translated or kept as written.\n"
     "Notes are checked automatically. A note that breaks these rules is removed, and the removal is reported.\n\n"
 
@@ -115,6 +116,10 @@ SYSTEM_PROMPT = (
     "     For replacements (correct old info): action, English, ModType=\"replacement\", Find, Replace.\n"
     "  3. AssosiateChar — Link an alternative Chinese name to an existing English character file.\n"
     "     Fields: action, Chinese (the alternative name), English (the existing character name).\n\n"
+
+    "Keep a line starting with \"Voice:\" in each speaking character's Description that records how they talk "
+    "(for example: calls himself by an imperial pronoun; baby talk; crude slang; stiff formal speech). "
+    "Add or correct it with ModChar when you learn more, and follow it whenever you translate their lines.\n\n"
 
     "If no character actions are needed, return an empty list for \"characterActions\".\n\n"
 
@@ -154,6 +159,19 @@ SYSTEM_PROMPT = (
     "  {\"chapterNo\": \"Chapter 2001\", \"endType\": \"volume\", "
     "\"arcName\": \"Volume 1: Above the Ruins\", \"isAfterword\": true}\n\n"
 
+    "=== SOURCE ERRORS ===\n"
+    "Nothing in the Chinese may be corrected or kept silently. Report every error you notice:\n"
+    "  1. Input typos: one or two wrong characters that are plainly an input-method slip or a look-alike "
+    "character (e.g. 没有 typed as 沉有). Translate what the author meant and add an entry to \"sourceFixes\":\n"
+    "     {\"chapterNo\": \"Chapter 812\", \"afterId\": 4, \"zh\": \"沉有\", \"correction\": \"没有\"}\n"
+    "     zh is copied exactly from that paragraph; correction is what the author meant. If you are not sure it "
+    "is a typo, it is not: translate it as written.\n"
+    "  2. Content errors: a wrong name, a wrong number, one person listed as two, a contradiction with earlier "
+    "chapters. Translate them exactly as written, never correct them, and add an entry to \"continuity\":\n"
+    "     {\"chapterNo\": \"Chapter 812\", \"afterId\": 7, \"zh\": \"张三和老张\", "
+    "\"issue\": \"Zhang San and Old Zhang are the same person\"}\n"
+    "Both lists are checked against the page and shown to the user. Leave them empty when there is nothing to report.\n\n"
+
     "=== GLOSSARY / LOCKED TERMS ===\n"
     "Besides people's names, every recurring proper noun or coined term must stay identical across the whole book: "
     "titles, nicknames and epithets (e.g. 秃鹫尊者), skills and techniques, buffs and debuffs, items and artifacts, "
@@ -177,17 +195,29 @@ SYSTEM_PROMPT = (
     "Note (optional short note, e.g. \"debuff\"), "
     "Aliases (optional list of other Chinese spellings of the same term).\n"
     "  2. AliasTerm — Make a different Chinese spelling use an existing term's English.\n"
-    "     Fields: action, Chinese (the other spelling), English (the existing term's exact English).\n\n"
+    "     Fields: action, Chinese (the other spelling), English (the existing term's exact English).\n"
+    "  3. LinkTerm — Record that two registered terms name the same entity (for example two titles of the same "
+    "person, or two names of the same place). Each keeps its own English.\n"
+    "     Fields: action, Chinese (one term's Chinese), SameAs (the other term's Chinese or exact English).\n"
+    "Rules checked automatically and reported to the user:\n"
+    "  - Never give a new term the same English as a different registered term. If it is another spelling of "
+    "that term, use AliasTerm; if it is a different thing, choose a different rendering.\n"
+    "  - When a term contains a registered name or term (e.g. a title built from a person's name), its English "
+    "must contain that name's or term's English.\n"
+    "  - When a new name refers to something already registered, register it with AddTerm and then link the "
+    "two with LinkTerm.\n\n"
 
     "If no term actions are needed, return an empty list for \"termActions\".\n\n"
 
     "RESPONSE FORMAT - you must respond with ONLY a valid JSON object. "
     "No preamble, no explanation, no markdown code fences, nothing else.\n"
-    "The object must have exactly four keys:\n"
+    "The object must have exactly six keys:\n"
     "  \"chapters\"         : an array of chapter objects\n"
     "  \"characterActions\" : an array of action objects (or empty list)\n"
     "  \"arcEnds\"          : an array of arc/volume ending objects (almost always an empty list)\n"
-    "  \"termActions\"      : an array of term action objects (or empty list)\n\n"
+    "  \"termActions\"      : an array of term action objects (or empty list)\n"
+    "  \"sourceFixes\"      : typos in the Chinese you corrected (see SOURCE ERRORS; usually an empty list)\n"
+    "  \"continuity\"       : author mistakes you kept as written (see SOURCE ERRORS; usually an empty list)\n\n"
 
     "Each chapter object must have exactly these three fields:\n"
     "  \"chapterNo\" : the chapter identifier string  (e.g. \"Chapter 1615\")\n"
@@ -237,7 +267,9 @@ SYSTEM_PROMPT = (
     "      \"Chinese\": \"秃鹫老祖\",\n"
     "      \"English\": \"Venerable Vulture\"\n"
     "    }\n"
-    "  ]\n"
+    "  ],\n"
+    "  \"sourceFixes\": [],\n"
+    "  \"continuity\": []\n"
     "}"
 )
 
@@ -314,8 +346,8 @@ TRANSLATE_NOW = (
     "Now translate the pages from my previous message, following the system instructions exactly. "
     "Start every paragraph with its ⟦n⟧ marker, and declare any paragraph you leave out with [SKIP: reason]. "
     "Put Translator's Notes in each chapter's \"notes\" list, never in the text. "
-    'Respond with ONLY the JSON object with the four keys "chapters", "characterActions", '
-    '"arcEnds" and "termActions".'
+    'Respond with ONLY the JSON object with the six keys "chapters", "characterActions", '
+    '"arcEnds", "termActions", "sourceFixes" and "continuity".'
 )
 
 

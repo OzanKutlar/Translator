@@ -2,10 +2,14 @@
 
 import json
 import os
+import re
 
 from .storage import sanitize_filename
 
 CHANGE_KINDS = ("modified", "added", "associated")
+MIN_NAME_HITS = 2          # a name must appear this often on the page before its absence is reported
+MIN_DRIFT_NAME_LENGTH = 2
+_NAME_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z'’-]{2,}")
 
 
 def load_characters(book_dir: str) -> dict:
@@ -39,18 +43,26 @@ def get_character_context(book_dir: str, chinese_text: str) -> str:
     seen_files = set()
     context_parts = []
 
-    for chinese_name, md_filename in char_map.items():
-        if chinese_name in chinese_text and md_filename not in seen_files:
-            seen_files.add(md_filename)
-            md_path = os.path.join(chars_dir, md_filename)
-            if os.path.exists(md_path):
-                try:
-                    with open(md_path, "r", encoding="utf-8") as f:
-                        content = f.read().strip()
-                    char_label = os.path.splitext(md_filename)[0]
-                    context_parts.append(f"### {char_label}\n{content}")
-                except IOError:
-                    pass
+    working = chinese_text if isinstance(chinese_text, str) else ""
+    names = sorted((k for k in char_map if isinstance(k, str) and k), key=len, reverse=True)
+    for chinese_name in names:
+        md_filename = char_map[chinese_name]
+        if not isinstance(md_filename, str) or chinese_name not in working:
+            continue
+        # Mask the name so a shorter name inside it (张三 in 张三丰) does not match again.
+        working = working.replace(chinese_name, "\x00" * len(chinese_name))
+        if md_filename in seen_files:
+            continue
+        seen_files.add(md_filename)
+        md_path = os.path.join(chars_dir, md_filename)
+        if os.path.exists(md_path):
+            try:
+                with open(md_path, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                char_label = os.path.splitext(md_filename)[0]
+                context_parts.append(f"### {char_label}\n{content}")
+            except IOError:
+                pass  # an unreadable profile only means less context for this batch
 
     if not context_parts:
         return ""
@@ -59,6 +71,65 @@ def get_character_context(book_dir: str, chinese_text: str) -> str:
         "Use this context to ensure consistent names and details:\n\n"
         + "\n\n".join(context_parts)
     )
+
+
+def name_map(book_dir: str) -> dict[str, str]:
+    """Chinese name -> English name (the character file's name) for every known spelling."""
+    char_map = load_characters(book_dir) if book_dir else {}
+    if not isinstance(char_map, dict):
+        return {}
+    return {
+        chinese.strip(): os.path.splitext(md)[0]
+        for chinese, md in char_map.items()
+        if isinstance(chinese, str) and chinese.strip() and isinstance(md, str)
+    }
+
+
+def _name_hits(char_map: dict, raw: str) -> dict[str, list]:
+    """Character file -> [times named, spellings found], longest spellings matched and masked first."""
+    working = raw
+    hits: dict[str, list] = {}
+    names = sorted((k for k in char_map if isinstance(k, str) and len(k.strip()) >= MIN_DRIFT_NAME_LENGTH),
+                   key=len, reverse=True)
+    for chinese in names:
+        md_filename = char_map[chinese]
+        count = working.count(chinese) if isinstance(md_filename, str) else 0
+        if not count:
+            continue
+        working = working.replace(chinese, "\x00" * len(chinese))
+        entry = hits.setdefault(md_filename, [0, []])
+        entry[0] += count
+        entry[1].append(chinese)
+    return hits
+
+
+def _named(english: str, folded: str) -> bool:
+    """True when the English name, or one of its words of 3+ letters, appears in the folded text."""
+    if english.casefold() in folded:
+        return True
+    for token in _NAME_TOKEN_RE.findall(english):
+        if re.search(r"(?<![a-z])" + re.escape(token.casefold()) + r"(?![a-z])", folded):
+            return True
+    return False
+
+
+def name_drift(char_map, raw, translation) -> list[dict]:
+    """Characters named at least MIN_NAME_HITS times on the raw page but never in the translation.
+
+    Returns {"english", "forms", "count"} entries. Pronouns replace names legitimately, so a
+    name used once is never reported, and any word of the English name counts as naming them.
+    """
+    if not isinstance(char_map, dict) or not isinstance(raw, str) or not isinstance(translation, str):
+        return []
+    folded = translation.casefold()
+    drift = []
+    for md_filename, (count, forms) in _name_hits(char_map, raw).items():
+        if count < MIN_NAME_HITS:
+            continue
+        english = os.path.splitext(md_filename)[0]
+        if not _named(english, folded):
+            drift.append({"english": english, "forms": " / ".join(forms), "count": count})
+    return drift
 
 
 def get_all_characters_summary(book_dir: str) -> str:

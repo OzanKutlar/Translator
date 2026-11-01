@@ -23,6 +23,8 @@ import re
 import threading
 from dataclasses import dataclass
 
+from . import characters
+
 GLOSSARY_FILENAME = "Glossary.json"
 SCHEMA_VERSION = 1
 MIN_KEY_LENGTH = 2            # one-character keys would match almost every page
@@ -30,6 +32,9 @@ MAX_KEY_LENGTH = 40
 MAX_ENGLISH_LENGTH = 120
 MAX_NOTE_LENGTH = 300
 MAX_ALIASES = 20
+MAX_LINKS = 10                # same-entity links per term
+MAX_CONTAINMENT_PER_TERM = 5
+MAX_CONTAINMENT_REPORTS = 200
 MAX_INJECTED_TERMS = 150      # bounds the LOCKED TERMS block sent with each batch
 MAX_ACTIONS_PER_REPLY = 200   # more than this in one reply is certainly a model error
 MAX_DRIFT_WARNINGS = 50
@@ -60,6 +65,7 @@ class MatchedTerm:
     refers_to: str
     note: str
     forms: tuple[str, ...]   # the Chinese spellings actually found in the text
+    same_as: tuple[str, ...] = ()   # English of terms linked as the same entity
 
 
 # ----------------------------------------------------------------------
@@ -186,6 +192,18 @@ def _aliases_of(record) -> list[str]:
     return aliases
 
 
+def same_as_of(record) -> list[str]:
+    """Chinese keys of the terms linked to this one as the same entity."""
+    if not isinstance(record, dict) or not isinstance(record.get("sameAs"), list):
+        return []
+    links = []
+    for item in record["sameAs"][:MAX_LINKS]:
+        key = _clean_key(item)
+        if key and key not in links:
+            links.append(key)
+    return links
+
+
 # ----------------------------------------------------------------------
 # Lookup and matching
 # ----------------------------------------------------------------------
@@ -221,7 +239,105 @@ def spelling_map(terms: dict) -> dict[str, str]:
     return {form: _english_of(terms.get(key)) for form, key in _build_index(terms).items()}
 
 
-def _matched(key: str, record: dict, forms: list[str]) -> MatchedTerm:
+def english_of(record) -> str:
+    """A term record's English rendering, or ''."""
+    return _english_of(record)
+
+
+def term_spellings(terms: dict, key: str) -> tuple[str, ...]:
+    """The term's canonical Chinese followed by its aliases; () for an unknown term."""
+    record = terms.get(key) if isinstance(terms, dict) else None
+    if not isinstance(record, dict):
+        return ()
+    return (key, *_aliases_of(record))
+
+
+def _resolve(terms: dict, index: dict, value) -> str | None:
+    key = _clean_key(value)
+    if key and key in index:
+        return index[key]
+    text = _clean_text(value, MAX_ENGLISH_LENGTH)
+    return _find_by_english(terms, text) if text else None
+
+
+def resolve_term(terms, value) -> str | None:
+    """Canonical key of the term named by any of its Chinese spellings or by its English, or None."""
+    if not isinstance(terms, dict):
+        return None
+    return _resolve(terms, _build_index(terms), value)
+
+
+# ----------------------------------------------------------------------
+# Containment: a name inside a term must keep its English
+# ----------------------------------------------------------------------
+
+def entity_spellings(terms, names=None) -> dict[str, str]:
+    """Chinese spelling -> English for every glossary term (and alias) and every character name."""
+    result = spelling_map(terms)
+    if isinstance(names, dict):
+        for chinese, english in names.items():
+            key = _clean_key(chinese)
+            rendering = _clean_text(english, MAX_ENGLISH_LENGTH)
+            if key and rendering:
+                result.setdefault(key, rendering)
+    return result
+
+
+def containment_problems(chinese, english, spellings) -> list[dict]:
+    """Registered names inside chinese whose English is missing from english.
+
+    Longer names are matched first and masked, so a name inside another name is not judged twice.
+    """
+    if not isinstance(chinese, str) or not isinstance(english, str) or not isinstance(spellings, dict):
+        return []
+    target = english.casefold()
+    working = chinese
+    problems = []
+    for form in sorted(spellings, key=len, reverse=True):
+        if len(form) >= len(chinese) or form not in working:
+            continue
+        working = working.replace(form, "\x00" * len(form))
+        part = spellings[form]
+        if not part or part.casefold() == target or part.casefold() in target:
+            continue
+        problems.append({"chinese": chinese, "english": english, "part": form, "partEnglish": part})
+        if len(problems) >= MAX_CONTAINMENT_PER_TERM:
+            break
+    return problems
+
+
+def check_containment(terms, names=None, keys=None) -> list[dict]:
+    """Containment problems of the given terms (all terms when keys is None); exempt terms are skipped."""
+    if not isinstance(terms, dict):
+        return []
+    spellings = entity_spellings(terms, names)
+    wanted = list(terms) if keys is None else [k for k in keys if k in terms]
+    problems = []
+    for key in wanted:
+        record = terms.get(key)
+        english = _english_of(record)
+        if not english or record.get("containmentExempt") is True:
+            continue
+        for form in (key, *_aliases_of(record)):
+            problems.extend(containment_problems(form, english, spellings))
+        if len(problems) >= MAX_CONTAINMENT_REPORTS:
+            break
+    return problems[:MAX_CONTAINMENT_REPORTS]
+
+
+def _linked_english(terms, record) -> tuple[str, ...]:
+    """English of the terms linked to record as the same entity."""
+    if not isinstance(terms, dict):
+        return ()
+    names = []
+    for key in same_as_of(record):
+        english = _english_of(terms.get(key))
+        if english and english not in names:
+            names.append(english)
+    return tuple(names)
+
+
+def _matched(key: str, record: dict, forms: list[str], terms: dict | None = None) -> MatchedTerm:
     return MatchedTerm(
         key=key,
         english=_english_of(record),
@@ -229,6 +345,7 @@ def _matched(key: str, record: dict, forms: list[str]) -> MatchedTerm:
         refers_to=_clean_text(record.get("refersTo"), MAX_ENGLISH_LENGTH),
         note=_clean_text(record.get("note"), MAX_NOTE_LENGTH),
         forms=tuple(forms),
+        same_as=_linked_english(terms, record),
     )
 
 
@@ -246,7 +363,7 @@ def find_terms(terms: dict, text: str, limit: int = MAX_INJECTED_TERMS) -> list[
         if form in working:
             found.setdefault(index[form], []).append(form)
             working = working.replace(form, "\x00" * len(form))
-    matched = [_matched(key, terms[key], forms) for key, forms in found.items()]
+    matched = [_matched(key, terms[key], forms, terms) for key, forms in found.items()]
     return matched[:limit] if limit else matched
 
 
@@ -261,6 +378,8 @@ def _context_line(term: MatchedTerm) -> str:
         details.append(f"refers to {term.refers_to}")
     if term.note:
         details.append(term.note)
+    if term.same_as:
+        details.append("same entity as " + ", ".join(term.same_as))
     return f"- {' / '.join(term.forms)} → {term.english} ({'; '.join(details)})"
 
 
@@ -280,8 +399,11 @@ def get_term_context(matched: list[MatchedTerm]) -> str:
 # ----------------------------------------------------------------------
 
 def _new_summary() -> dict:
-    """added/unchanged: English names; aliased/conflicts/recovered: dicts; skipped/failed: reasons."""
-    return {"added": [], "aliased": [], "unchanged": [], "conflicts": [], "recovered": [],
+    """added/unchanged: English names; added_keys: Chinese keys of new terms;
+    aliased/conflicts/recovered/collisions/containment/linked: dicts; skipped/failed: reasons.
+    """
+    return {"added": [], "added_keys": [], "aliased": [], "unchanged": [], "conflicts": [],
+            "recovered": [], "collisions": [], "containment": [], "linked": [],
             "skipped": [], "failed": []}
 
 
@@ -358,10 +480,13 @@ def _add_term(terms: dict, index: dict, act: dict, chapter, summary: dict) -> bo
         return _report_existing(terms, index[chinese], chinese, english, summary)
     same_english = _find_by_english(terms, english)
     if same_english is not None:
-        return _attach_alias(terms, index, same_english, chinese, summary)
+        # Never merged silently: an alias must be asked for with AliasTerm or 'term alias'.
+        summary["collisions"].append({"chinese": chinese, "english": english, "existing": same_english})
+        return False
     terms[chinese] = _new_record(act, english, chapter)
     index[chinese] = chinese
     summary["added"].append(english)
+    summary["added_keys"].append(chinese)
     for alias in _action_aliases(act):
         _attach_alias(terms, index, chinese, alias, summary)
     return True
@@ -379,7 +504,52 @@ def _alias_term(terms: dict, index: dict, act: dict, chapter, summary: dict) -> 
     return _attach_alias(terms, index, key, alias, summary)
 
 
+def _link_pair(terms: dict, first: str, second: str, summary: dict) -> bool:
+    """Link two terms as the same entity, both ways. Returns True when a link was added."""
+    changed = False
+    for one, other in ((first, second), (second, first)):
+        links = same_as_of(terms[one])
+        if other in links:
+            continue
+        if len(links) >= MAX_LINKS:
+            summary["skipped"].append(f"{one} already has {MAX_LINKS} same-entity links; {other} not added")
+            continue
+        terms[one]["sameAs"] = links + [other]
+        changed = True
+    if changed:
+        summary["linked"].append({"first": first, "second": second})
+    return changed
+
+
+def _link_term(terms: dict, index: dict, act: dict, chapter, summary: dict) -> bool:
+    first = _resolve(terms, index, act.get("Chinese"))
+    second = _resolve(terms, index, act.get("SameAs"))
+    if first is None or second is None:
+        summary["skipped"].append(
+            f"LinkTerm needs two registered terms; got {act.get('Chinese')!r} and {act.get('SameAs')!r}"
+        )
+        return False
+    if first == second:
+        summary["skipped"].append(f"LinkTerm links {first} to itself")
+        return False
+    if "user" in (terms[first].get("source"), terms[second].get("source")):
+        summary["skipped"].append(
+            f"{first} and {second} look like the same entity; link your term with 'term same {first} = {second}'"
+        )
+        return False
+    return _link_pair(terms, first, second, summary)
+
+
+def _unlink_all(terms: dict, key: str) -> None:
+    """Remove every same-entity link pointing at key."""
+    for record in terms.values():
+        if isinstance(record, dict) and key in same_as_of(record):
+            record["sameAs"] = [k for k in same_as_of(record) if k != key]
+
+
 _ACTION_HANDLERS = {
+    "LinkTerm": _link_term,
+    "SameAsTerm": _link_term,
     "AddTerm": _add_term,
     "AliasTerm": _alias_term,
     "AssociateTerm": _alias_term,
@@ -421,7 +591,8 @@ def _apply_with_prior(terms: dict, index: dict, act, chapter, first_seen: dict, 
     return changed
 
 
-def _merge_actions(book_dir: str, actions: list, chapter, first_seen: dict, summary: dict) -> None:
+def _merge_actions(book_dir: str, actions: list, chapter, first_seen: dict, summary: dict,
+                   names: dict) -> None:
     data, err = load_glossary(book_dir)
     if err:
         summary["failed"].append(f"{err} (nothing was written; fix or remove the file)")
@@ -433,15 +604,15 @@ def _merge_actions(book_dir: str, actions: list, chapter, first_seen: dict, summ
         changed = _apply_with_prior(terms, index, act, chapter, first_seen, summary) or changed
     if not changed:
         return
+    summary["containment"] = check_containment(terms, names, summary["added_keys"])
     save_err = _try_save(book_dir, data)
     if save_err:
-        summary["added"].clear()
-        summary["aliased"].clear()
-        summary["recovered"].clear()
+        for kind in ("added", "added_keys", "aliased", "recovered", "linked", "containment"):
+            summary[kind].clear()
         summary["failed"].append(save_err)
 
 
-def record_term_actions(book_dir: str, actions, first_chapter=None, first_seen=None) -> dict:
+def record_term_actions(book_dir: str, actions, first_chapter=None, first_seen=None, names=None) -> dict:
     """Apply model term actions to Glossary.json and return a summary (see _new_summary).
 
     first_chapter is stored on new terms for reference only. first_seen maps Chinese text to
@@ -460,8 +631,9 @@ def record_term_actions(book_dir: str, actions, first_chapter=None, first_seen=N
         summary["skipped"].append(f"{len(actions)} term actions in one reply; all ignored as implausible")
         return summary
     if actions:
+        known = names if isinstance(names, dict) else characters.name_map(book_dir)
         with _file_lock:
-            _merge_actions(book_dir, actions, first_chapter, seen, summary)
+            _merge_actions(book_dir, actions, first_chapter, seen, summary, known)
     return summary
 
 
@@ -480,6 +652,7 @@ def format_summary(summary) -> str | None:
         parts.append(f"added {_count_text(len(added), 'term', 'terms')} ({names})")
     for kind, verb, singular, plural in (
         ("aliased", "linked", "alias", "aliases"),
+        ("linked", "joined", "same-entity pair", "same-entity pairs"),
         ("conflicts", "rejected", "conflicting rendering", "conflicting renderings"),
         ("skipped", "skipped", "term action", "term actions"),
     ):
@@ -608,6 +781,7 @@ def add_user_alias(book_dir: str, alias, target) -> tuple[bool, str]:
 def _remove_entry(terms: dict, key: str) -> tuple[bool, str, bool]:
     if key in terms:
         record = terms.pop(key)
+        _unlink_all(terms, key)
         aliases = _aliases_of(record)
         extra = f" together with its aliases {', '.join(aliases)}" if aliases else ""
         return True, f"Removed {key} (“{_english_of(record)}”){extra}.", True
@@ -627,6 +801,58 @@ def remove_term(book_dir: str, chinese) -> tuple[bool, str]:
     return _edit_glossary(book_dir, lambda terms: _remove_entry(terms, key))
 
 
+def _link_user(terms: dict, first_value: str, second_value: str) -> tuple[bool, str, bool]:
+    index = _build_index(terms)
+    first = _resolve(terms, index, first_value)
+    second = _resolve(terms, index, second_value)
+    if first is None or second is None:
+        missing = first_value if first is None else second_value
+        return False, f"No term matches '{missing}'. Add it first with 'term add'.", False
+    if first == second:
+        return False, f"{first_value} and {second_value} are the same term.", False
+    summary = _new_summary()
+    if not _link_pair(terms, first, second, summary):
+        reason = summary["skipped"][0] if summary["skipped"] else "they are already linked"
+        return True, f"{first} and {second}: {reason}.", False
+    return True, (
+        f"{first} (“{_english_of(terms[first])}”) and {second} (“{_english_of(terms[second])}”) "
+        "are now marked as the same entity."
+    ), True
+
+
+def add_user_link(book_dir: str, first, second) -> tuple[bool, str]:
+    """Mark two terms, named by Chinese or English, as the same entity."""
+    first_text = _clean_text(first, MAX_ENGLISH_LENGTH)
+    second_text = _clean_text(second, MAX_ENGLISH_LENGTH)
+    if not first_text or not second_text:
+        return False, "Usage: term same <term> = <term>"
+    return _edit_glossary(book_dir, lambda terms: _link_user(terms, first_text, second_text))
+
+
+def _set_exempt(terms: dict, value: str, exempt: bool) -> tuple[bool, str, bool]:
+    key = resolve_term(terms, value)
+    if key is None:
+        return False, f"No term matches '{value}'.", False
+    record = terms[key]
+    if bool(record.get("containmentExempt")) == exempt:
+        state = "already exempt from" if exempt else "already checked by"
+        return True, f"{key} is {state} the containment rule.", False
+    if exempt:
+        record["containmentExempt"] = True
+    else:
+        record.pop("containmentExempt", None)
+    state = "no longer checked" if exempt else "checked again"
+    return True, f"{key} (“{_english_of(record)}”) is {state} by the containment rule.", True
+
+
+def set_containment_exempt(book_dir: str, chinese, exempt: bool = True) -> tuple[bool, str]:
+    """Exempt a term from the rule that names inside it must keep their English (or undo that)."""
+    value = str(chinese or "").strip()
+    if not value:
+        return False, "Usage: term exempt <chinese> [off]"
+    return _edit_glossary(book_dir, lambda terms: _set_exempt(terms, value, bool(exempt)))
+
+
 def _row(key: str, record: dict) -> dict:
     return {
         "chinese": key,
@@ -636,6 +862,7 @@ def _row(key: str, record: dict) -> dict:
         "refersTo": _clean_text(record.get("refersTo"), MAX_ENGLISH_LENGTH),
         "source": _clean_text(record.get("source"), 20),
         "firstChapter": _first_chapter(record.get("firstChapter")),
+        "sameAs": same_as_of(record),
     }
 
 

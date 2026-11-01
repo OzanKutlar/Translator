@@ -567,3 +567,25 @@ def alignment_texts(data) -> tuple[list[str], dict[int, str]]:
             if isinstance(key, str) and key.isdigit() and isinstance(text, str) and text.strip():
                 en[int(key)] = text
     return zh, en
+
+
+_ALIGN_FILE_RE = re.compile(r"^ch_(\d{1,9})\.json$")
+MAX_ALIGNED_FILES = 50_000
+
+
+def aligned_chapters(book_dir: str) -> list[int]:
+    """Chapters with an alignment file, ascending. Raises OSError when the folder is unreadable."""
+    if not book_dir:
+        return []
+    folder = os.path.join(book_dir, ALIGN_DIRNAME)
+    if not os.path.isdir(folder):
+        return []
+    numbers = []
+    with os.scandir(folder) as entries:
+        for count, entry in enumerate(entries):
+            if count >= MAX_ALIGNED_FILES:
+                break
+            match = _ALIGN_FILE_RE.match(entry.name)
+            if match and int(match.group(1)) > 0:
+                numbers.append(int(match.group(1)))
+    return sorted(numbers)

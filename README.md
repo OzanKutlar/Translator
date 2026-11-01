@@ -126,6 +126,11 @@ Everything typed into the console is a command, so no `/` prefix is needed (a le
 - `term alias <chinese> = <term>` — Make another Chinese spelling render like an existing term (named by its Chinese or English).
 - `term rm <chinese>` — Remove a term together with its aliases, or a single alias.
 - `terms audit <chinese>` — Every translated chapter whose raw page contains the term, with the surrounding Chinese lines and the matching English passage.
+- `terms lint [N]` — Check the whole glossary; reports only (see [Glossary Checks](#glossary-checks)).
+- `terms rename <chinese> = <english> [--apply]` — Preview, or write with `--apply`, a new rendering in past chapters.
+- `term same <term> = <term>` — Mark two terms as the same entity.
+- `term exempt <chinese> [off]` — Stop (or resume) checking that names inside a term keep their English.
+- `qa source [chapters]` — Typos the model fixed and author mistakes it kept as written (see [Source Errors](#source-errors)).
 - `lookup <on|off>` — Turn the prior-usage term lookup on or off (see below).
 - `repair <on|off>` — Turn paragraph repair on or off (see [Paragraph Repair and Incomplete Chapters](#paragraph-repair-and-incomplete-chapters)).
 - `flush` — Send all pending pages now, including a partial batch.
@@ -185,6 +190,8 @@ Only problems get a ⚠, and they are grouped: one Term drift line per batch (up
 - `_resume.json` — The reopen address: the URL and chapter of the last page the scraper sent.
 - `_align/ch_000120.json` — Paragraph alignment: the Chinese paragraphs by marker, the English paragraph for each marker, declared skips and TNs (see below).
 - `_qa/ratios.json` — Recent English/Chinese paragraph length ratios for the length check.
+- `_qa/source_fixes.jsonl`, `_qa/continuity.jsonl` — Every typo the model fixed and every author mistake it kept, one JSON object per line.
+- `_qa/backups/rename_<time>/` — Chapter files as they were before a `terms rename --apply`.
 
 ### Translation Approach
 
@@ -262,11 +269,44 @@ Character files keep people's names consistent. Everything else that must stay t
     }
 
 - Before each batch, every term whose Chinese text or one of its `aliases` appears in the pages is sent to the model as **LOCKED TERMS**, which it must use exactly. Longer spellings are matched first, so 小丑印记 wins over 小丑.
-- The model registers new terms with `AddTerm` and links other spellings with `AliasTerm`. If it adds a new spelling with an English rendering that already exists, the spelling becomes an alias of that term.
+- The model registers new terms with `AddTerm` and links other spellings with `AliasTerm`. A new term whose English already belongs to a different term is not added; the batch log reports it, and `term alias` links it by hand if it really is the same term. Terms that name the same entity are linked with `LinkTerm` (see [Glossary Checks](#glossary-checks)).
 - The model can never change an existing term. A different rendering is logged under the batch as `⚠ Kept locked terms: 小丑印记 stays “Joker's Mark” (model suggested …)`.
 - Terms you add with `term add` are marked `"source": "user"`. The model never edits them, not even to add an alias; it logs a hint instead.
 - After each reply, every chapter whose raw page contains a locked term is checked for that term's English. If it is missing, the batch's single `⚠ Term drift` line lists the term with the chapters it is missing from, e.g. `“Joker's Mark” (小丑印记) missing from Chapters 831–845`; use `retry <chapter>` if the translation really drifted. A term reported in every chapter usually means the locked English is not what the model writes; check it with `terms audit <chinese>`. Text the model skips (site headers, recommendations) can occasionally cause a false warning.
 - Chinese keys and aliases must be 2–40 characters; one-character keys would match almost every page.
+
+### Glossary Checks
+
+Every new term is checked as it is registered, and the results appear under the batch:
+
+- **Same English.** A new term whose English already belongs to a different term is not added, e.g. `⚠ Not added, same English as a registered term: 光明城 “Holy City” matches 圣城`. If it is another spelling of that term, link it with `term alias`; otherwise it needs its own rendering.
+- **Names inside terms.** When a term contains a registered character name or term, its English must contain that name's English. 张三剑 rendered “Azure Sword” is reported because it lacks “Zhang San”. The term is still added. Use `term exempt <chinese>` when the rendering is intended.
+- **Same entity.** The model links two terms that name the same thing (two titles of one person, two names of one place) with `LinkTerm`; you can do it with `term same <term> = <term>`. LOCKED TERMS then shows `same entity as …`. Removing a term also removes links to it.
+
+`terms lint [N]` checks the whole book at once and changes nothing. It lists:
+
+- terms and character names that contain another name without its English;
+- different terms with the same English;
+- same-entity links to removed terms;
+- one English word used for terms built on unrelated Chinese, e.g. “Divine” for a group of terms with 圣 and a group with 神;
+- a term's English appearing in aligned paragraphs (the last N chapters with an alignment file, default 300) whose Chinese contains none of its spellings, with the Chinese most often found there instead.
+
+`terms rename <chinese> = <new english>` shows every aligned paragraph whose Chinese contains the term and whose English contains the old rendering. Add `--apply` to write it: changed chapters are first copied to `_qa/backups/rename_<time>/`, alignment files are updated, and the term is locked as yours with the new English. Paragraphs that contain the Chinese but not the old English, and chapters without an alignment file, are listed and left alone.
+
+### Character Name Checks
+
+- Character context matches longer names first, so 张三丰 no longer also pulls in the profile for 张三.
+- **Name drift.** A character named at least twice on the raw page whose English name, or any word of 3+ letters in it, never appears in the chapter's English is reported, e.g. `⚠ Name drift: “Li Yao” (李耀) never named in the English of Chapter 812`.
+- The model keeps a `Voice:` line in each speaking character's file (how they talk) and follows it.
+
+### Source Errors
+
+Nothing in the Chinese is corrected or kept silently. The reply carries two lists:
+
+- `sourceFixes`: input typos the model corrected, e.g. `{"chapterNo": "Chapter 812", "afterId": 4, "zh": "沉有", "correction": "没有"}`. A fix is *verified* when its text is on the page and the correction changes one or two characters; otherwise it is *unverified* and shown as a warning, since the translation already contains the change.
+- `continuity`: author mistakes (a wrong name, a wrong number, a contradiction) kept exactly as written, with no TN.
+
+Both appear under the batch (`Source fixes: …`, `Kept as written: …`), are appended to `_qa/source_fixes.jsonl` and `_qa/continuity.jsonl`, and can be browsed with `qa source [chapters]`.
 
 ### Prior-Usage Lookup
 

@@ -329,6 +329,11 @@ def _translated_index(book_dir: str) -> dict[int, str]:
     return index
 
 
+def translated_index(book_dir: str) -> dict[int, str]:
+    """Chapter number -> path of its translated .md file. Raises OSError when unreadable."""
+    return _translated_index(book_dir)
+
+
 def _searchable(book_dir: str, exclude: set) -> tuple[list[int], dict[int, str]]:
     """Chapters with both a stored raw page and a translation, minus exclude, ascending."""
     translated = _translated_index(book_dir)
