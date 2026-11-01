@@ -83,6 +83,10 @@ HELP_ROWS = (
     ("qa source [chapters]", "Show the typos the model fixed and the author mistakes it kept as written."),
     ("lookup <on|off>", "Toggle the prior-usage term lookup: a short scout call before each batch so new terms reuse earlier renderings."),
     ("repair <on|off>", "Toggle paragraph repair: paragraphs a reply left out are asked for again (at most 2 rounds) before the chapter is saved."),
+    ("reviewer [id|off]", "Pick the reviewer model (same endpoint), set it by id, or turn it off. The reviewer checks each batch and fixes problems with search/replace edits."),
+    ("review <chapters>", "Review chapters now, e.g. review 120-125; runs in the background."),
+    ("review all <on|off>", "Review every chapter of every batch instead of only the chapters the checks flagged."),
+    ("review undo <chapter>", "Restore a chapter to its version before the latest review edits; repeat to step further back."),
     ("flush", "Send all pending pages now, including a final partial batch."),
     ("auto <on|off>", "Toggle auto-dispatching (turn off to keep pages pending for manual)."),
     ("manual", "Copy the next batch of pending pages to the clipboard for external translation."),
@@ -224,6 +228,11 @@ def print_status(ctx: ReplContext) -> None:
     table.add_row("Auto Dispatch", "[green]ON[/green]" if s["auto_dispatch"] else "[yellow]PAUSED[/yellow]")
     table.add_row("Term Lookup", "[green]ON[/green]" if s.get("term_lookup") else "[yellow]OFF[/yellow]")
     table.add_row("Paragraph Repair", "[green]ON[/green]" if s.get("repair") else "[yellow]OFF[/yellow]")
+    if s.get("reviewer"):
+        scope = "every chapter" if s.get("review_all") else "flagged chapters"
+        table.add_row("Reviewer", f"[green]{escape(s['reviewer'])}[/green] · {scope}")
+    else:
+        table.add_row("Reviewer", "[yellow]OFF[/yellow]")
     table.add_row("Manual Active", f"[yellow]YES ({s['manual']} pages)[/yellow]" if s["manual_active"] else "NO")
     table.add_row("Clipboard Watch", "[green]ON[/green]" if s.get("clipboard_watch") else "OFF")
     table.add_row("Pending Pages", _pending_text(s))
@@ -877,6 +886,64 @@ def cmd_qa(ctx: ReplContext, args: list[str]) -> None:
     _print_source_log(ctx.cfg.book_dir, "Kept as written", qalog.CONTINUITY_FILENAME, wanted, False)
 
 
+REVIEW_USAGE = "Usage: review <chapters> · review all <on|off> · review undo <chapter>"
+
+
+def cmd_reviewer(ctx: ReplContext, args: list[str]) -> None:
+    """reviewer -> picker; reviewer off; reviewer <model id>."""
+    if not args:
+        ctx.client.select_reviewer_model(ctx.cfg)
+        return
+    ctx.cfg.reviewer_model = " ".join(args)
+    if ctx.cfg.reviewer_model:
+        con.ok(f"Reviewer model set to [bold cyan]{escape(ctx.cfg.reviewer_model)}[/bold cyan]")
+    else:
+        con.ok("Reviewer off: chapters are no longer reviewed.")
+
+
+def _review_all(ctx: ReplContext, args: list[str]) -> None:
+    if not args or args[0].lower() not in ("on", "off"):
+        state = "on" if ctx.cfg.review_all else "off"
+        con.warn(f"Reviewing every chapter is currently {state}. Usage: review all <on|off>")
+        return
+    ctx.cfg.review_all = args[0].lower() == "on"
+    if ctx.cfg.review_all:
+        con.ok("Every chapter of every batch is reviewed.")
+    else:
+        con.ok("Only chapters the checks flagged are reviewed.")
+
+
+def _review_undo(ctx: ReplContext, args: list[str]) -> None:
+    if len(args) != 1 or not args[0].isdigit() or int(args[0]) <= 0:
+        con.warn("Usage: review undo <chapter>")
+        return
+    ok, msg = ctx.pipeline.undo_review(int(args[0]))
+    (con.ok if ok else con.warn)(escape(msg))
+
+
+def cmd_review(ctx: ReplContext, args: list[str]) -> None:
+    """review <chapters> | review all <on|off> | review undo <chapter>."""
+    if not args:
+        model = ctx.cfg.reviewer_model or "off"
+        scope = "every chapter" if ctx.cfg.review_all else "chapters the checks flagged"
+        con.info(f"Reviewer: {escape(model)}; after each batch it reviews {scope}.")
+        con.dim(escape(REVIEW_USAGE))
+        return
+    sub = args[0].lower()
+    if sub == "undo":
+        _review_undo(ctx, args[1:])
+        return
+    if sub == "all":
+        _review_all(ctx, args[1:])
+        return
+    selection = parse_selection(args)
+    if selection.errors or not selection.chapters:
+        for error in selection.errors or [REVIEW_USAGE]:
+            con.warn(escape(error))
+        return
+    print_report(ctx.pipeline.review_now(selection.chapters))
+
+
 def cmd_repair(ctx: ReplContext, args: list[str]) -> None:
     """repair on|off -> toggle asking again for paragraphs a reply left out."""
     if not args or args[0].lower() not in ("on", "off"):
@@ -996,6 +1063,8 @@ HANDLERS = {
     "lookup": cmd_lookup,
     "repair": cmd_repair,
     "qa": cmd_qa,
+    "reviewer": cmd_reviewer,
+    "review": cmd_review,
 }
 COMMAND_WORDS = tuple(sorted(set(HANDLERS) | {"quit", "retranslate", "buffer", "queue", "glossary", "grab", "clip"}))
 

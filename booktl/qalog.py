@@ -23,6 +23,7 @@ from . import parsing, qa
 
 SOURCE_FIXES_FILENAME = "source_fixes.jsonl"
 CONTINUITY_FILENAME = "continuity.jsonl"
+REVIEW_FILENAME = "review.jsonl"     # reviewer edits: applied, rejected and undone
 MAX_REPORTS_PER_REPLY = 100
 MAX_FIELD_CHARS = 300
 MAX_READ_RECORDS = 20_000
@@ -156,7 +157,7 @@ def log_path(book_dir: str, filename: str) -> str:
     """Path of one of the two logs. Raises ValueError."""
     if not book_dir:
         raise ValueError("No book directory selected")
-    if filename not in (SOURCE_FIXES_FILENAME, CONTINUITY_FILENAME):
+    if filename not in (SOURCE_FIXES_FILENAME, CONTINUITY_FILENAME, REVIEW_FILENAME):
         raise ValueError(f"Unknown log file: {filename!r}")
     return os.path.join(book_dir, qa.QA_DIRNAME, filename)
 

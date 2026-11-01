@@ -125,6 +125,7 @@ _VALID_JSON_KEYS = [
     "candidateTerms", "ProposedEnglish",
     "notes", "afterId", "kind", "zh", "correction", "text", "paragraphs", "id",
     "sourceFixes", "continuity", "issue", "SameAs",
+    "phase", "summary", "edits", "chapter", "search_replace", "search", "replace", "reason",
 ]
 
 
@@ -350,3 +351,21 @@ def parse_repair_reply(raw_response: str) -> tuple[list[dict], list[dict], str |
     raw_notes = parsed.get("notes")
     notes = [n for n in raw_notes[:MAX_REPAIR_ENTRIES] if isinstance(n, dict)] if isinstance(raw_notes, list) else []
     return paragraphs, notes, None, unreadable
+
+
+MAX_REVIEW_ENTRIES = 200
+
+
+def parse_review_reply(raw_response: str) -> tuple[str, list, str | None]:
+    """Summary and edits from a reviewer reply. Returns (summary, edits, error_message)."""
+    parsed, err = _load_payload(raw_response)
+    if err:
+        return "", [], err
+    if not isinstance(parsed, dict):
+        return "", [], "expected a JSON object"
+    items = parsed.get("edits", [])
+    if not isinstance(items, list):
+        return "", [], "'edits' key must be a JSON array"
+    summary = parsed.get("summary")
+    text = re.sub(r"\s+", " ", summary).strip() if isinstance(summary, str) else ""
+    return text, items[:MAX_REVIEW_ENTRIES], None

@@ -373,6 +373,13 @@ def _context_blocks(book_dir: str, pages_text: str, prior_usage: str = "") -> li
     return blocks
 
 
+def book_context(book_dir: str, chinese_text: str) -> str:
+    """The book context blocks (characters, locked terms, arc endings) for some Chinese text, joined."""
+    if not isinstance(chinese_text, str):
+        return ""
+    return "\n\n".join(_context_blocks(book_dir, chinese_text))
+
+
 def build_messages(book_dir: str, pages_text: str, prior_usage: str = "") -> list[dict]:
     """Construct clean OpenAI-style role messages. prior_usage comes from termlookup."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]

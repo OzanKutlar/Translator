@@ -131,6 +131,10 @@ Everything typed into the console is a command, so no `/` prefix is needed (a le
 - `term same <term> = <term>` — Mark two terms as the same entity.
 - `term exempt <chinese> [off]` — Stop (or resume) checking that names inside a term keep their English.
 - `qa source [chapters]` — Typos the model fixed and author mistakes it kept as written (see [Source Errors](#source-errors)).
+- `reviewer [id|off]` — Pick, set or turn off the reviewer model (see [Reviewer](#reviewer)).
+- `review <chapters>` — Review chapters now, in the background.
+- `review all <on|off>` — Review every chapter of every batch, not only flagged ones.
+- `review undo <chapter>` — Restore a chapter to its version before the latest review edits.
 - `lookup <on|off>` — Turn the prior-usage term lookup on or off (see below).
 - `repair <on|off>` — Turn paragraph repair on or off (see [Paragraph Repair and Incomplete Chapters](#paragraph-repair-and-incomplete-chapters)).
 - `flush` — Send all pending pages now, including a partial batch.
@@ -192,6 +196,8 @@ Only problems get a ⚠, and they are grouped: one Term drift line per batch (up
 - `_qa/ratios.json` — Recent English/Chinese paragraph length ratios for the length check.
 - `_qa/source_fixes.jsonl`, `_qa/continuity.jsonl` — Every typo the model fixed and every author mistake it kept, one JSON object per line.
 - `_qa/backups/rename_<time>/` — Chapter files as they were before a `terms rename --apply`.
+- `_qa/backups/review/ch_000120/` — The chapter and its alignment file before each round of reviewer edits (used by `review undo`).
+- `_qa/review.jsonl` — Every reviewer edit: applied, rejected (with the reason) or undone.
 
 ### Translation Approach
 
@@ -274,6 +280,42 @@ Character files keep people's names consistent. Everything else that must stay t
 - Terms you add with `term add` are marked `"source": "user"`. The model never edits them, not even to add an alias; it logs a hint instead.
 - After each reply, every chapter whose raw page contains a locked term is checked for that term's English. If it is missing, the batch's single `⚠ Term drift` line lists the term with the chapters it is missing from, e.g. `“Joker's Mark” (小丑印记) missing from Chapters 831–845`; use `retry <chapter>` if the translation really drifted. A term reported in every chapter usually means the locked English is not what the model writes; check it with `terms audit <chinese>`. Text the model skips (site headers, recommendations) can occasionally cause a false warning.
 - Chinese keys and aliases must be 2–40 characters; one-character keys would match almost every page.
+
+### Reviewer
+
+A second model from the same endpoint can review every batch and fix it. At startup, after the translation model, a picker offers the **reviewer model**; its first row is **Off**. Set it on the command line with `--reviewer-model <id|off>` (or `TL_REVIEWER_MODEL`), which skips the picker, and change it later with `reviewer`.
+
+After a batch is saved, each chapter is checked again from disk:
+
+- missing paragraphs;
+- paragraphs of unusual length;
+- name drift;
+- locked terms whose English is missing;
+- unverified typo fixes.
+
+Chapters with findings go to the reviewer and clean chapters are skipped. `review all on` (or `--review-all`) sends every chapter. `review 120-125` reviews chapters now, in the background.
+
+The reviewer sees each Chinese paragraph next to its saved English (`MISSING` or `SKIPPED` where there is none), the Translator's Notes, the check results as leads, and the book's locked terms and character notes (including `Voice:` lines). It is told to fix real errors only (omissions, additions, mistranslations, wrong names or terms, lost voice, plain grammar) and never to rewrite for style. It answers with exact search/replace edits:
+
+    {"phase": "REVIEW", "summary": "…", "edits": [{"chapter": 812, "kind": "omission", "reason": "…",
+      "search_replace": [{"search": "He nodded.", "replace": "He nodded.\n\n⟦15⟧ She left the hall."}]}]}
+
+Edits are applied without asking. The file is chosen from the chapter number, never from a path. An edit is rejected, and the rejection reported, when any of these hold:
+
+- a search text does not occur exactly once;
+- it is larger than the size caps;
+- it removes a Translator's Note;
+- it lowers how often a locked term or character name appears whose Chinese is in the chapter;
+- it uses a `⟦n⟧` marker for anything but inserting a missing paragraph.
+
+One failing pair rejects the whole edit. An inserted `⟦n⟧` paragraph also updates the alignment file, and a chapter that becomes complete leaves the Incomplete list.
+
+Before a chapter is first changed, the file and its alignment are copied to `_qa/backups/review/`. `review undo <chapter>` restores the newest copy; run it again to step further back. Every edit is logged to `_qa/review.jsonl`. `cancel` also stops running reviews; edits already applied are kept.
+
+    → Batch #78 review: sent Chapters 812–813 to qwen-reviewer
+    ✔ Batch #78 review: Reviewed 2 chapter(s) with qwen-reviewer · 3 edit(s) applied, 1 rejected · 8 chapter(s) passed every check
+       Chapter 812: omission · ⟦15⟧ was missing
+       ⚠ Chapter 813: rejected grammar edit (removes “Zhang San”) · …
 
 ### Glossary Checks
 

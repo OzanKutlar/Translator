@@ -16,6 +16,7 @@ from .config import ConfigError
 MODEL_PAGE_SIZE = 15
 MAX_FALLBACK_ATTEMPTS = 10
 MANUAL_ENTRY_LABEL = "✎ Enter model ID manually…"
+REVIEWER_OFF_LABEL = "Off (no reviewer)"
 _MANUAL = object()  # sentinel: the picker's manual-entry row was chosen
 POST_POLL_SECONDS = 0.25
 POST_GRACE_SECONDS = 5   # extra wait beyond the request timeout before giving up on the helper thread
@@ -302,6 +303,45 @@ class ApiClient:
         con.ok(f"Selected model: [bold cyan]{escape(cfg.model)}[/bold cyan]")
         return True
 
+    def select_reviewer_model(self, cfg) -> bool:
+        """Pick the reviewer model from the same endpoint; the first row turns the reviewer off."""
+        models = self._fetch_models(cfg)
+        ids = [m["id"] for m in models]
+        options = [REVIEWER_OFF_LABEL] + ids
+        hints = ["chapters are not reviewed"] + [m["owned_by"] for m in models]
+        default = ids.index(cfg.reviewer_model) + 1 if cfg.reviewer_model in ids else 0
+        title = "Select reviewer model (checks each batch and fixes problems with search/replace edits)"
+        try:
+            idx = menu.select_option(title, options, hints, default)
+        except menu.MenuUnavailable as e:
+            con.dim(f"Arrow-key menu unavailable ({escape(str(e))}); using numbered list.")
+            idx = self._numbered_reviewer(options)
+        if idx is None:
+            con.warn("Reviewer unchanged.")
+            return False
+        cfg.reviewer_model = "" if idx == 0 else ids[idx - 1]
+        if cfg.reviewer_model:
+            con.ok(f"Reviewer model: [bold cyan]{escape(cfg.reviewer_model)}[/bold cyan]")
+        else:
+            con.info("Reviewer off: chapters are not reviewed.")
+        return True
+
+    @staticmethod
+    def _numbered_reviewer(options: list[str]) -> int | None:
+        for number, label in enumerate(options):
+            con.console.print(f"  [cyan]{number:2d}.[/cyan] {escape(label)}")
+        for _ in range(MAX_FALLBACK_ATTEMPTS):
+            try:
+                ans = con.console.input("[bold]Reviewer # (0 = off, 'q' to cancel): [/bold]").strip()
+            except (KeyboardInterrupt, EOFError):
+                return None
+            if ans.lower() in ("q", "quit"):
+                return None
+            if ans.isdigit() and int(ans) < len(options):
+                return int(ans)
+            con.warn("Invalid selection, please try again.")
+        return None
+
     def _prompt_manual_model(self, cfg) -> bool:
         try:
             ans = con.console.input("[bold]Enter model ID manually (blank to cancel): [/bold]").strip()
@@ -314,7 +354,8 @@ class ApiClient:
     # ------------------------------------------------------------------
 
     def chat(self, cfg, messages: list[dict], max_tokens: int | None = None,
-             cancel: CancelToken | None = None, label: str | None = None) -> tuple[str, dict | None]:
+             cancel: CancelToken | None = None, label: str | None = None,
+             model: str | None = None) -> tuple[str, dict | None]:
         """Send chat completion request with exponential backoff.
 
         max_tokens limits this call only; when cfg.max_tokens is also set, the smaller one wins.
@@ -325,11 +366,14 @@ class ApiClient:
             raise TypeError("cancel must be a CancelToken or None")
         if label is not None and not isinstance(label, str):
             raise TypeError("label must be a string or None")
-        if not cfg.model:
+        if model is not None and not isinstance(model, str):
+            raise TypeError("model must be a string or None")
+        model_id = (model or "").strip() or cfg.model  # model overrides cfg.model for this call (reviewer)
+        if not model_id:
             raise ApiError("No model specified. Use the model command to configure one.")
 
         payload = {
-            "model": cfg.model,
+            "model": model_id,
             "messages": messages,
             "temperature": cfg.temperature,
         }
@@ -338,7 +382,7 @@ class ApiClient:
             payload["max_tokens"] = min(limits)
 
         wants_json = cfg.json_mode == "on" or (
-            cfg.json_mode == "auto" and cfg.model not in self._no_json_format_models
+            cfg.json_mode == "auto" and model_id not in self._no_json_format_models
         )
         if wants_json:
             payload["response_format"] = {"type": "json_object"}
@@ -363,9 +407,9 @@ class ApiClient:
                 body_sample = resp.text[:300]
                 # Fallback for models not supporting response_format in auto mode
                 if resp.status_code in (400, 422) and "response_format" in body_sample and cfg.json_mode == "auto":
-                    self._no_json_format_models.add(cfg.model)
+                    self._no_json_format_models.add(model_id)
                     payload.pop("response_format", None)
-                    con.warn(_labelled(label, f"hit a response_format error on '{escape(cfg.model)}' · retrying without it"))
+                    con.warn(_labelled(label, f"hit a response_format error on '{escape(model_id)}' · retrying without it"))
                     continue
 
                 if resp.status_code in (401, 403):

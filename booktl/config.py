@@ -77,6 +77,8 @@ class Config:
         self._port = 5001
         self._term_lookup = True
         self._repair = True
+        self._reviewer_model = ""   # "" means no reviewer
+        self._review_all = False
 
     @property
     def base_url(self) -> str:
@@ -271,6 +273,31 @@ class Config:
             self._repair = bool(val)
 
     @property
+    def reviewer_model(self) -> str:
+        """Model that reviews saved chapters; '' when the reviewer is off."""
+        with self._lock:
+            return self._reviewer_model
+
+    @reviewer_model.setter
+    def reviewer_model(self, val):
+        clean = str(val or "").strip()
+        if clean.lower() in ("off", "none", "no", "null"):
+            clean = ""
+        with self._lock:
+            self._reviewer_model = clean
+
+    @property
+    def review_all(self) -> bool:
+        """Review every chapter of every batch, not only chapters the checks flagged."""
+        with self._lock:
+            return self._review_all
+
+    @review_all.setter
+    def review_all(self, val: bool):
+        with self._lock:
+            self._review_all = bool(val)
+
+    @property
     def host(self) -> str:
         with self._lock:
             return self._host
@@ -329,6 +356,10 @@ class Config:
         repair_env = os.environ.get("TL_REPAIR", "").strip().lower()
         repair_off = bool(getattr(args, "no_repair", False)) or repair_env in ("0", "off", "false", "no")
         cfg.repair = not repair_off
+
+        cfg.reviewer_model = getattr(args, "reviewer_model", None) or os.environ.get("TL_REVIEWER_MODEL") or ""
+        review_all_env = os.environ.get("TL_REVIEW_ALL", "").strip().lower()
+        cfg.review_all = bool(getattr(args, "review_all", False)) or review_all_env in ("1", "on", "true", "yes")
 
         port = getattr(args, "port", None) or os.environ.get("TL_PORT") or 5001
         cfg._port = int(port)

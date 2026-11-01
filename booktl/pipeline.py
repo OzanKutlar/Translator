@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from rich.markup import escape
 
 from . import console as con
-from . import activity, arcs, clipaccept, prompts, parsing, qa, qalog, repair, resume, segments, storage, characters, glossary, termlookup
+from . import activity, arcs, clipaccept, edits, prompts, parsing, qa, qalog, repair, resume, review, segments, storage, characters, glossary, termlookup
 from .batchlog import BatchLog
 from .tracker import ChapterTracker
 from .client import ApiClient, ApiError
@@ -264,6 +264,7 @@ class Pipeline:
         self._ignored_fps: list[str] = []    # text the translator copied itself ('manual' prompts)
         self._clip_watcher: clipaccept.ClipboardWatcher | None = None
         self._skip_url: str | None = None    # last session's reopen address; its first page is ignored
+        self._review_tokens: set = set()     # CancelTokens of running reviews
 
         self.counters = {
             "pages_seen": 0,
@@ -741,8 +742,8 @@ class Pipeline:
             self._mark_incomplete(log, "manual", works, numbers, repaired=False)
             if entries:
                 self._check_term_drift(log, entries, chapters)
-                return "Manual session closed."
-            return "Pasted translation processed."
+            self._review_in_background("Manual paste review", numbers, "manual", self.cfg.review_all)
+            return "Manual session closed." if entries else "Pasted translation processed."
         finally:
             log.emit()
 
@@ -758,7 +759,16 @@ class Pipeline:
             restored = [e for _, entries in active for e in entries] + (manual or [])
             self.pool.add(sorted(restored, key=entry_sort_key), front=True)
             auto_on = self.auto_dispatch
-        return self._describe_cancel(active, manual, auto_on)
+            reviews = list(self._review_tokens)
+        for token in reviews:
+            token.cancel()
+        if not reviews:
+            return self._describe_cancel(active, manual, auto_on)
+        note = (f"Cancelled {len(reviews)} running review(s); edits already applied are kept "
+                "('review undo <chapter>' restores a chapter).")
+        if not active and manual is None:
+            return [note]
+        return self._describe_cancel(active, manual, auto_on) + [note]
 
     def _cancel_active_locked(self) -> list[tuple[int, list[PageEntry]]]:
         """Abort in-flight batches, drop them from the in-flight list and return their pages."""
@@ -1170,8 +1180,92 @@ class Pipeline:
             self._check_term_drift(log, entries, chapters)
         except ApiCancelled:
             log.head("info", "Cancelled during repair; nothing was saved (its pages are back in the pending pool)")
+            return
         finally:
             log.emit()
+        self._review_after_batch(batch_id, numbers)
+
+    # ------------------------------------------------------------------
+    # Reviewer
+    # ------------------------------------------------------------------
+
+    def _reviewer_on(self) -> bool:
+        return bool(self.cfg.reviewer_model) and not self.cfg.dry_run
+
+    def _review_after_batch(self, batch_id: int, numbers: list[int]) -> None:
+        """Review the batch's saved chapters in this worker, before it takes the next batch."""
+        if not self._reviewer_on() or not numbers:
+            return
+        with self.lock:
+            # The chapters are saved: a 'cancel' during the review must not re-queue their pages.
+            self._active.pop(batch_id, None)
+            self.pool.notify()
+        self._run_review(f"Batch #{batch_id} review", sorted(set(numbers)), batch_id, self.cfg.review_all)
+
+    def _review_in_background(self, label: str, numbers, batch_ref, force: bool) -> bool:
+        """Run a review on its own thread. Returns True when one was started."""
+        if not self._reviewer_on() or not numbers:
+            return False
+        chapters = sorted({n for n in numbers if isinstance(n, int) and n > 0})
+        threading.Thread(
+            target=self._run_review, args=(label, chapters, batch_ref, force), daemon=True, name="booktl-review"
+        ).start()
+        return True
+
+    def _run_review(self, label: str, chapters: list[int], batch_ref, force: bool) -> None:
+        """Review chapters, apply the edits and print the outcome as one block."""
+        token = CancelToken()
+        with self.lock:
+            self._review_tokens.add(token)
+        log = BatchLog(label)
+        try:
+            outcome = review.run(self.client, self.cfg, chapters, force, batch_ref, token, label)
+            self._record_usage({"total_tokens": outcome.tokens})
+            review.log_outcome(log, outcome)
+            self._clear_completed(log, outcome.completed)
+        except Exception as e:  # a reviewer problem must never affect chapters that are already saved
+            log.head("fail", f"Review failed: {escape(str(e))}")
+        finally:
+            with self.lock:
+                self._review_tokens.discard(token)
+            log.emit()
+
+    def _clear_completed(self, log: BatchLog, chapters: list[int]) -> None:
+        """Chapters the reviewer made whole leave the Incomplete list."""
+        if not chapters:
+            return
+        with self.lock:
+            keys = [str(c) for c in chapters if str(c) in self.pool.incomplete]
+            changed = self.pool.forget(keys) if keys else 0
+        if changed:
+            self._persist_queue_state()
+            log.detail(f"No longer Incomplete: {_format_chapter_ranges([int(k) for k in keys])}")
+
+    def review_now(self, chapters) -> list[tuple[str, str]]:
+        """Review chapters on request, in the background, whatever the checks say."""
+        if not self.cfg.book_dir:
+            return [("warn", "No book directory selected.")]
+        if not self.cfg.reviewer_model:
+            return [("warn", "No reviewer model is set. Pick one with 'reviewer'.")]
+        if self.cfg.dry_run:
+            return [("warn", "Dry run: nothing is sent to the reviewer.")]
+        wanted = sorted({c for c in chapters or () if isinstance(c, int) and c > 0})[:review.MAX_CHAPTERS]
+        if not wanted:
+            return [("warn", "No chapters given, e.g. 'review 120-125'.")]
+        self._review_in_background("Review", wanted, "manual review", True)
+        span = escape(_format_chapter_ranges(wanted))
+        model = escape(self.cfg.reviewer_model)
+        return [("ok", f"Reviewing {span} with [bold]{model}[/bold] in the background; the result appears as its own block.")]
+
+    def undo_review(self, chapter) -> tuple[bool, str]:
+        """Restore a chapter to its version before the latest review edits."""
+        if not self.cfg.book_dir:
+            return False, "No book directory selected."
+        try:
+            md_path = termlookup.translated_index(self.cfg.book_dir).get(chapter)
+        except OSError as e:
+            return False, f"Could not list the book folder: {e}"
+        return edits.undo_review(self.cfg.book_dir, chapter, md_path)
 
     # ------------------------------------------------------------------
     # Paragraph anchors
@@ -1896,6 +1990,8 @@ class Pipeline:
                 "temperature": self.cfg.temperature,
                 "term_lookup": self.cfg.term_lookup,
                 "repair": self.cfg.repair,
+                "reviewer": self.cfg.reviewer_model,
+                "review_all": self.cfg.review_all,
                 "clipboard_watch": self.clipboard_watch_active(),
                 "counters": dict(self.counters),
                 "tracker": self.tracker.snapshot(),

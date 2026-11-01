@@ -70,6 +70,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--save-raw", action="store_true", help="Save raw LLM output to _raw/ folder")
         p.add_argument("--no-term-lookup", action="store_true", help="Skip the term-scout call and prior-usage lookup before each batch")
         p.add_argument("--no-repair", action="store_true", help="Save chapters with missing paragraphs as Incomplete instead of asking for them again")
+        p.add_argument("--reviewer-model", help="Model that reviews saved chapters ('off' for none); skips the reviewer picker")
+        p.add_argument("--review-all", action="store_true", help="Review every chapter, not only chapters the checks flagged")
 
     # Default 'run' subcommand
     p_run = subparsers.add_parser("run", help="Start ingest server and worker console")
@@ -201,6 +203,11 @@ def main():
             return
     else:
         con.ok(f"Using model: [bold green]{cfg.model}[/bold green]")
+    reviewer_given = getattr(args, "reviewer_model", None) or os.environ.get("TL_REVIEWER_MODEL")
+    if sub == "run" and not reviewer_given:
+        client.select_reviewer_model(cfg)
+    elif cfg.reviewer_model:
+        con.ok(f"Reviewer model: [bold green]{escape(cfg.reviewer_model)}[/bold green]")
     # 3. Pipeline & Workers Initialization
     pipeline = Pipeline(cfg, client)
     goal_arg = getattr(args, "goal", None)
