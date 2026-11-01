@@ -29,6 +29,25 @@ python translate.py
 - `python translate.py retry -b <BookName>` — Re-queues every Failed chapter (and any older `_failed/` batches), waits for them, then exits.
 - `python translate.py prompt -b <BookName>` — Inspects the generated translation prompt.
 
+## Inquire: Sending Chapters to combineCopy
+
+`python inquire.py` picks a book and a chapter range, then runs `combineCopy` inside the library folder. For every chapter it passes the English file and then the raw page, as paths relative to the library:
+
+    combineCopy '.\SuperBase Evolution\Chapter 10.md' '.\SuperBase Evolution\_raw\chapters\ch_000010.txt' …
+
+- **From the start N**: Chapters 1 to N.
+- **From the end N**: the last N translated chapters.
+- **Around the middle N**: N chapters around the middle chapter. N=10 gives middle−5 to middle+4.
+- **Explicit range**: e.g. `140-175`.
+
+The last chapter is the highest translated chapter. Chapters missing their translation or raw page are skipped with a warning. `combineCopy`'s output appears directly in the console.
+
+`combineCopy` can be an executable, a `.bat`/`.cmd`, a `.ps1` on PATH, or a function from your PowerShell profile.
+
+    python inquire.py -b "SuperBase Evolution" --end 10
+    python inquire.py --range 140-175 -y
+    python inquire.py --middle 10 --dry-run
+
 ## Choosing or Creating a Book
 
 The book picker lists the books you translated recently first, newest at the top, with a hint such as `translated 2h ago · ch 1240`. Pressing Enter on the first row therefore opens the book you worked on last. Books without a recorded translation follow in alphabetical order.
