@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from rich.markup import escape
 
 from . import console as con
-from . import activity, arcs, clipaccept, edits, prompts, parsing, qa, qalog, repair, resume, review, segments, storage, characters, glossary, termlookup
+from . import activity, arcs, clipaccept, edits, prompts, parsing, qa, qalog, repair, resume, review, segments, storage, style, characters, glossary, termlookup
 from .batchlog import BatchLog
 from .tracker import ChapterTracker
 from .client import ApiClient, ApiError
@@ -1332,6 +1332,27 @@ class Pipeline:
         self._record_anchors(log, works, numbers)
         self._check_lengths(log, works, numbers)
         self._check_name_drift(log, works, numbers)
+        self._check_style(log, works, numbers)
+
+    def _check_style(self, log: BatchLog, works: list, numbers: list[int]) -> None:
+        """One warning listing style findings of the saved chapters; nothing is changed."""
+        try:
+            guide = style.load_style(self.cfg.book_dir)
+            saved = set(numbers or [])
+            lines = []
+            for work in works:
+                if work.chapter not in saved:
+                    continue
+                findings = style.check_text(segments.strip_markers(work.text), guide.caps)
+                if findings:
+                    lines.append(f"Chapter {work.chapter}: {style.describe(findings)}")
+        except Exception as e:  # a checker bug must never fail a batch that is already saved
+            log.warn(f"Style check failed: {escape(str(e))}")
+            return
+        for error in guide.errors[:MAX_REPORTED_WARNINGS]:
+            log.warn(f"{style.STYLE_FILENAME}: {escape(error)}")
+        if lines:
+            log.warn(f"Style (report only): {_listing(lines)}")
 
     def _check_name_drift(self, log: BatchLog, works: list, numbers: list[int]) -> None:
         """Warn when a character named on the page never appears by name in the English."""

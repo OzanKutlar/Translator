@@ -1,6 +1,6 @@
 """System prompt definitions and message building logic."""
 
-from . import arcs, characters, glossary
+from . import arcs, characters, glossary, style
 
 SYSTEM_PROMPT = (
     "You are a professional literary translator (Chinese to English) working for a book translation company. "
@@ -367,6 +367,12 @@ def _context_blocks(book_dir: str, pages_text: str, prior_usage: str = "") -> li
         blocks.append(f"=== LOCKED TERMS ===\n{locked}\n=== END LOCKED TERMS ===")
     if prior_usage:
         blocks.append(f"=== PRIOR USAGE ===\n{PRIOR_USAGE_INTRO}\n\n{prior_usage}\n=== END PRIOR USAGE ===")
+    guide = style.load_style(book_dir).prompt_text()
+    if guide:
+        blocks.append(
+            "=== STYLE GUIDE ===\nThis book's own style choices. Follow them; they never override locked terms "
+            f"or character names.\n\n{guide}\n=== END STYLE GUIDE ==="
+        )
     recorded_arcs = arcs.get_arcs_summary(book_dir)
     if recorded_arcs:
         blocks.append(f"=== RECORDED ARC/VOLUME ENDINGS ===\n{recorded_arcs}\n=== END RECORDED ARC/VOLUME ENDINGS ===")

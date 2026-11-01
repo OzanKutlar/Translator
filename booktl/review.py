@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 from rich.markup import escape
 
-from . import characters, edits, glossary, parsing, prompts, qa, qalog, segments, termlookup
+from . import characters, edits, glossary, parsing, prompts, qa, qalog, segments, style, termlookup
 from . import console as con
 from .cancel import ApiCancelled
 from .client import ApiError
@@ -33,12 +33,14 @@ REVIEW_SYSTEM = (
     "  - mistranslation: English that changes the meaning (wrong subject, action or number, or a reversed meaning);\n"
     "  - name / term: a character name or locked term rendered differently from the book context;\n"
     "  - voice: a character's lines that ignore the Voice notes in the character context;\n"
-    "  - grammar: plain English errors such as \"an foreign\" or a doubled word.\n\n"
+    "  - grammar: plain English errors such as \"an foreign\", a doubled word, or Chinese characters left in the English.\n\n"
     "Do NOT:\n"
     "  - rewrite for style or polish the prose. The translation keeps the author's style, tone, pacing, repetition "
     "and paragraph breaks on purpose, even where they are plain or clumsy. If the meaning is right, leave it;\n"
     "  - change Translator's Notes (TN lines), or remove a locked term or character name the Chinese contains;\n"
-    "  - correct the author's own mistakes (a wrong name, a contradiction); they are translated as written on purpose.\n"
+    "  - correct the author's own mistakes (a wrong name, a contradiction); they are translated as written on purpose;\n"
+    "  - edit because of findings marked \"Information only\" (how often a phrase is used); they are context, "
+    "not requests. Follow the STYLE GUIDE only to fix a clear break of one of its rules.\n"
     "When unsure, change nothing. An empty edit list is a good answer.\n\n"
     "=== EDITS ===\n"
     "Every edit is an exact search/replace on the saved English chapter:\n"
@@ -91,6 +93,7 @@ class _HintContext:
     char_map: dict
     usual: float
     unverified: dict
+    caps: dict = field(default_factory=dict)
 
 
 def _clip(text, limit: int = CLIP_CHARS) -> str:
@@ -114,8 +117,10 @@ def _hint_context(book_dir: str, warnings: list) -> _HintContext:
         if record.get("status") == "unverified" and isinstance(record.get("chapter"), int):
             unverified.setdefault(record["chapter"], []).append(qalog.describe_fix(record))
     char_map = characters.load_characters(book_dir)
+    guide = style.load_style(book_dir)
+    warnings.extend(f"{style.STYLE_FILENAME}: {error}" for error in guide.errors)
     return _HintContext(glossary.load_terms(book_dir), char_map if isinstance(char_map, dict) else {},
-                        qa.usual_ratio(sample), unverified)
+                        qa.usual_ratio(sample), unverified, guide.caps)
 
 
 def _alignment_hints(source: edits.ChapterSource, usual: float) -> list[str]:
@@ -140,7 +145,16 @@ def chapter_hints(source: edits.ChapterSource, ctx: _HintContext) -> list[str]:
         hints.append(f"Locked term {ev['forms']} should appear as “{ev['english']}”, but that rendering is missing.")
     for text in ctx.unverified.get(source.chapter, []):
         hints.append(f"Unverified typo fix: {text}. Check that the English follows the Chinese.")
+    for finding in style.check_text(source.text, ctx.caps):
+        if finding.grammar:
+            hints.append(f"Style check: {finding.text}.")
     return hints[:MAX_HINTS]
+
+
+def low_priority_hints(source: edits.ChapterSource, ctx: _HintContext) -> list[str]:
+    """Phrase-frequency findings: shown when a chapter is reviewed anyway, never a reason to review it."""
+    findings = style.check_text(source.text, ctx.caps)
+    return [f"Information only, do not edit for this: {f.text}." for f in findings if not f.grammar][:MAX_HINTS]
 
 
 def collect_targets(book_dir: str, chapters, force: bool, outcome: ReviewOutcome) -> list[ReviewTarget]:
@@ -159,7 +173,7 @@ def collect_targets(book_dir: str, chapters, force: bool, outcome: ReviewOutcome
             continue
         hints = chapter_hints(source, ctx)
         if hints or force:
-            targets.append(ReviewTarget(source, hints))
+            targets.append(ReviewTarget(source, hints + low_priority_hints(source, ctx)))
         else:
             outcome.clean += 1
     return targets

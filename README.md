@@ -135,6 +135,9 @@ Everything typed into the console is a command, so no `/` prefix is needed (a le
 - `review <chapters>` — Review chapters now, in the background.
 - `review all <on|off>` — Review every chapter of every batch, not only flagged ones.
 - `review undo <chapter>` — Restore a chapter to its version before the latest review edits.
+- `style` — Show the book's Style.md and the phrase caps in use (see [Style Guide and Style Check](#style-guide-and-style-check)).
+- `style init` — Create a Style.md template.
+- `style check <chapters>` — Run the style check over saved chapters; reports only.
 - `lookup <on|off>` — Turn the prior-usage term lookup on or off (see below).
 - `repair <on|off>` — Turn paragraph repair on or off (see [Paragraph Repair and Incomplete Chapters](#paragraph-repair-and-incomplete-chapters)).
 - `flush` — Send all pending pages now, including a partial batch.
@@ -198,6 +201,7 @@ Only problems get a ⚠, and they are grouped: one Term drift line per batch (up
 - `_qa/backups/rename_<time>/` — Chapter files as they were before a `terms rename --apply`.
 - `_qa/backups/review/ch_000120/` — The chapter and its alignment file before each round of reviewer edits (used by `review undo`).
 - `_qa/review.jsonl` — Every reviewer edit: applied, rejected (with the reason) or undone.
+- `Style.md` — The book's own style choices and phrase caps (optional).
 
 ### Translation Approach
 
@@ -280,6 +284,29 @@ Character files keep people's names consistent. Everything else that must stay t
 - Terms you add with `term add` are marked `"source": "user"`. The model never edits them, not even to add an alias; it logs a hint instead.
 - After each reply, every chapter whose raw page contains a locked term is checked for that term's English. If it is missing, the batch's single `⚠ Term drift` line lists the term with the chapters it is missing from, e.g. `“Joker's Mark” (小丑印记) missing from Chapters 831–845`; use `retry <chapter>` if the translation really drifted. A term reported in every chapter usually means the locked English is not what the model writes; check it with `terms audit <chinese>`. Text the model skips (site headers, recommendations) can occasionally cause a false warning.
 - Chinese keys and aliases must be 2–40 characters; one-character keys would match almost every page.
+
+### Style Guide and Style Check
+
+Nothing here rewrites text. `style init` creates `<Book>/Style.md`. The template is all comments and sends nothing until you write outside them. Everything outside `<!-- -->` comments is sent to the translator and the reviewer as a STYLE GUIDE block. Use it for choices specific to the book: how strong profanity should be, how a character's pronouns work, which names are transliterated and which translated.
+
+The `## Capped phrases` section sets the style check's limits, one per line:
+
+    ## Capped phrases
+    - actually: 2
+    - somewhat: off
+
+`- phrase: N` allows N uses per 1,000 words before the phrase is reported; `- phrase: off` turns a built-in check off. Phrases listed here are also sent to the translator as phrases to use sparingly. The built-in caps (*actually*, *somewhat*, *couldn't help but*, *a trace of*, *at this moment*, *in the blink of an eye*) are used for detection only and are never sent to the model.
+
+After each batch the style check reports, in one line:
+
+- **phrases over their cap**, used at least 3 times. This is information only, because a repeated phrase can be translationese or the author's voice;
+- **`a`/`an` before the wrong sound**, e.g. *an foreign*. Exceptions such as *an hour* and *a university* are allowed. A capital `A` at the start of a sentence is not checked;
+- **doubled words**, apart from common intentional ones such as *no no* and *ha ha*;
+- **Chinese characters left in the English**, outside Translator's Notes.
+
+    ⚠ Style (report only): Chapter 812: wrong article: “an foreign”; “actually” ×9 (4.5 per 1,000 words; cap 2)
+
+Grammar findings (articles, doubled words, leftover Chinese) send a chapter to the reviewer, which may fix them. Phrase counts never trigger a review on their own. When a chapter is reviewed for another reason, they are shown to the reviewer as information it must not edit for. `style check 1200-1250` runs the check over saved chapters.
 
 ### Reviewer
 

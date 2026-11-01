@@ -10,7 +10,7 @@ from . import console as con
 from . import glossary
 from . import storage
 from . import termlookup
-from . import qalog, termlint, termrename
+from . import qalog, style, termlint, termrename
 from .client import ApiClient
 from .config import Config, ConfigError
 from .library import ask_reopen, create_book, open_url, select_book
@@ -81,6 +81,9 @@ HELP_ROWS = (
     ("term same <term> = <term>", "Mark two terms as the same entity (two titles of one person, two names of one place)."),
     ("term exempt <chinese> [off]", "Stop (or resume) checking that names inside this term keep their English."),
     ("qa source [chapters]", "Show the typos the model fixed and the author mistakes it kept as written."),
+    ("style", "Show the book's Style.md: what is sent to the model and which phrase caps the style check uses."),
+    ("style init", "Create a Style.md template. It sends nothing until you write outside its comments."),
+    ("style check <chapters>", "Run the style check over saved chapters, e.g. style check 1200-1250. Reports only."),
     ("lookup <on|off>", "Toggle the prior-usage term lookup: a short scout call before each batch so new terms reuse earlier renderings."),
     ("repair <on|off>", "Toggle paragraph repair: paragraphs a reply left out are asked for again (at most 2 rounds) before the chapter is saved."),
     ("reviewer [id|off]", "Pick the reviewer model (same endpoint), set it by id, or turn it off. The reviewer checks each batch and fixes problems with search/replace edits."),
@@ -886,6 +889,83 @@ def cmd_qa(ctx: ReplContext, args: list[str]) -> None:
     _print_source_log(ctx.cfg.book_dir, "Kept as written", qalog.CONTINUITY_FILENAME, wanted, False)
 
 
+STYLE_USAGE = "Usage: style · style init · style check <chapters>"
+
+
+def _style_show(book_dir: str) -> None:
+    guide = style.load_style(book_dir)
+    if guide.exists:
+        con.info(f"Style guide: {escape(guide.path)}")
+    else:
+        con.info(f"No {style.STYLE_FILENAME} yet; the built-in checks are used. Create one with 'style init'.")
+    for error in guide.errors[:MAX_AUDIT_WARNINGS]:
+        con.warn(escape(error))
+    text = guide.prompt_text()
+    if text:
+        con.panel(escape(text), title="Sent to the translator and the reviewer", style="cyan")
+    elif guide.exists:
+        con.dim("Nothing in it is sent to the model yet: everything is inside comments.")
+    rows = [(p, f"{c:g}", style.STYLE_FILENAME if p in guide.file_caps else "built-in") for p, c in sorted(guide.caps.items())]
+    if rows:
+        _print_table("Capped phrases (uses per 1,000 words)", ("Phrase", "Cap", "From"), rows)
+
+
+def _read_text(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _style_check(book_dir: str, args: list[str]) -> None:
+    selection = parse_selection(args)
+    if selection.errors or not selection.chapters:
+        for error in selection.errors or [STYLE_USAGE]:
+            con.warn(escape(error))
+        return
+    try:
+        translated = termlookup.translated_index(book_dir)
+    except OSError as e:
+        con.fail(f"Could not list the book folder: {escape(str(e))}")
+        return
+    caps = style.load_style(book_dir).caps
+    rows, clean, absent = [], 0, []
+    for chapter in selection.chapters:
+        path = translated.get(chapter)
+        if path is None:
+            absent.append(chapter)
+            continue
+        try:
+            findings = style.check_text(_read_text(path), caps)
+        except (OSError, ValueError) as e:
+            con.warn(f"Chapter {chapter}: could not read ({escape(str(e))})")
+            continue
+        if findings:
+            rows.append((chapter, style.describe(findings)))
+        else:
+            clean += 1
+    if rows:
+        _print_table("Style findings (report only)", ("Chapter", "Findings"), rows)
+    con.info(f"{clean} chapter(s) without findings, {len(rows)} with findings.")
+    if absent:
+        con.dim(f"No translation: {escape(format_chapter_ranges(absent))}")
+
+
+def cmd_style(ctx: ReplContext, args: list[str]) -> None:
+    """style | style init | style check <chapters>."""
+    if not ctx.cfg.book_dir:
+        con.warn("No book directory selected.")
+        return
+    sub = args[0].lower() if args else ""
+    if not sub:
+        _style_show(ctx.cfg.book_dir)
+    elif sub == "init":
+        ok, msg = style.create_template(ctx.cfg.book_dir)
+        (con.ok if ok else con.warn)(escape(msg))
+    elif sub == "check":
+        _style_check(ctx.cfg.book_dir, args[1:])
+    else:
+        con.warn(escape(STYLE_USAGE))
+
+
 REVIEW_USAGE = "Usage: review <chapters> · review all <on|off> · review undo <chapter>"
 
 
@@ -1065,6 +1145,7 @@ HANDLERS = {
     "qa": cmd_qa,
     "reviewer": cmd_reviewer,
     "review": cmd_review,
+    "style": cmd_style,
 }
 COMMAND_WORDS = tuple(sorted(set(HANDLERS) | {"quit", "retranslate", "buffer", "queue", "glossary", "grab", "clip"}))
 
