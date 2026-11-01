@@ -126,6 +126,7 @@ _VALID_JSON_KEYS = [
     "notes", "afterId", "kind", "zh", "correction", "text", "paragraphs", "id",
     "sourceFixes", "continuity", "issue", "SameAs",
     "phase", "summary", "edits", "chapter", "search_replace", "search", "replace", "reason",
+    "map", "en",
 ]
 
 
@@ -369,3 +370,8 @@ def parse_review_reply(raw_response: str) -> tuple[str, list, str | None]:
     summary = parsed.get("summary")
     text = re.sub(r"\s+", " ", summary).strip() if isinstance(summary, str) else ""
     return text, items[:MAX_REVIEW_ENTRIES], None
+
+
+def load_json_reply(raw_response: str) -> tuple[object, str | None]:
+    """Decode a JSON reply, repairing common model mistakes. Returns (parsed, error_message)."""
+    return _load_payload(raw_response)

@@ -8,236 +8,41 @@ Pick a book, then a range of chapters:
   Explicit range       e.g. 140-175
 
 Chapter 1 is always the first chapter; the last is the highest translated chapter.
-combineCopy runs inside the library folder and receives paths relative to it, the English
-file and then the raw page for every chapter (backslashes on Windows):
+combineCopy runs inside the library folder and receives paths relative to it, the English file and
+then the raw page for every chapter (backslashes on Windows):
 
   combineCopy './SuperBase Evolution/Chapter 10.md' './SuperBase Evolution/_raw/chapters/ch_000010.txt'
 
-Its output appears directly in this console.
+Its output appears directly in this console. The range and command code lives in booktl/combine.py,
+shared with audit.py.
 """
 
 import argparse
 import os
-import re
-import shutil
-import subprocess
+import shutil  # noqa: F401  (tests patch shutil.which through this module)
+import subprocess  # noqa: F401  (tests patch subprocess.run through this module)
 import sys
-from dataclasses import dataclass, field
 
 from rich.markup import escape
 
 from booktl import console as con
 from booktl import menu
+from booktl.combine import (  # noqa: F401  (re-exported for callers and tests)
+    MAX_COMMAND_CHARS, Selection, build_command, check_length, collect_files, parse_count, parse_range,
+    ps_quote, raw_parts, relative, resolve_range, run_combine, translated_chapters,
+)
 from booktl.library import ordered_books
-from booktl.parsing import format_chapter_ranges, parse_chapter_number
-from booktl.storage import CHAPTER_PAGES_DIRNAME, RAW_DIRNAME
+from booktl.parsing import format_chapter_ranges
 
 DEFAULT_LIBRARY = "../TranslateBook"
 DEFAULT_COMMAND = "combineCopy"
 MAX_INPUT_ATTEMPTS = 5
-MAX_SCAN_ENTRIES = 50_000    # bounds the scan of one book folder
-MAX_COMMAND_CHARS = 30_000   # Windows caps a command line at 32,767 characters
 PREVIEW_PAIRS = 2            # chapters shown at each end of the command preview
 EXIT_OK, EXIT_USER, EXIT_COMMAND = 0, 1, 2
 MODES = ("start", "end", "middle", "range")
 MODE_LABELS = ("From the start", "From the end", "Around the middle", "Explicit range")
 _YES = ("", "y", "yes")
 _NO = ("n", "no", "q", "quit")
-_RANGE_RE = re.compile(
-    r"^(?:ch(?:apter)?\.?\s*)?([0-9]{1,7})(?:\s*[-–—~]\s*(?:ch(?:apter)?\.?\s*)?([0-9]{1,7}))?$",
-    re.IGNORECASE,
-)
-
-
-@dataclass
-class Selection:
-    """Files to send plus the chapters left out because a file is missing."""
-
-    files: list = field(default_factory=list)       # relative paths: English then raw, per chapter
-    chapters: list = field(default_factory=list)    # chapters that were included
-    no_english: list = field(default_factory=list)
-    no_raw: list = field(default_factory=list)
-
-
-# ----------------------------------------------------------------------
-# Range parsing
-# ----------------------------------------------------------------------
-
-def parse_count(value) -> int:
-    """A positive whole number of chapters. Raises ValueError."""
-    text = str(value).strip() if value is not None else ""
-    if not re.fullmatch(r"[0-9]{1,7}", text) or int(text) <= 0:
-        raise ValueError(f"'{text}' is not a positive whole number of chapters.")
-    return int(text)
-
-
-def parse_range(value) -> tuple[int, int]:
-    """'140-175', 'ch140-175', '140 – 175' or '140' -> (low, high). Raises ValueError."""
-    text = str(value).strip() if value is not None else ""
-    match = _RANGE_RE.match(text)
-    if not match:
-        raise ValueError(f"Could not read '{text}'. Use e.g. 140-175.")
-    low = int(match.group(1))
-    high = int(match.group(2) or match.group(1))
-    if low <= 0:
-        raise ValueError("Chapter numbers start at 1.")
-    if high < low:
-        raise ValueError(f"'{text}' runs backwards; write it as {high}-{low}.")
-    return low, high
-
-
-def _middle_window(count: int, last: int) -> tuple[int, int]:
-    """count chapters around the middle chapter: middle-count//2 onwards, kept inside 1..last."""
-    if count >= last:
-        return 1, last
-    middle = (1 + last) // 2
-    low = max(1, min(middle - count // 2, last - count + 1))
-    return low, low + count - 1
-
-
-def resolve_range(mode: str, value, last: int) -> tuple[int, int]:
-    """Inclusive (low, high) chapter span for a mode and its value. Raises ValueError."""
-    if isinstance(last, bool) or not isinstance(last, int) or last <= 0:
-        raise ValueError("The book has no translated chapters.")
-    if mode == "range":
-        low, high = parse_range(value)
-        if low > last:
-            raise ValueError(f"Chapter {low} is past the last translated chapter ({last}).")
-        return low, min(high, last)
-    count = parse_count(value)
-    if mode == "start":
-        return 1, min(count, last)
-    if mode == "end":
-        return max(1, last - count + 1), last
-    if mode == "middle":
-        return _middle_window(count, last)
-    raise ValueError(f"Unknown range mode {mode!r}.")
-
-
-# ----------------------------------------------------------------------
-# Chapter files
-# ----------------------------------------------------------------------
-
-def _chapter_of(filename: str) -> int | None:
-    """Chapter number of a translated file such as 'Chapter 12.md', else None."""
-    if not filename.lower().endswith(".md"):
-        return None
-    chapter = parse_chapter_number(filename[:-3])
-    return chapter if chapter and chapter > 0 else None
-
-
-def _is_file(entry) -> bool:
-    try:
-        return entry.is_file()
-    except OSError:
-        return False  # removed or unreadable during the scan: treated as absent
-
-
-def translated_chapters(book_dir: str) -> dict[int, str]:
-    """Chapter number -> file name of its translation. Raises OSError when the folder is unreadable."""
-    found = {}
-    with os.scandir(book_dir) as entries:
-        for count, entry in enumerate(entries):
-            if count >= MAX_SCAN_ENTRIES:
-                break
-            chapter = _chapter_of(entry.name)
-            if chapter is None or not _is_file(entry):
-                continue
-            if chapter not in found or entry.name == f"Chapter {chapter}.md":
-                found[chapter] = entry.name
-    return found
-
-
-def raw_parts(book_name: str, chapter: int) -> tuple[str, ...]:
-    return (book_name, RAW_DIRNAME, CHAPTER_PAGES_DIRNAME, f"ch_{chapter:06d}.txt")
-
-
-def relative(*parts: str) -> str:
-    """Path relative to the library folder, e.g. './Book/Chapter 10.md'."""
-    return os.path.join(os.curdir, *parts)
-
-
-def collect_files(library_dir: str, book_name: str, translated: dict, low: int, high: int) -> Selection:
-    """English file and raw page for every chapter in low..high that has both."""
-    if low < 1 or high < low:
-        raise ValueError(f"Invalid chapter span {low}-{high}.")
-    selection = Selection()
-    for chapter in range(low, high + 1):
-        english = translated.get(chapter)
-        raw = raw_parts(book_name, chapter)
-        has_raw = os.path.isfile(os.path.join(library_dir, *raw))
-        if english is None:
-            selection.no_english.append(chapter)
-        if not has_raw:
-            selection.no_raw.append(chapter)
-        if english is None or not has_raw:
-            continue
-        selection.files += [relative(book_name, english), relative(*raw)]
-        selection.chapters.append(chapter)
-    return selection
-
-
-# ----------------------------------------------------------------------
-# Running combineCopy
-# ----------------------------------------------------------------------
-
-def _powershell() -> str | None:
-    return shutil.which("pwsh") or shutil.which("powershell")
-
-
-def ps_quote(text) -> str:
-    """PowerShell single-quoted string."""
-    return "'" + str(text).replace("'", "''") + "'"
-
-
-def build_command(command: str, files: list, windows: bool = os.name == "nt") -> list[str]:
-    """argv for combineCopy: an executable, a .ps1 script, or a PowerShell profile function.
-
-    Raises ValueError for an empty command and FileNotFoundError when nothing can run it.
-    """
-    if not isinstance(command, str) or not command.strip():
-        raise ValueError("The command name cannot be empty.")
-    exe = shutil.which(command)
-    if exe is None and windows:
-        exe = shutil.which(command + ".ps1")
-    if exe is not None and not exe.lower().endswith(".ps1"):
-        return [exe, *files]
-    shell = _powershell()
-    if exe is not None and shell:
-        return [shell, "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", exe, *files]
-    if exe is None and windows and shell:
-        # Not on PATH: it may be a function or alias defined in the PowerShell profile.
-        call = " ".join(["&", ps_quote(command), *(ps_quote(f) for f in files)])
-        return [shell, "-NoLogo", "-Command", call]
-    raise FileNotFoundError(f"'{command}' was not found on PATH, and no PowerShell is available to run it.")
-
-
-def check_length(argv: list, windows: bool = os.name == "nt") -> None:
-    """Refuse commands longer than Windows allows. Raises ValueError."""
-    if not windows:
-        return
-    length = len(subprocess.list2cmdline(argv))
-    if length > MAX_COMMAND_CHARS:
-        raise ValueError(
-            f"The command would be {length:,} characters long; Windows allows about {MAX_COMMAND_CHARS:,}. "
-            "Pick a smaller range."
-        )
-
-
-def run_combine(argv: list, cwd: str) -> int | None:
-    """Run the command in cwd with its output going straight to this console. None if it could not run."""
-    try:
-        completed = subprocess.run(argv, cwd=cwd, check=False)
-    except FileNotFoundError as e:
-        con.fail(f"Could not start {escape(str(argv[0]))}: {escape(str(e))}")
-        return None
-    except OSError as e:
-        con.fail(f"Running {escape(str(argv[0]))} failed: {escape(str(e))}")
-        return None
-    except KeyboardInterrupt:
-        con.warn("Interrupted; the command may not have finished.")
-        return None
-    return completed.returncode
 
 
 # ----------------------------------------------------------------------
@@ -403,17 +208,22 @@ def send_chapters(args, library: str, book: str, translated: dict, span: tuple[i
     return _run_and_report(argv, library, args.command)
 
 
+def add_range_args(parser: argparse.ArgumentParser) -> None:
+    """--start/--end/--middle/--range, shared with audit.py."""
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--start", metavar="N", help="Chapters 1 to N")
+    group.add_argument("--end", metavar="N", help="The last N translated chapters")
+    group.add_argument("--middle", metavar="N", help="N chapters around the middle chapter")
+    group.add_argument("--range", metavar="A-B", help="An explicit range, e.g. 140-175")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Send the English translations and raw pages of a chapter range to combineCopy."
     )
     parser.add_argument("-b", "--book", help="Book folder name (skips the book menu)")
     parser.add_argument("-l", "--library", default=DEFAULT_LIBRARY, help="Library folder (default: ../TranslateBook)")
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument("--start", metavar="N", help="Chapters 1 to N")
-    group.add_argument("--end", metavar="N", help="The last N translated chapters")
-    group.add_argument("--middle", metavar="N", help="N chapters around the middle chapter")
-    group.add_argument("--range", metavar="A-B", help="An explicit range, e.g. 140-175")
+    add_range_args(parser)
     parser.add_argument("-y", "--yes", action="store_true", help="Run without asking for confirmation")
     parser.add_argument("--dry-run", action="store_true", help="Print the command instead of running it")
     parser.add_argument("--command", default=DEFAULT_COMMAND, help="Command to run (default: combineCopy)")

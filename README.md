@@ -48,6 +48,37 @@ The last chapter is the highest translated chapter. Chapters missing their trans
     python inquire.py --range 140-175 -y
     python inquire.py --middle 10 --dry-run
 
+## Audit: Sending Problem Chapters to combineCopy
+
+`python audit.py` checks a range of translated chapters from disk and sends only the chapters with problems to `combineCopy`, with the findings piped in as the prompt:
+
+    combineCopy --prompt-pipe '.\Book\Chapter 812.md' '.\Book\_raw\chapters\ch_000812.txt' …
+
+Pick the book and range as in `inquire.py`, with the menu or `--start N`, `--end N`, `--middle N` or `--range A-B`. No model is called unless you pass `--align`. For every chapter the audit looks for:
+
+- **omission**: paragraphs with no English. A chapter without an alignment file is checked by paragraph count only;
+- **addition**: English paragraphs an audit alignment matched to no Chinese paragraph;
+- **length**: paragraphs, or whole unaligned chapters, far from the book's usual English length;
+- **note**: Translator's Notes that make a typo claim or only say the text was kept as written;
+- **name / term**: character names and locked terms missing from the English;
+- **source**: unverified typo fixes;
+- **review**: rejected reviewer edits;
+- **incomplete**: chapters on the Incomplete list;
+- **style**: grammar findings.
+
+Continuity notes, declared skips and phrase counts are listed as *Information only* and never flag a chapter on their own.
+
+The script prints a table of the problem chapters and saves the findings to `<Book>/_qa/audit/audit_<time>.md` (or `--findings-out`). It then asks before running combineCopy. The findings start with instructions for the receiving model; replace them with `--instructions <file>`. Each chapter's block lists numbered findings with the quoted Chinese and English lines.
+
+- **`--align`** builds alignment files for chapters without one, with one model call per chapter (`-u`, `-m`, `-k` or the `TL_*` variables; it asks for a model if none is set). `--realign` rebuilds existing ones too. The model only maps Chinese paragraphs to numbered English paragraphs, so it cannot change or invent text. A map that goes backwards is refused and reported, and one English paragraph covering several Chinese ones is recorded as a merge.
+- **Size limits.** combineCopy reads at most 2 MB from the pipe, and Windows caps a command line at about 32,000 characters. Larger findings are split into parts by chapter (`--max-prompt-bytes`, default 1,900,000), and the script waits for Enter between parts (`-y` does not wait). A single chapter too big for one part is cut with a note pointing to the saved file.
+- **`--dry-run`** saves the findings and prints each part's command and prompt size without running anything.
+- **Which combineCopy.** The executable on PATH (the pip-installed `combineCopy.exe`) is used directly. Otherwise the script runs it through PowerShell, switches to UTF-8 first, and pipes the prompt in with `$input`. A combineCopy function in your PowerShell profile must forward its pipeline input, or it receives no prompt:
+
+      function combineCopy {
+          if ($MyInvocation.ExpectingInput) { $input | combineCopy.exe @args } else { combineCopy.exe @args }
+      }
+
 ## Choosing or Creating a Book
 
 The book picker lists the books you translated recently first, newest at the top, with a hint such as `translated 2h ago · ch 1240`. Pressing Enter on the first row therefore opens the book you worked on last. Books without a recorded translation follow in alphabetical order.
@@ -202,6 +233,7 @@ Only problems get a ⚠, and they are grouped: one Term drift line per batch (up
 - `_qa/backups/review/ch_000120/` — The chapter and its alignment file before each round of reviewer edits (used by `review undo`).
 - `_qa/review.jsonl` — Every reviewer edit: applied, rejected (with the reason) or undone.
 - `Style.md` — The book's own style choices and phrase caps (optional).
+- `_qa/audit/audit_<time>.md` — Findings saved by `audit.py`, exactly as they were piped to combineCopy.
 
 ### Translation Approach
 
