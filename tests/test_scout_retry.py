@@ -17,7 +17,11 @@ from booktl.pipeline import Pipeline, _drift_text
 PAGE = "某某书名\n第120章 血色\n" + "李耀走进大殿，苍穹宗的长老看着他，众人大惊。\n" * 6
 SCOUT_REPLY = '{"candidateTerms": []}'
 TRANSLATION = json.dumps({
-    "chapters": [{"chapterNo": "Chapter 120", "content": "# Chapter 120: Blood\n\nLi Yao walked in.\n\n[[Chapter 121]]"}],
+    "chapters": [{
+        "chapterNo": "Chapter 120",
+        "content": "⟦0⟧ # Chapter 120: Blood\n\n⟦1⟧ Li Yao walked in.\n\n[[Chapter 121]]",
+        "notes": []
+    }],
     "characterActions": [], "arcEnds": [], "termActions": [],
 })
 

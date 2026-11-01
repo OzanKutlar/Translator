@@ -69,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--dry-run", action="store_true", help="Build prompts without calling LLM endpoint")
         p.add_argument("--save-raw", action="store_true", help="Save raw LLM output to _raw/ folder")
         p.add_argument("--no-term-lookup", action="store_true", help="Skip the term-scout call and prior-usage lookup before each batch")
+        p.add_argument("--no-repair", action="store_true", help="Save chapters with missing paragraphs as Incomplete instead of asking for them again")
 
     # Default 'run' subcommand
     p_run = subparsers.add_parser("run", help="Start ingest server and worker console")
@@ -220,7 +221,10 @@ def main():
         pipeline.shutdown(drain=False)
         stats = pipeline.stats()
         if finished:
-            con.ok(f"Retry complete. Missing chapters: {stats['missing']}, failed chapters: {stats['failed']}.")
+            con.ok(
+                f"Retry complete. Missing chapters: {stats['missing']}, failed chapters: {stats['failed']}, "
+                f"incomplete chapters: {stats['incomplete']}."
+            )
         else:
             con.warn("Retry did not finish; unsent pending pages were saved to _raw/.")
         return
@@ -259,6 +263,7 @@ def main():
             f"Failed Batches: {cnt['failures']}\n"
             f"Missing Chapters: {stats['missing']}\n"
             f"Failed Chapters: {stats['failed']}\n"
+            f"Incomplete Chapters: {stats['incomplete']}\n"
             f"Reported Tokens: {cnt['tokens']:,}",
             title="Session Summary",
             style="blue"

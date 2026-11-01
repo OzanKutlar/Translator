@@ -61,8 +61,8 @@ HELP_ROWS = (
     ("goal <n|+n|none>", "Set or clear the stop chapter. With a goal the scraper runs until the goal; without one it waits at 4 x batch size pending pages."),
     ("progress", "Display current scraping and translation progress bars."),
     ("pending [all]", "List pending chapters and in-flight batches; 'all' lists every page (aliases: buffer, queue)."),
-    ("missing", "List chapters left out of replies and chapters from failed batches. They are never re-queued automatically."),
-    ("retry [chapters]", "Re-queue and send chapters now: retry 112-115, retry 120 130, retry missing, retry failed, retry all. No argument re-queues all failed chapters (aliases: retranslate, rt)."),
+    ("missing", "List chapters left out of replies, chapters from failed batches, and chapters saved with missing paragraphs (Incomplete). None are re-queued automatically."),
+    ("retry [chapters]", "Re-queue and send chapters now: retry 112-115, retry 120 130, retry missing, retry failed, retry incomplete, retry all. No argument re-queues all failed chapters (aliases: retranslate, rt)."),
     ("recover [#batch|chapters]", "No argument lists spooled batches. 'recover #8' loads batch 8; 'recover 112-115' loads chapters to the front of the pool without forcing a send."),
     ("terms [search]", "Show the glossary of locked terms (titles, skills, debuffs, items, places...), optionally filtered (alias: glossary)."),
     ("term add <chinese> = <english> [type:<type>]", "Add or override a term and lock it as yours; the model never changes your terms."),
@@ -70,6 +70,7 @@ HELP_ROWS = (
     ("term rm <chinese>", "Remove a term together with its aliases, or remove a single alias."),
     ("terms audit <chinese>", "Show every translated chapter whose raw page contains a term, with the surrounding Chinese lines and the matching English passage."),
     ("lookup <on|off>", "Toggle the prior-usage term lookup: a short scout call before each batch so new terms reuse earlier renderings."),
+    ("repair <on|off>", "Toggle paragraph repair: paragraphs a reply left out are asked for again (at most 2 rounds) before the chapter is saved."),
     ("flush", "Send all pending pages now, including a final partial batch."),
     ("auto <on|off>", "Toggle auto-dispatching (turn off to keep pages pending for manual)."),
     ("manual", "Copy the next batch of pending pages to the clipboard for external translation."),
@@ -210,12 +211,14 @@ def print_status(ctx: ReplContext) -> None:
     table.add_row("JSON Mode", s["json_mode"])
     table.add_row("Auto Dispatch", "[green]ON[/green]" if s["auto_dispatch"] else "[yellow]PAUSED[/yellow]")
     table.add_row("Term Lookup", "[green]ON[/green]" if s.get("term_lookup") else "[yellow]OFF[/yellow]")
+    table.add_row("Paragraph Repair", "[green]ON[/green]" if s.get("repair") else "[yellow]OFF[/yellow]")
     table.add_row("Manual Active", f"[yellow]YES ({s['manual']} pages)[/yellow]" if s["manual_active"] else "NO")
     table.add_row("Clipboard Watch", "[green]ON[/green]" if s.get("clipboard_watch") else "OFF")
     table.add_row("Pending Pages", _pending_text(s))
     table.add_row("In-Flight", f"{s['in_flight_batches']} batch(es), {s['in_flight']} page(s)")
     table.add_row("Missing Chapters", f"[bold yellow]{s['missing']}[/bold yellow]" if s["missing"] else "0")
     table.add_row("Failed Chapters", f"[bold red]{s['failed']}[/bold red]" if s["failed"] else "0")
+    table.add_row("Incomplete Chapters", f"[bold magenta]{s['incomplete']}[/bold magenta]" if s.get("incomplete") else "0")
     table.add_row("Chapters Saved", f"[bold green]{c['chapters_saved']}[/bold green]")
     table.add_row("Pages Received", str(c["pages_seen"]))
     table.add_row("Failed Batches", f"[bold red]{c['failures']}[/bold red]" if c["failures"] else "0")
@@ -424,9 +427,10 @@ def _when_text(stamp) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(stamp))
 
 
-def _problem_rows(missing: dict, failed: dict) -> list[tuple]:
+def _problem_rows(missing: dict, failed: dict, incomplete: dict | None = None) -> list[tuple]:
     rows = []
-    for status, records, style in (("Missing", missing, "yellow"), ("Failed", failed, "red")):
+    groups = (("Missing", missing, "yellow"), ("Failed", failed, "red"), ("Incomplete", incomplete or {}, "magenta"))
+    for status, records, style in groups:
         for key, info in sorted(records.items(), key=_problem_sort_key):
             rows.append((
                 f"[{style}]{status}[/{style}]",
@@ -444,11 +448,12 @@ def _chapter_numbers(records: dict) -> list[int]:
 
 def cmd_missing(ctx: ReplContext, args: list[str]) -> None:
     missing, failed = ctx.pipeline.problems()
-    if not missing and not failed:
-        con.ok("No missing or failed chapters.")
+    incomplete = ctx.pipeline.incomplete()
+    if not missing and not failed and not incomplete:
+        con.ok("No missing, failed or incomplete chapters.")
         return
-    rows = _problem_rows(missing, failed)
-    table = Table(title="Missing & Failed Chapters", border_style="red")
+    rows = _problem_rows(missing, failed, incomplete)
+    table = Table(title="Missing, Failed & Incomplete Chapters", border_style="red")
     for column in ("Status", "Chapter", "Batch", "Reason", "Recorded"):
         table.add_column(column)
     for row in rows[:MAX_PROBLEM_ROWS]:
@@ -456,13 +461,14 @@ def cmd_missing(ctx: ReplContext, args: list[str]) -> None:
     con.console.print(table)
     if len(rows) > MAX_PROBLEM_ROWS:
         con.dim(f"Showing {MAX_PROBLEM_ROWS} of {len(rows)} rows.")
-    if missing:
-        con.info(f"Missing ({len(missing)}): {escape(format_chapter_ranges(_chapter_numbers(missing)) or 'unnumbered pages only')}")
-    if failed:
-        con.info(f"Failed ({len(failed)}): {escape(format_chapter_ranges(_chapter_numbers(failed)) or 'unnumbered pages only')}")
+    for name, records in (("Missing", missing), ("Failed", failed), ("Incomplete", incomplete)):
+        if records:
+            span = format_chapter_ranges(_chapter_numbers(records)) or "unnumbered pages only"
+            con.info(f"{name} ({len(records)}): {escape(span)}")
     con.info(
         "Nothing is re-queued automatically. Use [bold cyan]retry missing[/bold cyan], "
-        "[bold cyan]retry failed[/bold cyan] or e.g. [bold cyan]retry 112-115[/bold cyan]."
+        "[bold cyan]retry failed[/bold cyan], [bold cyan]retry incomplete[/bold cyan] "
+        "or e.g. [bold cyan]retry 112-115[/bold cyan]."
     )
 
 
@@ -673,6 +679,19 @@ def cmd_lookup(ctx: ReplContext, args: list[str]) -> None:
         con.ok("Term lookup off: batches go out as a single translation call.")
 
 
+def cmd_repair(ctx: ReplContext, args: list[str]) -> None:
+    """repair on|off -> toggle asking again for paragraphs a reply left out."""
+    if not args or args[0].lower() not in ("on", "off"):
+        state = "on" if ctx.cfg.repair else "off"
+        con.warn(f"Paragraph repair is currently {state}. Usage: repair <on|off>")
+        return
+    ctx.cfg.repair = args[0].lower() == "on"
+    if ctx.cfg.repair:
+        con.ok("Paragraph repair on: missing paragraphs are asked for again (at most 2 rounds) before a chapter is saved.")
+    else:
+        con.ok("Paragraph repair off: chapters with missing paragraphs are saved and listed as Incomplete.")
+
+
 def _split_assignment(args: list[str]) -> tuple[str, str] | None:
     """'小丑 = Joker' -> ('小丑', 'Joker'); None when either side is missing."""
     left, sep, right = " ".join(args).partition("=")
@@ -762,6 +781,7 @@ HANDLERS = {
     "terms": cmd_terms,
     "term": cmd_term,
     "lookup": cmd_lookup,
+    "repair": cmd_repair,
 }
 COMMAND_WORDS = tuple(sorted(set(HANDLERS) | {"quit", "retranslate", "buffer", "queue", "glossary", "grab", "clip"}))
 

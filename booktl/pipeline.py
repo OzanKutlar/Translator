@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from rich.markup import escape
 
 from . import console as con
-from . import activity, arcs, clipaccept, prompts, parsing, resume, segments, storage, characters, glossary, termlookup
+from . import activity, arcs, clipaccept, prompts, parsing, qa, repair, resume, segments, storage, characters, glossary, termlookup
 from .batchlog import BatchLog
 from .tracker import ChapterTracker
 from .client import ApiClient, ApiError
@@ -176,16 +176,6 @@ def _more_items(total: int, shown: int, singular: str, plural: str) -> str:
     return f" · {extra} more {singular if extra == 1 else plural}" if extra > 0 else ""
 
 
-@dataclass
-class AnchorCheck:
-    """Paragraph-marker check of one returned chapter."""
-
-    chapter: int | None
-    parsed: segments.MarkedOutput
-    parts: segments.PageParts | None
-    findings: list = field(default_factory=list)
-
-
 class ScoutFailed(Exception):
     """The term query did not produce usable results; the batch must not be translated without them.
 
@@ -283,7 +273,7 @@ class Pipeline:
         count = self.pool.import_state(state)
         if count:
             con.info(
-                f"Loaded {count} missing/failed chapter record(s) from {storage.QUEUE_STATE_FILENAME}. "
+                f"Loaded {count} missing/failed/incomplete chapter record(s) from {storage.QUEUE_STATE_FILENAME}. "
                 f"Type [bold cyan]missing[/bold cyan] to view them."
             )
 
@@ -681,9 +671,12 @@ class Pipeline:
         try:
             with self.lock:
                 session = list(self.manual_entries or []) if self.manual_active else []
-            chapters, anchors = self._strip_and_check(session, reply.chapters or [])
+            works, extras = self._prepare_chapters(session, reply.chapters or [])
+            if any(work.missing_ids() for work in works):
+                log.detail("Pasted replies are not repaired; chapters with missing paragraphs are listed as Incomplete.")
+            chapters = self._finish_chapters(log, works, extras)
             numbers = self._save_results(log, chapters, reply)
-            self._record_anchors(log, anchors, numbers)
+            self._after_save(log, works, numbers)
             with self.lock:
                 entries = self.manual_entries if self.manual_active else None
                 self.manual_active = False
@@ -691,9 +684,12 @@ class Pipeline:
                 self.pool.notify()
             if entries:
                 self._reconcile(log, "manual", entries, chapters, numbers)
+            else:
+                self._resolve_returned(numbers)
+            self._mark_incomplete(log, "manual", works, numbers, repaired=False)
+            if entries:
                 self._check_term_drift(log, entries, chapters)
                 return "Manual session closed."
-            self._resolve_returned(numbers)
             return "Pasted translation processed."
         finally:
             log.emit()
@@ -787,6 +783,8 @@ class Pipeline:
             wanted.append(("missing", missing))
         if selection.keywords & {"failed", "all"}:
             wanted.append(("failed", failed))
+        if selection.keywords & {"incomplete", "all"}:
+            wanted.append(("incomplete", self.pool.incomplete_records()))
         for name, records in wanted:
             if not records:
                 notes.append(("info", f"No {name} chapters recorded."))
@@ -1091,11 +1089,11 @@ class Pipeline:
             con.dim(f"{label}: reply arrived after cancellation and was discarded (pages are already back in the pending pool).")
             return
         timing = f"in {time.monotonic() - started:.0f}s{_tokens_text(usage)}"
-        self._process_reply(batch_id, entries, raw_reply, first_seen, timing)
+        self._process_reply(batch_id, entries, raw_reply, first_seen, timing, token)
 
     def _process_reply(self, batch_id: int, entries: list[PageEntry], raw_reply: str,
-                       first_seen: dict, timing: str) -> None:
-        """Parse, save and check a translation reply, then print it as one block."""
+                       first_seen: dict, timing: str, token: CancelToken | None = None) -> None:
+        """Parse, repair, save and check a translation reply, then print it as one block."""
         reply = parsing.parse_reply(raw_reply)
         if reply.error:
             self._handle_batch_failure(batch_id, entries, raw_reply, f"JSON error: {reply.error}")
@@ -1103,13 +1101,22 @@ class Pipeline:
         if not reply.chapters:
             self._handle_batch_failure(batch_id, entries, raw_reply, "Reply contained no chapters")
             return
-        log = BatchLog(f"Batch #{batch_id}")
+        label = f"Batch #{batch_id}"
+        log = BatchLog(label)
         try:
-            chapters, anchors = self._strip_and_check(entries, reply.chapters)
+            works, extras = self._prepare_chapters(entries, reply.chapters)
+            repaired = self.cfg.repair
+            self._repair(log, label, works, token)
+            if self._is_cancelled(batch_id):
+                raise ApiCancelled("Batch cancelled during repair")
+            chapters = self._finish_chapters(log, works, extras)
             numbers = self._save_results(log, chapters, reply, first_seen, timing)
-            self._record_anchors(log, anchors, numbers)
+            self._after_save(log, works, numbers)
             self._reconcile(log, batch_id, entries, chapters, numbers)
+            self._mark_incomplete(log, batch_id, works, numbers, repaired)
             self._check_term_drift(log, entries, chapters)
+        except ApiCancelled:
+            log.head("info", "Cancelled during repair; nothing was saved (its pages are back in the pending pool)")
         finally:
             log.emit()
 
@@ -1132,24 +1139,137 @@ class Pipeline:
             dropped += parts.dropped
         return PAGE_SEPARATOR.join(texts), paragraphs, dropped
 
-    def _strip_and_check(self, entries, chapters) -> tuple[list, list[AnchorCheck]]:
-        """Returned chapters with their markers removed, plus the marker check of each one."""
+    def _prepare_chapters(self, entries, chapters) -> tuple[list, list]:
+        """Reply chapters ready for checking, plus entries that are not usable chapter objects."""
         by_chapter = {e.chapter: e for e in (entries or []) if e.chapter is not None}
-        cleaned, checks = [], []
+        works, extras = [], []
         for entry in chapters if isinstance(chapters, list) else []:
             if not isinstance(entry, dict) or not isinstance(entry.get("content"), str):
-                cleaned.append(entry)
+                extras.append(entry)
                 continue
-            parsed = segments.parse_marked(entry["content"])
-            cleaned.append({**entry, "content": segments.strip_markers(entry["content"])})
             number = parsing.parse_chapter_number(str(entry.get("chapterNo") or ""))
-            checks.append(self._anchor_check(number, parsed, by_chapter))
-        return cleaned, checks
+            notes = entry.get("notes") if isinstance(entry.get("notes"), list) else []
+            parts = self._source_parts(number, by_chapter)
+            work = qa.ChapterWork(entry, number, entry["content"], parts, list(notes))
+            work.refresh()
+            works.append(work)
+        return works, extras
 
-    def _anchor_check(self, number, parsed: segments.MarkedOutput, by_chapter: dict) -> AnchorCheck:
-        parts = self._source_parts(number, by_chapter)
-        findings = segments.check_anchors(segments.expected_ids(parts), parsed) if parts else []
-        return AnchorCheck(number, parsed, parts, findings)
+    def _finish_chapters(self, log: BatchLog, works: list, extras: list) -> list:
+        """Place the notes, remove the markers and return the chapter objects to save."""
+        report = qa.NoteReport()
+        for work in works:
+            qa.place_notes(work, report)
+        self._log_notes(log, report)
+        return [work.finished() for work in works] + list(extras)
+
+    @staticmethod
+    def _log_notes(log: BatchLog, report) -> None:
+        """One line for placed notes; warnings for notes left inside the text and for removed notes."""
+        placed = []
+        if report.placed:
+            placed.append(f"placed {_plural(report.placed, 'note', 'notes')} after their paragraphs")
+        if report.moved:
+            placed.append(f"moved {report.moved} to the paragraph that contains its Chinese")
+        if placed:
+            log.detail("Notes: " + ", ".join(placed))
+        if report.inline:
+            log.warn(f"{_plural(report.inline, 'note was', 'notes were')} written inside the chapter text "
+                     "instead of the notes list; left where the model put it")
+        if report.removed:
+            shown = escape(" · ".join(report.removed[:MAX_LISTED_NAMES]))
+            log.warn(f"Removed notes: {shown}{_more_items(len(report.removed), MAX_LISTED_NAMES, 'note', 'notes')}")
+
+    def _after_save(self, log: BatchLog, works: list, numbers: list[int]) -> None:
+        """Checks that need the saved chapters: alignment files and paragraph lengths."""
+        self._record_anchors(log, works, numbers)
+        self._check_lengths(log, works, numbers)
+
+    def _check_lengths(self, log: BatchLog, works: list, numbers: list[int]) -> None:
+        """Report paragraphs far shorter or longer than this book usually translates to; nothing is changed."""
+        sample, err = qa.load_ratio_sample(self.cfg.book_dir)
+        if err:
+            log.warn(escape(err))
+            return
+        usual = qa.usual_ratio(sample)
+        saved = set(numbers or [])
+        flagged, fresh = [], []
+        for work in works:
+            if work.chapter not in saved or work.parts is None:
+                continue
+            ratios = qa.paragraph_ratios(work.zh, work.parsed.paragraphs)
+            fresh.extend(ratios.values())
+            flags = qa.length_flags(ratios, usual)
+            if flags:
+                flagged.append(f"Chapter {work.chapter} {qa.describe_length_flags(flags)}")
+        if flagged:
+            shown = escape(" · ".join(flagged[:MAX_LISTED_NAMES]))
+            log.warn(f"Length check: {shown}{_more_items(len(flagged), MAX_LISTED_NAMES, 'chapter', 'chapters')}")
+        self._store_ratios(log, fresh)
+
+    def _store_ratios(self, log: BatchLog, fresh: list) -> None:
+        try:
+            qa.add_ratios(self.cfg.book_dir, fresh)
+        except (OSError, ValueError) as e:
+            log.warn(f"Could not update {qa.QA_DIRNAME}/{qa.RATIOS_FILENAME}: {escape(str(e))}")
+
+    def _mark_incomplete(self, log: BatchLog, batch_ref, works: list, numbers: list[int], repaired: bool) -> None:
+        """List saved chapters that still have gaps as Incomplete (never re-queued automatically)."""
+        saved = set(numbers or [])
+        items = []
+        for work in works:
+            reason = qa.incomplete_reason(work, repaired) if work.chapter in saved and work.parts else ""
+            if reason:
+                items.append((work.chapter, reason))
+        if not items:
+            return
+        with self.lock:
+            self.pool.mark_incomplete(items, batch_ref)
+        self._persist_queue_state()
+        span = _format_chapter_ranges([chapter for chapter, _ in items])
+        log.warn(f"Incomplete: {escape(span)} saved with gaps (see 'missing'; 'retry incomplete' translates them again)")
+
+    def _repair(self, log: BatchLog, label: str, works: list, token) -> None:
+        """Ask again for missing paragraphs, at most repair.REPAIR_ROUNDS rounds. Raises ApiCancelled."""
+        if not self.cfg.repair or not any(work.missing_ids() for work in works):
+            return
+        for round_no in range(1, repair.REPAIR_ROUNDS + 1):
+            targets, too_many = repair.select_targets(works)
+            if round_no == 1 and too_many:
+                listed = ", ".join(f"{w.chapter_no} ({len(w.missing_ids())})" for w in too_many[:MAX_LISTED_NAMES])
+                log.warn(f"Too many missing paragraphs to patch, left for a full retranslation: {escape(listed)}")
+            if not targets or not self._repair_round(log, label, round_no, targets, token):
+                return
+
+    def _repair_round(self, log: BatchLog, label: str, round_no: int, targets: list, token) -> bool:
+        """One repair call. Returns True when it filled at least one paragraph."""
+        request, used = repair.build_request(targets)
+        if not used:
+            return False
+        messages = prompts.build_repair_messages(self.cfg.book_dir, request, repair.chinese_text(used))
+        con.sent(f"{label}: Repair round {round_no} sent ({escape(repair.describe_targets(used))})")
+        try:
+            raw_reply, usage = self.client.chat(self.cfg, messages, cancel=token, label=f"{label}: Repair")
+        except ApiError as e:
+            log.warn(f"Repair round {round_no} failed: {escape(_error_summary(e))}")
+            return False
+        self._record_usage(usage)
+        outcome = repair.apply_reply(used, raw_reply if isinstance(raw_reply, str) else "")
+        self._log_repair(log, round_no, outcome)
+        return bool(outcome.filled)
+
+    @staticmethod
+    def _log_repair(log: BatchLog, round_no: int, outcome) -> None:
+        if outcome.error:
+            log.warn(f"Repair round {round_no}: unusable reply ({escape(_one_line(outcome.error))})")
+        elif not outcome.filled:
+            log.warn(f"Repair round {round_no}: the reply filled none of the missing paragraphs")
+        if outcome.filled:
+            shown = [f"Chapter {n} {segments.format_ids(ids)}" for n, ids in sorted(outcome.filled.items())]
+            more = _more_items(len(shown), MAX_LISTED_NAMES, "chapter", "chapters")
+            log.detail(f"Repaired in round {round_no}: {escape(' · '.join(shown[:MAX_LISTED_NAMES]))}{more}")
+        if outcome.ignored:
+            log.warn(f"Repair round {round_no}: ignored {_plural(outcome.ignored, 'entry', 'entries')} that were not asked for")
 
     def _source_parts(self, number, by_chapter: dict) -> segments.PageParts | None:
         """The raw page a returned chapter translates, split as it was when sent; None when unknown."""
@@ -1184,7 +1304,7 @@ class Pipeline:
             self._update_alignment(log, check)
         self._log_anchor_lines(log, problems, skips, unchecked)
 
-    def _update_alignment(self, log: BatchLog, check: AnchorCheck) -> None:
+    def _update_alignment(self, log: BatchLog, check: qa.ChapterWork) -> None:
         """Write the chapter's alignment file; a chapter translated without markers loses its old one."""
         book_dir = self.cfg.book_dir
         try:
@@ -1593,6 +1713,7 @@ class Pipeline:
                 "in_flight_batches": len(self._active),
                 "missing": len(self.pool.missing),
                 "failed": len(self.pool.failed),
+                "incomplete": len(self.pool.incomplete),
                 "manual": len(self.manual_entries or []),
             }
 
@@ -1613,6 +1734,10 @@ class Pipeline:
     def problems(self) -> tuple[dict, dict]:
         """Copies of the (missing, failed) chapter records."""
         return self.pool.problems()
+
+    def incomplete(self) -> dict:
+        """Copy of the Incomplete chapter records: saved chapters that still have gaps."""
+        return self.pool.incomplete_records()
 
     def is_idle(self) -> bool:
         """True when nothing is in flight and nothing pending could still be sent."""
@@ -1647,6 +1772,7 @@ class Pipeline:
                 "json_mode": self.cfg.json_mode,
                 "temperature": self.cfg.temperature,
                 "term_lookup": self.cfg.term_lookup,
+                "repair": self.cfg.repair,
                 "clipboard_watch": self.clipboard_watch_active(),
                 "counters": dict(self.counters),
                 "tracker": self.tracker.snapshot(),

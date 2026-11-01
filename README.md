@@ -89,8 +89,9 @@ After each reply, the chapters that were sent are compared with the chapters tha
 
 - **Missing**: a chapter that was sent but not returned. It is logged under the batch, e.g. `⚠ Missing Chapters 123, 125: left out of the reply (not re-queued; use 'retry missing')`.
 - **Failed**: every chapter in a batch that hit an API or JSON error. The batch is also quarantined to `_failed/`. A reply cut off at the token limit (`finish_reason: length`) counts as an API error; lower `batch` or raise `maxtokens` and retry.
+- **Incomplete**: a chapter that was saved but still has paragraphs missing after repair, or whose reply had no paragraph markers. See [Paragraph Repair and Incomplete Chapters](#paragraph-repair-and-incomplete-chapters).
 
-Neither list is re-queued automatically. Use `missing` to see them, and `retry` to send them again. A chapter leaves both lists once it is translated successfully or re-queued. The lists are stored in `<Book>/_queue_state.json`, so they survive restarts.
+None of these lists is re-queued automatically. Use `missing` to see them, and `retry` to send them again. A chapter leaves these lists once it is translated successfully or re-queued. The lists are stored in `<Book>/_queue_state.json`, so they survive restarts.
 
 Pages with no readable chapter number are keyed as `page:<id>`. They can only be checked for missing by count, and `retry page:<id>` works only during the session that scraped them.
 
@@ -107,11 +108,11 @@ Everything typed into the console is a command, so no `/` prefix is needed (a le
 - `batch <n>` — Adjust batch page size (default: 10). Applies to the next batch sent.
 - `concurrency <n>` — Adjust active worker threads.
 - `pending [all]` — Show pending chapters and in-flight batches (aliases: `buffer`, `queue`).
-- `missing` — Table of Missing and Failed chapters with batch and reason.
+- `missing` — Table of Missing, Failed and Incomplete chapters with batch and reason.
 - `retry [chapters]` — Re-queue chapters at the front of the pool and send them now. Ranges include both ends:
   - `retry 112-115` — Chapters 112, 113, 114 and 115.
   - `retry 120 130`, `retry ch120` — Individual chapters.
-  - `retry missing`, `retry failed`, `retry all` — Everything on the Missing list, the Failed list, or both.
+  - `retry missing`, `retry failed`, `retry incomplete`, `retry all` — Everything on the Missing, Failed or Incomplete list, or on all three.
   - `retry` — With no argument, re-queues all Failed chapters.
   - Aliases: `retranslate`, `rt`.
 - `recover [#batch|chapters]` — With no argument, lists spooled batches. `recover #8` loads spooled batch 8. `recover 112-115` puts those chapters at the front of the pool *without* forcing a send, for `manual` or `flush`.
@@ -126,6 +127,7 @@ Everything typed into the console is a command, so no `/` prefix is needed (a le
 - `term rm <chinese>` — Remove a term together with its aliases, or a single alias.
 - `terms audit <chinese>` — Every translated chapter whose raw page contains the term, with the surrounding Chinese lines and the matching English passage.
 - `lookup <on|off>` — Turn the prior-usage term lookup on or off (see below).
+- `repair <on|off>` — Turn paragraph repair on or off (see [Paragraph Repair and Incomplete Chapters](#paragraph-repair-and-incomplete-chapters)).
 - `flush` — Send all pending pages now, including a partial batch.
 - `auto <on|off>` — Pause or resume automatic sending.
 - `quit` — Gracefully drain and shut down workers.
@@ -177,11 +179,12 @@ Only problems get a ⚠, and they are grouped: one Term drift line per batch (up
 - `_raw/batch_XXXX_pages.json` — Pages of every batch sent, written before the API call.
 - `_raw/unsent_*.json` — Pending pages that were never sent when the program exited.
 - `_failed/` — Quarantined failed batches with the model reply and error.
-- `_queue_state.json` — Missing and Failed chapter lists.
+- `_queue_state.json` — Missing, Failed and Incomplete chapter lists.
 - `Glossary.json` — Locked term renderings (see below).
 - `_activity.json` — When the book was last translated and the highest chapter in that batch; orders the book picker.
 - `_resume.json` — The reopen address: the URL and chapter of the last page the scraper sent.
 - `_align/ch_000120.json` — Paragraph alignment: the Chinese paragraphs by marker, the English paragraph for each marker, declared skips and TNs (see below).
+- `_qa/ratios.json` — Recent English/Chinese paragraph length ratios for the length check.
 
 ### Translation Approach
 
@@ -203,17 +206,49 @@ Before a batch is sent, each page is split into its title line, its story paragr
 
     ⟦0⟧ # Chapter 120: Blood Red
     ⟦1⟧ Li Yao walked into the great hall.
-    (TN: Translator's Notes sit on their own unmarked line right after their paragraph.)
+    (TN: Notes are placed here by the software, right after their paragraph; see Translator's Notes.)
     ⟦2⟧ An elder looked at him.
 
 - The send line shows how many paragraphs went out and how many site lines were removed, e.g. `→ Batch #12: Translation sent to … · 152 paragraphs · 18 site lines removed`.
 - A paragraph the model leaves out on purpose (an author's note, a site notice that slipped through) must be written as `⟦31⟧ [SKIP: reason]`. Declared skips are listed under the batch, e.g. `Declared skips: Chapter 120 ⟦31⟧ (author's note)`.
 - Lines after `(本章完)` are sent under `[After the chapter, not for translation]`, only as evidence for arc and volume endings.
-- After the reply arrives, every chapter is checked against the paragraphs that were sent. Problems are listed under the batch as one line, e.g. `⚠ Anchors: Chapter 812 missing ⟦14–17⟧ · Chapter 815 2 unmarked paragraphs`. A reply without markers (for example a manual `paste` that lost them) is still saved and reported as not checkable. For now problems are reported only; nothing is retranslated automatically.
+- After the reply arrives, every chapter is checked against the paragraphs that were sent. Problems are listed under the batch as one line, e.g. `⚠ Anchors: Chapter 812 missing ⟦14–17⟧ · Chapter 815 2 unmarked paragraphs`. A reply without markers (for example a manual `paste` that lost them) is still saved and reported as not checkable. Missing paragraphs are then repaired (see [Paragraph Repair and Incomplete Chapters](#paragraph-repair-and-incomplete-chapters)).
 - The markers are removed before the chapter is saved, so the `.md` files look the same as before. The pairing is kept in `<Book>/_align/ch_000120.json`. A chapter translated again without markers loses its old alignment file, and the batch log says so.
 - The prior-usage lookup and `terms audit` use the alignment file when a chapter has one and show the exact paragraph (`exact aligned paragraph`) instead of a position estimate.
 - `manual` copies the marked pages; `paste` checks the reply against the open manual session's pages, or against the stored raw page when no session is open.
 - Extend `END_MARKERS` / `BOILERPLATE` in `booktl/segments.py` for other sites.
+
+### Translator's Notes
+
+Translator's Notes never go inside the chapter text. The model lists them per chapter in a `notes` list:
+
+    {"afterId": 17, "kind": "pun", "zh": "奶", "correction": "", "text": "(TN: In gaming slang …)"}
+
+The software checks each note and places it on its own line directly after paragraph `afterId`. A note is removed when:
+
+- it only says the text was translated or kept as written;
+- the Chinese it names (`zh`) is not on the page, or it names none;
+- it is a `source` note (an error in the Chinese) whose `correction` does not differ from `zh` by one or two characters;
+- its `kind` is not one of `pun`, `culture`, `term`, `source`.
+
+Every removal is listed under the batch with the reason and the start of the note, e.g. `⚠ Removed notes: Chapter 812 after ⟦4⟧: “(TN: The raw has a typo here…” (it only says the text was kept as written)`. A note whose `zh` sits in another paragraph than `afterId` moves to the paragraph that contains it, and the batch log counts these. Notes the model still writes inside the text are left where they are and counted in a warning, unless they make a typo claim (which cannot be checked there) or only say the text was kept as written; those are removed and listed.
+
+### Paragraph Repair and Incomplete Chapters
+
+When a reply leaves out marked paragraphs, a repair call asks for just those paragraphs before anything is saved. It sends each missing paragraph with up to 2 neighbouring paragraphs on each side, in Chinese and in the English already written, and splices the answers in by marker. The repair call carries the same translation instructions and book context as the batch.
+
+    → Batch #78: Repair round 1 sent (Chapter 812 ⟦14–17⟧)
+       Repaired in round 1: Chapter 812 ⟦14–17⟧
+
+- At most 2 rounds run per batch, and a round that fills nothing ends the repair.
+- A chapter with more than 40 missing paragraphs is not patched; it needs a full retranslation.
+- A chapter saved with paragraphs still missing, or whose reply had no markers at all, is listed as **Incomplete**, e.g. `⚠ Incomplete: Chapter 812 saved with gaps`. See it with `missing` and translate it again with `retry incomplete`.
+- `paste` replies are never repaired; their gaps go straight to the Incomplete list.
+- `repair off` (or `--no-repair`, `TL_REPAIR=off`) turns repair off. Chapters with gaps are then saved and listed as Incomplete.
+
+### Length Check
+
+Each paragraph's English length is divided by its Chinese length and compared with the book's usual ratio: the median of the most recent 3,000 paragraphs, kept in `<Book>/_qa/ratios.json`. Until 100 paragraphs are recorded, 3 English characters per Chinese character is assumed. Paragraphs with fewer than 15 Chinese characters are not judged. A paragraph under 0.35× or over 3× the usual ratio is reported, e.g. `⚠ Length check: Chapter 812 ⟦14⟧ short (0.21× usual)`. The check never changes anything.
 
 ### Glossary / Locked Terms
 

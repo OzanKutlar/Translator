@@ -123,6 +123,7 @@ _VALID_JSON_KEYS = [
     "arcEnds", "endType", "arcName", "isAfterword",
     "termActions", "Type", "RefersTo", "Note", "Aliases",
     "candidateTerms", "ProposedEnglish",
+    "notes", "afterId", "kind", "zh", "correction", "text", "paragraphs", "id",
 ]
 
 
@@ -289,3 +290,58 @@ def parse_scout_reply(raw_response: str) -> tuple[list[dict], str | None]:
         if entry is not None:
             entries.append(entry)
     return entries, None
+
+
+MAX_REPAIR_ENTRIES = 200   # far more than one repair call asks for
+
+
+def chapter_value(value) -> int | None:
+    """Chapter number from 812, "812" or "Chapter 812"; None when unreadable."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    text = str(value or "").strip()
+    if text.isdecimal():
+        number = int(text)
+        return number if number > 0 else None
+    return parse_chapter_number(text)
+
+
+def _marker_value(value) -> int | None:
+    if isinstance(value, str) and value.strip().isdecimal():
+        value = int(value.strip())
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _repair_entry(item) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    chapter = chapter_value(item.get("chapterNo"))
+    marker = _marker_value(item.get("id"))
+    text = item.get("text")
+    if chapter is None or marker is None or not isinstance(text, str) or not text.strip():
+        return None
+    return {"chapter": chapter, "id": marker, "text": text.strip()}
+
+
+def parse_repair_reply(raw_response: str) -> tuple[list[dict], list[dict], str | None, int]:
+    """Paragraphs and notes from a repair reply. Returns (paragraphs, notes, error_message, unreadable).
+
+    Each paragraph is {"chapter", "id", "text"}; notes are returned as the model wrote them.
+    unreadable counts paragraph entries that were dropped as unusable.
+    """
+    parsed, err = _load_payload(raw_response)
+    if err:
+        return [], [], err, 0
+    items = parsed.get("paragraphs") if isinstance(parsed, dict) else None
+    if not isinstance(items, list):
+        return [], [], "'paragraphs' key must be a JSON array", 0
+    kept = items[:MAX_REPAIR_ENTRIES]
+    paragraphs = [p for p in (_repair_entry(item) for item in kept) if p is not None]
+    unreadable = len(items) - len(paragraphs)
+    raw_notes = parsed.get("notes")
+    notes = [n for n in raw_notes[:MAX_REPAIR_ENTRIES] if isinstance(n, dict)] if isinstance(raw_notes, list) else []
+    return paragraphs, notes, None, unreadable

@@ -44,6 +44,7 @@ def _queue_line(queue) -> str:
         f"In-flight {queue.get('in_flight', 0)}",
         f"Missing {queue.get('missing', 0)}",
         f"Failed {queue.get('failed', 0)}",
+        f"Incomplete {queue.get('incomplete', 0)}",
     ]
     if queue.get("manual"):
         parts.append(f"Manual {queue.get('manual')}")

@@ -293,6 +293,124 @@ def strip_markers(text) -> str:
 
 
 # ----------------------------------------------------------------------
+# Editing marked text (repair splices, note placement)
+# ----------------------------------------------------------------------
+
+def _is_break(text: str) -> bool:
+    """A line that starts a new paragraph instead of continuing the one above it."""
+    return bool(_split_marker(text) or _TN_RE.match(text) or _LINK_RE.match(text))
+
+
+def _next_filled(lines: list[str], start: int) -> int | None:
+    for index in range(max(0, start), len(lines)):
+        if lines[index].strip():
+            return index
+    return None
+
+
+def _unmarked_heading(lines: list[str]) -> int | None:
+    """Line of a heading written without its ⟦0⟧, when it opens the chapter."""
+    first = _next_filled(lines, 0)
+    if first is None:
+        return None
+    text = lines[first].strip()
+    return first if _HEADING_RE.match(text) and _split_marker(text) is None else None
+
+
+def _anchor_line(lines: list[str], marker: int) -> int | None:
+    """Line of the paragraph with the highest marker not above marker (its first copy)."""
+    best, best_marker = None, -1
+    for index, line in enumerate(lines):
+        found = _split_marker(line.strip())
+        if found is not None and best_marker < found[0] <= marker:
+            best, best_marker = index, found[0]
+    if best is None and marker >= TITLE_ID:
+        best = _unmarked_heading(lines)
+    return best
+
+
+def _paragraph_end(lines: list[str], start: int) -> int:
+    """Last line of the paragraph at start, including continuation lines and the TNs right after it."""
+    end = start
+    for index in range(start + 1, len(lines)):
+        text = lines[index].strip()
+        if not text or _is_break(text):
+            break
+        end = index
+    for _ in range(len(lines)):
+        following = _next_filled(lines, end + 1)
+        if following is None or not _TN_RE.match(lines[following].strip()):
+            break
+        end = following
+    return end
+
+
+def _end_line(lines: list[str]) -> int:
+    """Line after which a block goes when it belongs at the end: before a closing wikilink."""
+    for index in range(len(lines) - 1, -1, -1):
+        text = lines[index].strip()
+        if text:
+            return index - 1 if _LINK_RE.match(text) else index
+    return -1
+
+
+def _splice(lines: list[str], after: int, block: str) -> str:
+    """lines with block as its own paragraph after line `after` (-1 puts it first)."""
+    before = lines[:after + 1]
+    rest = lines[after + 1:]
+    middle = ([""] if before else []) + [block] + ([""] if rest and rest[0].strip() else [])
+    return _BLANK_RUN_RE.sub("\n\n", "\n".join(before + middle + rest)).strip()
+
+
+def insert_after(text, marker, block) -> str:
+    """text with block as its own paragraph after paragraph `marker`, or the nearest lower one present.
+
+    marker None puts the block at the end, before a closing wikilink. When no paragraph at or below
+    marker exists, the block goes first.
+    """
+    if not isinstance(text, str) or not isinstance(block, str) or not block.strip():
+        return text
+    lines = text.split("\n")
+    if marker is None:
+        return _splice(lines, _end_line(lines), block.strip())
+    anchor = _anchor_line(lines, marker)
+    after = _paragraph_end(lines, anchor) if anchor is not None else -1
+    return _splice(lines, after, block.strip())
+
+
+def _single_paragraph(text) -> str:
+    """Text as one paragraph: a leading marker removed, blank lines dropped."""
+    if not isinstance(text, str):
+        return ""
+    found = _split_marker(text.strip())
+    body = found[1] if found is not None else text
+    return "\n".join(line.strip() for line in body.splitlines() if line.strip())
+
+
+def insert_paragraph(text, marker: int, paragraph) -> str:
+    """text with '⟦marker⟧ paragraph' spliced in after the nearest lower marker present."""
+    if isinstance(marker, bool) or not isinstance(marker, int) or marker < 0:
+        raise ValueError(f"Invalid marker: {marker!r}")
+    body = _single_paragraph(paragraph)
+    if not body:
+        return text
+    return insert_after(text, marker - 1, f"⟦{marker}⟧ {body}")
+
+
+def remove_line(text, line) -> str:
+    """text without the first line equal to line (surrounding spaces ignored)."""
+    if not isinstance(text, str) or not isinstance(line, str) or not line.strip():
+        return text
+    target = line.strip()
+    lines = text.split("\n")
+    for index, current in enumerate(lines):
+        if current.strip() == target:
+            del lines[index]
+            return _BLANK_RUN_RE.sub("\n\n", "\n".join(lines)).strip()
+    return text
+
+
+# ----------------------------------------------------------------------
 # Descriptions for the batch log
 # ----------------------------------------------------------------------
 

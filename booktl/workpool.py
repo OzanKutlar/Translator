@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 KNOWN_PAGE_LIMIT = 2000   # unnumbered pages remembered so 'retry page:<id>' can find them
 MAX_SELECTION = 5000      # most chapters one retry/recover command may select
 STATE_VERSION = 1
-SELECTION_KEYWORDS = ("missing", "failed", "all")
+SELECTION_KEYWORDS = ("missing", "failed", "incomplete", "all")
 MAX_REASON_CHARS = 300
 
 
@@ -85,6 +85,7 @@ class PendingPool:
         self._known: dict[int, PageEntry] = {}
         self.missing: dict[str, dict] = {}
         self.failed: dict[str, dict] = {}
+        self.incomplete: dict[str, dict] = {}   # saved chapters that still have gaps
 
     # ------------------------------------------------------------------
     # Entries
@@ -242,27 +243,54 @@ class PendingPool:
             "time": time.time(),
         }
 
+    def _drop_elsewhere(self, key: str, keep: dict) -> None:
+        """A chapter is on at most one list: remove key from every list except keep."""
+        for records in (self.missing, self.failed, self.incomplete):
+            if records is not keep:
+                records.pop(key, None)
+
     def mark_missing(self, entries: list[PageEntry], batch, reason) -> None:
         with self._cond:
             for entry in entries:
-                self.failed.pop(entry.key, None)
+                self._drop_elsewhere(entry.key, self.missing)
                 self.missing[entry.key] = self._record(entry, batch, reason)
 
     def mark_failed(self, entries: list[PageEntry], batch, reason) -> None:
         with self._cond:
             for entry in entries:
-                self.missing.pop(entry.key, None)
+                self._drop_elsewhere(entry.key, self.failed)
                 self.failed[entry.key] = self._record(entry, batch, reason)
 
+    def mark_incomplete(self, chapters, batch) -> None:
+        """chapters: (chapter number, reason) pairs for saved chapters that still have gaps."""
+        with self._cond:
+            for chapter, reason in chapters or []:
+                if isinstance(chapter, bool) or not isinstance(chapter, int) or chapter <= 0:
+                    continue
+                key = str(chapter)
+                self._drop_elsewhere(key, self.incomplete)
+                self.incomplete[key] = {
+                    "chapter": chapter,
+                    "label": f"Chapter {chapter}",
+                    "batch": batch,
+                    "reason": str(reason)[:MAX_REASON_CHARS],
+                    "time": time.time(),
+                }
+
     def forget(self, keys) -> int:
-        """Drop keys from both lists (translated again, or re-queued). Returns records removed."""
+        """Drop keys from every list (translated again, or re-queued). Returns records removed."""
         removed = 0
         with self._cond:
             for key in keys:
                 text = str(key)
-                removed += int(self.missing.pop(text, None) is not None)
-                removed += int(self.failed.pop(text, None) is not None)
+                for records in (self.missing, self.failed, self.incomplete):
+                    removed += int(records.pop(text, None) is not None)
         return removed
+
+    def incomplete_records(self) -> dict:
+        """Copy of the Incomplete records."""
+        with self._cond:
+            return {k: dict(v) for k, v in self.incomplete.items()}
 
     def problems(self) -> tuple[dict, dict]:
         """Copies of the (missing, failed) records."""
@@ -274,17 +302,24 @@ class PendingPool:
 
     def export_state(self) -> dict:
         missing, failed = self.problems()
-        return {"version": STATE_VERSION, "missing": missing, "failed": failed}
+        return {
+            "version": STATE_VERSION,
+            "missing": missing,
+            "failed": failed,
+            "incomplete": self.incomplete_records(),
+        }
 
     def import_state(self, state) -> int:
-        """Replace Missing/Failed with records from disk. Returns how many were loaded."""
+        """Replace Missing/Failed/Incomplete with records from disk. Returns how many were loaded."""
         state = state if isinstance(state, dict) else {}
         missing = _clean_records(state.get("missing"))
         failed = _clean_records(state.get("failed"))
+        incomplete = _clean_records(state.get("incomplete"))
         with self._cond:
             self.missing = missing
             self.failed = failed
-        return len(missing) + len(failed)
+            self.incomplete = incomplete
+        return len(missing) + len(failed) + len(incomplete)
 
 
 # ----------------------------------------------------------------------
@@ -339,7 +374,7 @@ def _parse_token(token: str, selection: Selection, chapters: set[int]) -> None:
     match = _RANGE_RE.match(token)
     if not match:
         selection.errors.append(
-            f"Could not read '{token}'. Use e.g. 120, 112-115, ch120, missing, failed or page:<id>."
+            f"Could not read '{token}'. Use e.g. 120, 112-115, ch120, missing, failed, incomplete or page:<id>."
         )
         return
     start = int(match.group(1))

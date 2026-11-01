@@ -76,6 +76,7 @@ class Config:
         self._host = "127.0.0.1"
         self._port = 5001
         self._term_lookup = True
+        self._repair = True
 
     @property
     def base_url(self) -> str:
@@ -259,6 +260,17 @@ class Config:
             self._term_lookup = bool(val)
 
     @property
+    def repair(self) -> bool:
+        """Ask again for paragraphs a reply left out before the chapter is saved."""
+        with self._lock:
+            return self._repair
+
+    @repair.setter
+    def repair(self, val: bool):
+        with self._lock:
+            self._repair = bool(val)
+
+    @property
     def host(self) -> str:
         with self._lock:
             return self._host
@@ -313,6 +325,10 @@ class Config:
         lookup_env = os.environ.get("TL_TERM_LOOKUP", "").strip().lower()
         lookup_off = bool(getattr(args, "no_term_lookup", False)) or lookup_env in ("0", "off", "false", "no")
         cfg.term_lookup = not lookup_off
+
+        repair_env = os.environ.get("TL_REPAIR", "").strip().lower()
+        repair_off = bool(getattr(args, "no_repair", False)) or repair_env in ("0", "off", "false", "no")
+        cfg.repair = not repair_off
 
         port = getattr(args, "port", None) or os.environ.get("TL_PORT") or 5001
         cfg._port = int(port)

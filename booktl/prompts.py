@@ -33,7 +33,7 @@ SYSTEM_PROMPT = (
     "must appear in the translation.\n"
     "  - Do not correct the author's plot, continuity or factual mistakes (a wrong name, a wrong number, "
     "a contradiction with earlier chapters). Translate them as written; if a mistake would clearly confuse "
-    "readers, add a TN.\n"
+    "readers, add a note (see TRANSLATOR'S NOTES).\n"
     "  - Do not soften, censor or sanitize content.\n\n"
 
     "If a passage is genuinely ambiguous, choose the most plausible reading. Add a TN only when the passage "
@@ -55,27 +55,43 @@ SYSTEM_PROMPT = (
     "  - If a marked paragraph must not be translated (an author's note, a site notice or a book recommendation "
     "that slipped through), write its marker followed by [SKIP: reason], e.g. "
     "⟦31⟧ [SKIP: author's note about the update schedule]. Never leave a paragraph out without this declaration.\n"
-    "  - Translator's Notes and the next-chapter wikilink are the only lines without a marker.\n"
+    "  - The next-chapter wikilink is the only line without a marker. Translator's Notes never go in the text "
+    "(see TRANSLATOR'S NOTES).\n"
     "  - Text under a line reading [After the chapter, not for translation] is shown only as evidence for "
     "ARC / VOLUME ENDINGS. Never translate it and never put a marker on it.\n"
     "The markers are how missing paragraphs are found. They are checked and removed automatically.\n\n"
 
-    "Translate each page as a separate chapter. "
-    "If you find any jokes that are unique to the Chinese language and might not translate well, "
-    "place a * directly after the joke and then add a Translator's Note (TN:) on its own unmarked line "
-    "directly after the paragraph that contains the joke. Wrap every TN in parentheses. "
-    "Never collect TNs at the end of the chapter.\n\n"
+    "Translate each page as a separate chapter.\n\n"
 
-    "Correct TN placement example (with the paragraph markers your reply carries):\n\n"
+    "=== TRANSLATOR'S NOTES ===\n"
+    "Never write a Translator's Note inside the chapter text. Put each note in the chapter object's \"notes\" "
+    "list; the software places it on its own line directly after the paragraph it belongs to.\n"
+    "When a joke is unique to the Chinese language and might not translate well, place a * directly after the "
+    "joke in the text and add a note for it.\n"
+    "Each note has exactly these fields:\n"
+    "  \"afterId\"    : the marker number of the paragraph the note belongs to (e.g. 17)\n"
+    "  \"kind\"       : \"pun\" (wordplay), \"culture\" (cultural or historical background), \"term\" (a term "
+    "rendered differently from earlier chapters, see PRIOR USAGE) or \"source\" (an error in the Chinese text)\n"
+    "  \"zh\"         : the exact Chinese text the note is about, copied from that paragraph\n"
+    "  \"correction\" : only for \"source\" notes, the Chinese the author evidently meant; otherwise \"\"\n"
+    "  \"text\"       : the note itself, starting with (TN: and ending with )\n"
+    "Rules:\n"
+    "  - Write a \"source\" note only for an obvious input typo of one or two characters that would confuse "
+    "readers, and only when you can name the exact characters. Never guess and never invent a correction.\n"
+    "  - Never write a note that only says the text was translated or kept as written.\n"
+    "Notes are checked automatically. A note that breaks these rules is removed, and the removal is reported.\n\n"
+
+    "Correct note example. The chapter text contains:\n\n"
     "⟦14⟧ her magnificent assets once again jiggled violently up and down.\n\n"
     "⟦15⟧ Han Xing then said with a smile, \"Why do I feel like you should have chosen a class like Cleric.\"\n\n"
     "⟦16⟧ Zhang Lianmeng looked puzzled. \"Hmm? Why's that?\"\n\n"
     "⟦17⟧ \"Because you can heal others.\"*\n\n"
-    "(TN: The Chinese word for \"heal\" in gaming slang is 奶 (nai), which literally means \"milk.\" "
-    "This is a pun referring to both the Cleric's healing role (often called a \"healer\" or \"奶妈\" - "
-    "naima, literally \"milk mom\") and her large bust.)\n\n"
     "⟦18⟧ Zhang Lianmeng seemed to understand the meaning behind Han Xing's words, "
     "and her face instantly turned bright red.\n\n"
+    "and the chapter's \"notes\" list holds:\n"
+    "{\"afterId\": 17, \"kind\": \"pun\", \"zh\": \"奶\", \"correction\": \"\", \"text\": \"(TN: In gaming slang "
+    "the word for heal is 奶 (nai), which literally means milk. This is a pun on the Cleric's healing role and "
+    "her large bust.)\"}\n\n"
 
     "At the end of each translated chapter, add a wikilink to the next chapter on its own line, "
     "e.g. if translating Chapter 12 end with: [[Chapter 13]]\n\n"
@@ -173,20 +189,23 @@ SYSTEM_PROMPT = (
     "  \"arcEnds\"          : an array of arc/volume ending objects (almost always an empty list)\n"
     "  \"termActions\"      : an array of term action objects (or empty list)\n\n"
 
-    "Each chapter object must have exactly these two fields:\n"
+    "Each chapter object must have exactly these three fields:\n"
     "  \"chapterNo\" : the chapter identifier string  (e.g. \"Chapter 1615\")\n"
-    "  \"content\"   : the full translated Markdown text of that chapter\n\n"
+    "  \"content\"   : the full translated Markdown text of that chapter, with no Translator's Notes in it\n"
+    "  \"notes\"     : the chapter's Translator's Notes (see TRANSLATOR'S NOTES), usually an empty list\n\n"
 
     "Example response:\n"
     "{\n"
     "  \"chapters\": [\n"
     "    {\n"
     "      \"chapterNo\": \"Chapter 1\",\n"
-    "      \"content\": \"⟦0⟧ # Chapter 1: The Beginning\\n\\n⟦1⟧ Li Yao extended his right index finger...\\n\\n[[Chapter 2]]\"\n"
+    "      \"content\": \"⟦0⟧ # Chapter 1: The Beginning\\n\\n⟦1⟧ Li Yao extended his right index finger...\\n\\n[[Chapter 2]]\",\n"
+    "      \"notes\": []\n"
     "    },\n"
     "    {\n"
     "      \"chapterNo\": \"Chapter 2\",\n"
-    "      \"content\": \"⟦0⟧ # Chapter 2: The Next Step\\n\\n⟦1⟧ She looked up at the horizon...\\n\\n[[Chapter 3]]\"\n"
+    "      \"content\": \"⟦0⟧ # Chapter 2: The Next Step\\n\\n⟦1⟧ She looked up at the horizon...\\n\\n[[Chapter 3]]\",\n"
+    "      \"notes\": []\n"
     "    }\n"
     "  ],\n"
     "  \"characterActions\": [\n"
@@ -238,7 +257,7 @@ PRIOR_USAGE_INTRO = (
     "rendering and put the other one in Note, e.g. 'also written as X in Chapter 612'.\n"
     "  3. Only if the earlier rendering clearly does not fit the current context (for example the term means "
     "something different here), use a better rendering, register that one, put 'previously written as X' in Note, "
-    "and after the paragraph where it first appears add: "
+    "and add a note of kind \"term\" after the paragraph where it first appears, with the text: "
     "(TN: This was written as X in earlier chapters, but Y fits the current context better.)\n"
     "  4. If an excerpt does not show the term at all, ignore that excerpt."
 )
@@ -281,7 +300,7 @@ PRIOR_USAGE_FOLLOWUP = (
     "wins: use its rendering and put the other one in Note, e.g. 'also written as X in Chapter 612'.\n"
     "  3. Only if the earlier rendering clearly does not fit the current context (for example the term means "
     "something different here), use a better rendering, register that one, put 'previously written as X' in Note, "
-    "and after the paragraph where it first appears add: "
+    "and add a note of kind \"term\" after the paragraph where it first appears, with the text: "
     "(TN: This was written as X in earlier chapters, but Y fits the current context better.)\n"
     "  4. If an excerpt does not show the term at all, ignore that excerpt."
 )
@@ -294,6 +313,7 @@ NO_PRIOR_USAGE_FOLLOWUP = (
 TRANSLATE_NOW = (
     "Now translate the pages from my previous message, following the system instructions exactly. "
     "Start every paragraph with its ⟦n⟧ marker, and declare any paragraph you leave out with [SKIP: reason]. "
+    "Put Translator's Notes in each chapter's \"notes\" list, never in the text. "
     'Respond with ONLY the JSON object with the four keys "chapters", "characterActions", '
     '"arcEnds" and "termActions".'
 )
@@ -401,4 +421,36 @@ def build_translation_followup(scout_messages, scout_reply, prior_usage: str = "
     messages = [dict(m) for m in scout_messages]
     messages.append({"role": "assistant", "content": scout_reply.strip()})
     messages.append({"role": "user", "content": _followup_text(prior_usage or "")})
+    return messages
+
+
+# User turn of a repair call (see build_repair_messages and repair.py).
+REPAIR_TURN = (
+    "Some paragraphs were left out of your translation. For THIS reply only, ignore the RESPONSE FORMAT in "
+    "the system instructions.\n\n"
+    "Below, each chapter lists its missing paragraphs (EN: MISSING) together with neighbouring paragraphs. "
+    "The neighbours show the Chinese and the English already written; they are context only, so do not "
+    "translate them again.\n"
+    "Translate every missing paragraph so it fits between its neighbours, following the system instructions, "
+    "the LOCKED TERMS and the known character names. If a missing paragraph must not be translated, "
+    "give [SKIP: reason] as its text.\n\n"
+    "RESPONSE FORMAT FOR THIS REPLY - respond with ONLY a valid JSON object. No preamble, no explanation, "
+    "no markdown code fences.\n"
+    '{"paragraphs": [{"chapterNo": "Chapter 812", "id": 14, "text": "The English paragraph, without its marker"}], '
+    '"notes": []}\n'
+    "\"notes\" follows the TRANSLATOR'S NOTES rules, with an added \"chapterNo\" field in each note. "
+    "Leave it empty unless a missing paragraph needs a note."
+)
+
+
+def build_repair_messages(book_dir: str, request_text: str, chinese_text: str = "") -> list[dict]:
+    """Repair call: the translation instructions, book context for these paragraphs, and the repair request."""
+    if not isinstance(request_text, str) or not request_text.strip():
+        raise ValueError("request_text must be a non-empty string")
+    context = chinese_text if isinstance(chinese_text, str) else ""
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    blocks = _context_blocks(book_dir, context)
+    if blocks:
+        messages.append({"role": "system", "content": "\n\n".join(blocks)})
+    messages.append({"role": "user", "content": f"{REPAIR_TURN}\n\n{request_text}"})
     return messages
