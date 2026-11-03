@@ -265,6 +265,7 @@ Before a batch is sent, each page is split into its title line, its story paragr
 - The markers are removed before the chapter is saved, so the `.md` files look the same as before. The pairing is kept in `<Book>/_align/ch_000120.json`. A chapter translated again without markers loses its old alignment file, and the batch log says so.
 - The prior-usage lookup and `terms audit` use the alignment file when a chapter has one and show the exact paragraph (`exact aligned paragraph`) instead of a position estimate.
 - `manual` copies the marked pages; `paste` checks the reply against the open manual session's pages, or against the stored raw page when no session is open.
+- Every translation request (and the `manual` prompt) ends with a note naming the chapter of each page, in order, e.g. `NOTE: … You are translating Chapters 496–500, one page per chapter, in this order: page 1 = Chapter 496, …`. The numbers come from the tool's own `第N章` detection, so a site index in front of the title (`503.第500章`) cannot shift the chapter numbers.
 - Extend `END_MARKERS` / `BOILERPLATE` in `booktl/segments.py` for other sites.
 
 ### Translator's Notes

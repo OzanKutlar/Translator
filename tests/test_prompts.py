@@ -65,5 +65,37 @@ class ConversationTests(unittest.TestCase):
         self.assertIs(prompts.build_scout_messages, prompts.build_scout_conversation)
 
 
+class ChapterNoteTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.book = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_note_lists_pages_in_order(self):
+        note = prompts.chapter_note([496, 497, None, 499])
+        self.assertIn("Chapters 496–497, 499", note)
+        self.assertIn("page 1 = Chapter 496", note)
+        self.assertIn("page 3 = number unknown", note)
+        self.assertIn("page 4 = Chapter 499", note)
+
+    def test_no_known_numbers_gives_no_note(self):
+        self.assertEqual(prompts.chapter_note([None, None]), "")
+        self.assertEqual(prompts.chapter_note([]), "")
+        self.assertEqual(prompts.chapter_note("496"), "")
+
+    def test_note_ends_every_translation_request(self):
+        note = prompts.chapter_note([120])
+        single = prompts.build_messages(self.book, PAGES, note=note)[-1]["content"]
+        self.assertTrue(single.endswith(note))
+        scout = prompts.build_scout_conversation(self.book, PAGES)
+        self.assertNotIn(note, scout[-1]["content"])
+        for usage in ("", USAGE):
+            last = prompts.build_translation_followup(scout, REPLY, usage, note)[-1]["content"]
+            self.assertTrue(last.endswith(note))
+        self.assertTrue(prompts.build_manual_prompt(self.book, PAGES, note).endswith(note))
+
+
 if __name__ == "__main__":
     unittest.main()

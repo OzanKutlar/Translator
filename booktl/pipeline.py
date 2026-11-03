@@ -690,7 +690,8 @@ class Pipeline:
                 return None, "Nothing is pending. No pages to translate."
             try:
                 prompt = prompts.build_manual_prompt(
-                    self.cfg.book_dir, self._mark_entries(entries)[0]
+                    self.cfg.book_dir, self._mark_entries(entries)[0],
+                    prompts.chapter_note([e.chapter for e in entries]),
                 )
             except Exception:
                 self.pool.add(entries, front=True)  # never lose pages if prompt building fails
@@ -1102,7 +1103,8 @@ class Pipeline:
         cancelled_note = f"{label}: cancelled during the term query; nothing was translated (pages are back in the pending pool)."
         try:
             scout = self._scout_terms(label, entries, pages_text, token)
-            messages = self._translation_messages(pages_text, scout)
+            note = prompts.chapter_note([e.chapter for e in entries])
+            messages = self._translation_messages(pages_text, scout, note)
         except ApiCancelled:
             con.dim(cancelled_note)
             return
@@ -1623,17 +1625,17 @@ class Pipeline:
         batch_chapters = {e.chapter for e in entries if e.chapter is not None}
         return termlookup.build_prior_usage(self.corpus, book_dir, candidates, batch_chapters)
 
-    def _translation_messages(self, pages_text: str, scout: ScoutOutcome) -> list[dict]:
+    def _translation_messages(self, pages_text: str, scout: ScoutOutcome, note: str = "") -> list[dict]:
         """Continue the term-query conversation, or build one plain call when no term query ran.
 
         Raises ScoutFailed when a term query ran but its conversation cannot be continued.
         """
         if not scout.ran:
-            return prompts.build_messages(self.cfg.book_dir, pages_text)
+            return prompts.build_messages(self.cfg.book_dir, pages_text, note=note)
         if not scout.usable:
             raise ScoutFailed("the term query left no conversation to continue", scout.reply, retryable=False)
         try:
-            return prompts.build_translation_followup(scout.messages, scout.reply, scout.lookup.context)
+            return prompts.build_translation_followup(scout.messages, scout.reply, scout.lookup.context, note)
         except ValueError as e:
             raise ScoutFailed(f"could not continue the term-query conversation: {e}", scout.reply, retryable=False) from e
 

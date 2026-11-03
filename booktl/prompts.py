@@ -1,6 +1,9 @@
 """System prompt definitions and message building logic."""
 
 from . import arcs, characters, glossary, style
+from .parsing import format_chapter_ranges
+
+MAX_NOTE_PAGES = 100   # pages listed one by one in the chapter note
 
 SYSTEM_PROMPT = (
     "You are a professional literary translator (Chinese to English) working for a book translation company. "
@@ -386,7 +389,43 @@ def book_context(book_dir: str, chinese_text: str) -> str:
     return "\n\n".join(_context_blocks(book_dir, chinese_text))
 
 
-def build_messages(book_dir: str, pages_text: str, prior_usage: str = "") -> list[dict]:
+def _page_text(number: int, chapter) -> str:
+    if chapter is None:
+        return f"page {number} = number unknown, use the number in its 第…章 title"
+    return f"page {number} = Chapter {chapter}"
+
+
+def chapter_note(chapters) -> str:
+    """NOTE naming the chapter of every page, in order; '' when no page has a known number.
+
+    chapters lists each page's chapter number in the order the pages are sent (None when unknown).
+    """
+    if not isinstance(chapters, (list, tuple)):
+        return ""
+    numbers = [
+        c if isinstance(c, int) and not isinstance(c, bool) and c > 0 else None
+        for c in chapters[:MAX_NOTE_PAGES]
+    ]
+    known = [n for n in numbers if n is not None]
+    if not known:
+        return ""
+    pages = ", ".join(_page_text(i, n) for i, n in enumerate(numbers, start=1))
+    return (
+        "NOTE: The chapter numbers printed on the pages might be wrong. "
+        f"You are translating {format_chapter_ranges(known)}, one page per chapter, in this order: {pages}. "
+        "Use exactly these numbers in \"chapterNo\", in each \"# Chapter X:\" heading and in each "
+        "[[Chapter X+1]] link. Ignore any other number on a page, such as a site index in front of the "
+        "title line (\"503.第500章\" is Chapter 500)."
+    )
+
+
+def _with_note(text: str, note) -> str:
+    """text followed by the chapter note, when there is one."""
+    clean = note.strip() if isinstance(note, str) else ""
+    return f"{text}\n\n{clean}" if clean else text
+
+
+def build_messages(book_dir: str, pages_text: str, prior_usage: str = "", note: str = "") -> list[dict]:
     """Construct clean OpenAI-style role messages. prior_usage comes from termlookup."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
@@ -397,16 +436,16 @@ def build_messages(book_dir: str, pages_text: str, prior_usage: str = "") -> lis
 
     messages.append({
         "role": "user",
-        "content": f"=== BEGIN PAGES ===\n\n{pages_text}\n\n=== END PAGES ==="
+        "content": _with_note(f"=== BEGIN PAGES ===\n\n{pages_text}\n\n=== END PAGES ===", note)
     })
     return messages
 
 
-def build_manual_prompt(book_dir: str, pages_text: str) -> str:
+def build_manual_prompt(book_dir: str, pages_text: str, note: str = "") -> str:
     """Construct a single unified text string for manual clipboard export."""
     parts = [SYSTEM_PROMPT, *_context_blocks(book_dir, pages_text)]
 
-    parts.append(f"=== BEGIN PAGES ===\n\n{pages_text}\n\n=== END PAGES ===")
+    parts.append(_with_note(f"=== BEGIN PAGES ===\n\n{pages_text}\n\n=== END PAGES ===", note))
     return "\n\n".join(parts)
 
 
@@ -439,15 +478,16 @@ def _is_message(message) -> bool:
     return isinstance(message, dict) and message.get("role") in _ROLES and isinstance(message.get("content"), str)
 
 
-def _followup_text(prior_usage: str) -> str:
-    """The user turn after the scout reply: prior-usage results (if any), then the translation request."""
+def _followup_text(prior_usage: str, note: str = "") -> str:
+    """The user turn after the scout reply: prior-usage results (if any), the translation request, the chapter note."""
     body = prior_usage.strip()
     if not body:
-        return f"{NO_PRIOR_USAGE_FOLLOWUP}\n\n{TRANSLATE_NOW}"
-    return f"{PRIOR_USAGE_FOLLOWUP}\n\n=== PRIOR USAGE ===\n{body}\n=== END PRIOR USAGE ===\n\n{TRANSLATE_NOW}"
+        return _with_note(f"{NO_PRIOR_USAGE_FOLLOWUP}\n\n{TRANSLATE_NOW}", note)
+    text = f"{PRIOR_USAGE_FOLLOWUP}\n\n=== PRIOR USAGE ===\n{body}\n=== END PRIOR USAGE ===\n\n{TRANSLATE_NOW}"
+    return _with_note(text, note)
 
 
-def build_translation_followup(scout_messages, scout_reply, prior_usage: str = "") -> list[dict]:
+def build_translation_followup(scout_messages, scout_reply, prior_usage: str = "", note: str = "") -> list[dict]:
     """Translation call that continues the scout conversation.
 
     Returns a new list: the scout messages unchanged, the scout reply as the assistant's turn, and a
@@ -465,7 +505,9 @@ def build_translation_followup(scout_messages, scout_reply, prior_usage: str = "
         raise ValueError("prior_usage must be a string")
     messages = [dict(m) for m in scout_messages]
     messages.append({"role": "assistant", "content": scout_reply.strip()})
-    messages.append({"role": "user", "content": _followup_text(prior_usage or "")})
+    if note is not None and not isinstance(note, str):
+        raise ValueError("note must be a string")
+    messages.append({"role": "user", "content": _followup_text(prior_usage or "", note or "")})
     return messages
 
 
