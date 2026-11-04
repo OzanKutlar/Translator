@@ -5,17 +5,22 @@
   python audit.py --middle 20 --dry-run    print the commands and save the findings only
 
 Pick a book and a range as in inquire.py. Every chapter in the range is checked from disk (no model is
-called unless --align is given). The chapters with problems are listed, their findings are saved to
+called unless --align is given). The chapters with problems are listed, the prompt is saved to
 <Book>/_qa/audit/audit_<time>.md, and combineCopy runs with --prompt-pipe and the English file and raw
-page of each problem chapter, with the findings piped in as the prompt:
+page of every chapter in the range, with the prompt piped in:
 
   combineCopy --prompt-pipe './Book/Chapter 812.md' './Book/_raw/chapters/ch_000812.txt' …
 
 Findings larger than combineCopy's 2 MB limit, or a command line too long for Windows, are split into
 parts by chapter; the script waits for Enter between parts.
+
+The prompt also asks the model to add translator's notes the translation is missing (poem and film
+sources, title references, author slips, source typos). The notes go inline, so auditor's [note]
+findings are left out. With --no-extra-tns, only problem chapters are sent and no notes are asked for.
 """
 
 import argparse
+import dataclasses
 import os
 import sys
 import time
@@ -47,6 +52,30 @@ PS_NOTE = (
     "else { combineCopy.exe @args } }\n"
     "The findings are also saved to {path}."
 )
+NOTE_KIND = "note"
+CLEAN_CHAPTER_NOTE = "No automatic findings. Check this chapter only for missing translator's notes."
+EXTRA_TN_INSTRUCTIONS = """\
+## Missing translator's notes
+Also read each chapter for places an English reader would miss something a Chinese reader would catch,
+where the translation has no (TN: ...) yet. Add a note for:
+- lines taken from poems, songs, classics or films (name the work and its author);
+- idioms, sayings or wordplay whose meaning does not come through in English;
+- references to the novel's own title, or to real people, places and events;
+- author slips the translation copies or quietly fixes, such as a count that does not match its list or a
+  number that contradicts an earlier chapter;
+- typos in the source that change how a line reads.
+
+Rules:
+- Put each note in its own paragraph right after the paragraph it explains, as (TN: ...).
+  There is no separate notes list.
+- Quote the exact Chinese characters you explain, so a reviewer can find them in the raw page.
+- Keep each note to one or two short sentences of plain English.
+- State only what you can check against the raw page or a well-known source. If you are unsure where a
+  line comes from, leave the note out.
+- Skip places where the English already makes the meaning clear, and do not repeat a note the chapter has.
+- Quote at most one line of a poem or song inside a note.
+- For each note, give the English paragraph to find, and that paragraph followed by the note as the
+  replacement."""
 
 
 # ----------------------------------------------------------------------
@@ -63,6 +92,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--command", default=DEFAULT_COMMAND, help="Command to run (default: combineCopy)")
     parser.add_argument("--findings-out", help="Where to save the findings (default: <Book>/_qa/audit/audit_<time>.md)")
     parser.add_argument("--instructions", help="File with your own instructions to put above the findings")
+    parser.add_argument("--no-extra-tns", action="store_true",
+                        help="Do not ask for missing translator's notes; send only problem chapters")
     parser.add_argument("--max-prompt-bytes", type=int, default=DEFAULT_PROMPT_BYTES,
                         help=f"Largest prompt per combineCopy run (at most {combine.PIPE_LIMIT_BYTES:,})")
     parser.add_argument("--align", action="store_true", help="First build paragraph alignments for chapters without one (one model call each)")
@@ -73,7 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _instructions(path) -> str:
+def _base_instructions(path) -> str:
     """Instructions text from --instructions, or the default. Raises OSError/ValueError."""
     if not path:
         return auditor.DEFAULT_INSTRUCTIONS
@@ -82,6 +113,14 @@ def _instructions(path) -> str:
     if not text or len(text) > MAX_INSTRUCTIONS_CHARS:
         raise ValueError(f"Instructions must be 1–{MAX_INSTRUCTIONS_CHARS:,} characters long.")
     return text
+
+
+def _instructions(path, extra_tns: bool) -> str:
+    """Base instructions, with the missing-TN request added unless turned off. Raises OSError/ValueError."""
+    base = _base_instructions(path)
+    if not extra_tns:
+        return base
+    return base.rstrip() + "\n\n" + EXTRA_TN_INSTRUCTIONS
 
 
 # ----------------------------------------------------------------------
@@ -130,11 +169,20 @@ def run_alignment(args, book_dir: str, book: str, chapters: list, translated: di
 # Audit and report
 # ----------------------------------------------------------------------
 
+def _drop_note_findings(audit):
+    """The audit without [note] findings: TNs stay inline here, so auditor's notes-list advice does not apply."""
+    if audit.error or not any(f.kind == NOTE_KIND for f in audit.findings):
+        return audit
+    kept = [f for f in audit.findings if f.kind != NOTE_KIND]
+    return dataclasses.replace(audit, findings=kept)
+
+
 def audit_range(book_dir: str, chapters: list, translated: dict) -> list:
     ctx = auditor.load_context(book_dir)
     for warning in ctx.warnings[:MAX_LISTED_ERRORS]:
         con.warn(escape(warning))
-    return [auditor.audit_chapter(book_dir, c, os.path.join(book_dir, translated[c]), ctx) for c in chapters]
+    audits = [auditor.audit_chapter(book_dir, c, os.path.join(book_dir, translated[c]), ctx) for c in chapters]
+    return [_drop_note_findings(a) for a in audits]
 
 
 def _kinds(audit) -> str:
@@ -163,12 +211,25 @@ def print_summary(audits: list) -> list:
     return problems
 
 
-def _blocks(library: str, book: str, translated: dict, problems: list) -> list:
+def _render_clean(chapter: int, files: list) -> str:
+    names = ", ".join(str(f) for f in files)
+    return f"## Chapter {chapter}\nFiles: {names}\n{CLEAN_CHAPTER_NOTE}"
+
+
+def _blocks(library: str, book: str, translated: dict, audits: list) -> list:
     blocks = []
-    for audit in problems:
+    for audit in audits:
         files = combine.collect_files(library, book, translated, audit.chapter, audit.chapter).files
-        blocks.append((audit.chapter, auditor.render_chapter(audit, files), files))
+        text = auditor.render_chapter(audit, files) if audit.problems else _render_clean(audit.chapter, files)
+        blocks.append((audit.chapter, text, files))
     return blocks
+
+
+def _chapters_to_send(audits: list, problems: list, extra_tns: bool) -> list:
+    """Every readable chapter when asking for TNs, otherwise only the problem chapters."""
+    if not extra_tns:
+        return problems
+    return [a for a in audits if not a.error]
 
 
 def _fits_function(command: str, windows: bool):
@@ -295,16 +356,16 @@ def _select(args, library: str):
     return book, translated, chapters
 
 
-def _plan(args, book: str, library: str, translated: dict, problems: list, instructions: str):
+def _plan(args, book: str, library: str, translated: dict, audits: list, instructions: str):
     windows = os.name == "nt"
     try:
         combine.build_pipe_command(args.command, [], windows)
         fits, command_error = _fits_function(args.command, windows), ""
     except (FileNotFoundError, ValueError) as e:
         fits, command_error = (lambda files: True), str(e)
-    reserve = len(auditor.render_header(book, [c.chapter for c in problems], 99, 99, instructions).encode("utf-8")) + HEADER_SLACK
+    reserve = len(auditor.render_header(book, [c.chapter for c in audits], 99, 99, instructions).encode("utf-8")) + HEADER_SLACK
     limit = max(reserve + 1, min(args.max_prompt_bytes, combine.PIPE_LIMIT_BYTES))
-    parts = auditor.plan_parts(_blocks(library, book, translated, problems), limit, reserve, fits)
+    parts = auditor.plan_parts(_blocks(library, book, translated, audits), limit, reserve, fits)
     return parts, _prompts(book, parts, instructions), command_error
 
 
@@ -313,8 +374,9 @@ def run(args) -> int:
     if not os.path.isdir(library):
         con.fail(f"Library folder not found: {escape(library)}")
         return EXIT_USER
+    extra_tns = not args.no_extra_tns
     try:
-        instructions = _instructions(args.instructions)
+        instructions = _instructions(args.instructions, extra_tns)
     except (OSError, ValueError) as e:
         con.fail(f"Could not use the instructions file: {escape(str(e))}")
         return EXIT_USER
@@ -326,11 +388,13 @@ def run(args) -> int:
     con.ok(f"[bold green]{escape(book)}[/bold green]: auditing {escape(format_chapter_ranges(chapters))}")
     if args.align and not run_alignment(args, book_dir, book, chapters, translated):
         con.warn("Alignment cancelled; auditing with the alignments that exist.")
-    problems = print_summary(audit_range(book_dir, chapters, translated))
-    if not problems:
-        con.ok("No problem chapters; nothing to send.")
+    audits = audit_range(book_dir, chapters, translated)
+    problems = print_summary(audits)
+    to_send = _chapters_to_send(audits, problems, extra_tns)
+    if not to_send:
+        con.ok("Nothing to send." if extra_tns else "No problem chapters; nothing to send.")
         return EXIT_OK
-    parts, prompts, command_error = _plan(args, book, library, translated, problems, instructions)
+    parts, prompts, command_error = _plan(args, book, library, translated, to_send, instructions)
     findings_path = _findings_path(args, book_dir)
     save_findings(findings_path, prompts)
     if command_error:
@@ -339,7 +403,8 @@ def run(args) -> int:
     if args.dry_run:
         _print_dry_run(parts, prompts, args.command, os.name == "nt", library)
         return EXIT_OK
-    question = f"Send {len(problems)} problem chapter(s) to {args.command} in {len(parts)} part(s)? [Y/n]: "
+    question = (f"Send {len(to_send)} chapter(s) ({len(problems)} with problems) to {args.command} "
+                f"in {len(parts)} part(s)? [Y/n]: ")
     if not args.yes and not confirm(question):
         con.warn("Cancelled; the findings are saved.")
         return EXIT_USER
