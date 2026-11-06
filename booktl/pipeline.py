@@ -40,6 +40,7 @@ SCOUT_ATTEMPTS = 2             # a failed term query is re-sent once, then the b
 MAX_LISTED_NAMES = 5           # names listed in one log line before "…"
 MAX_LISTED_TERMS = 3           # terms listed in one warning line before "N more"
 ONE_LINE_CHARS = 160           # longest error text shown on the console
+MIN_CHAPTERS_FOR_NOTE_CHECK = 3  # batches this size with no culture or pun note get an information line
 
 
 def _is_saveable(entry) -> bool:
@@ -1310,18 +1311,36 @@ class Pipeline:
         for work in works:
             qa.place_notes(work, report)
         self._log_notes(log, report)
+        self._log_note_coverage(log, works, report)
         return [work.finished() for work in works] + list(extras)
 
     @staticmethod
+    def _log_note_coverage(log: BatchLog, works: list, report) -> None:
+        """Information line when a batch of several chapters carries no culture or pun note at all."""
+        chapters = sum(1 for work in works if work.parts is not None)
+        explanatory = report.kinds.get("culture", 0) + report.kinds.get("pun", 0) + report.inline
+        if chapters >= MIN_CHAPTERS_FOR_NOTE_CHECK and not explanatory:
+            log.detail(
+                f"[dim]No culture or pun notes in {chapters} chapters; any idioms, proverbs or allusions "
+                "in these pages were left unexplained[/dim]"
+            )
+
+    @staticmethod
     def _log_notes(log: BatchLog, report) -> None:
-        """One line for placed notes; warnings for notes left inside the text and for removed notes."""
+        """One line for placed notes by kind; warnings for notes left inside the text and for removed notes."""
         placed = []
         if report.placed:
-            placed.append(f"placed {_plural(report.placed, 'note', 'notes')} after their paragraphs")
+            kinds = ", ".join(f"{count} {kind}" for kind, count in sorted(report.kinds.items()))
+            by_kind = f" ({kinds})" if kinds else ""
+            placed.append(f"placed {_plural(report.placed, 'note', 'notes')}{by_kind} after their paragraphs")
         if report.moved:
             placed.append(f"moved {report.moved} to the paragraph that contains its Chinese")
         if placed:
             log.detail("Notes: " + ", ".join(placed))
+        if report.unmatched:
+            shown = escape(" · ".join(report.unmatched[:MAX_LISTED_NAMES]))
+            more = _more_items(len(report.unmatched), MAX_LISTED_NAMES, "note", "notes")
+            log.detail(f"[dim]Kept where the model put them, Chinese not found on the page: {shown}{more}[/dim]")
         if report.inline:
             log.warn(f"{_plural(report.inline, 'note was', 'notes were')} written inside the chapter text "
                      "instead of the notes list; left where the model put it")

@@ -169,6 +169,17 @@ class ScriptTests(BookCase):
         self.assertNotIn("## Chapter 2", text)
         self.assertIn("Chapter 1.md", text)
 
+    def test_extra_tns_sends_every_chapter(self):
+        self._chapter(1, SHORT_MD)
+        self._chapter(2, FULL_MD.replace("Chapter 1", "Chapter 2"))
+        out = os.path.join(self.library, "findings.md")
+        args = ["-l", self.library, "-b", "Book", "--range", "1-2", "--dry-run", "--extra-tns", "--findings-out", out]
+        with mock.patch("booktl.combine.shutil.which", side_effect=lambda name: {"combineCopy": "/bin/combineCopy"}.get(name)):
+            self.assertEqual(audit.main(args), audit.EXIT_OK)
+        text = _read(out)
+        self.assertIn("## Chapter 2", text)
+        self.assertIn("Missing translator's notes", text)
+
     def test_no_problems_sends_nothing(self):
         self._chapter(1, FULL_MD)
         with mock.patch("booktl.combine.subprocess.run") as run:

@@ -14,9 +14,11 @@ page of every chapter in the range, with the prompt piped in:
 Findings larger than combineCopy's 2 MB limit, or a command line too long for Windows, are split into
 parts by chapter; the script waits for Enter between parts.
 
-The prompt also asks the model to add translator's notes the translation is missing (poem and film
-sources, title references, author slips, source typos). The notes go inline, so auditor's [note]
-findings are left out. With --no-extra-tns, only problem chapters are sent and no notes are asked for.
+By default only problem chapters are sent. With --extra-tns, every readable chapter in the range is sent
+and the prompt also asks the model to add translator's notes the translation is missing (poem and film
+sources, idioms, title references, author slips, source typos). The translator writes these notes itself,
+so this costs many tokens and is rarely needed. Translator's Notes stay inline, so auditor's [note]
+findings are left out either way.
 """
 
 import argparse
@@ -92,8 +94,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--command", default=DEFAULT_COMMAND, help="Command to run (default: combineCopy)")
     parser.add_argument("--findings-out", help="Where to save the findings (default: <Book>/_qa/audit/audit_<time>.md)")
     parser.add_argument("--instructions", help="File with your own instructions to put above the findings")
+    parser.add_argument("--extra-tns", action="store_true",
+                        help="Also ask for missing translator's notes; sends every chapter in the range")
     parser.add_argument("--no-extra-tns", action="store_true",
-                        help="Do not ask for missing translator's notes; send only problem chapters")
+                        help="The default; accepted so older commands keep working")
     parser.add_argument("--max-prompt-bytes", type=int, default=DEFAULT_PROMPT_BYTES,
                         help=f"Largest prompt per combineCopy run (at most {combine.PIPE_LIMIT_BYTES:,})")
     parser.add_argument("--align", action="store_true", help="First build paragraph alignments for chapters without one (one model call each)")
@@ -374,7 +378,7 @@ def run(args) -> int:
     if not os.path.isdir(library):
         con.fail(f"Library folder not found: {escape(library)}")
         return EXIT_USER
-    extra_tns = not args.no_extra_tns
+    extra_tns = bool(args.extra_tns) and not args.no_extra_tns
     try:
         instructions = _instructions(args.instructions, extra_tns)
     except (OSError, ValueError) as e:

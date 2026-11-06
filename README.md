@@ -70,6 +70,7 @@ Continuity notes, declared skips and phrase counts are listed as *Information on
 
 The script prints a table of the problem chapters and saves the findings to `<Book>/_qa/audit/audit_<time>.md` (or `--findings-out`). It then asks before running combineCopy. The findings start with instructions for the receiving model; replace them with `--instructions <file>`. Each chapter's block lists numbered findings with the quoted Chinese and English lines.
 
+- **`--extra-tns`** also asks the receiving model to add the Translator's Notes a chapter is missing (poem and film sources, idioms, title references, author slips). Every chapter in the range is then sent, not only the problem chapters, so it costs far more tokens. It is off by default because the translator writes these notes itself. `--no-extra-tns` is still accepted and does nothing.
 - **`--align`** builds alignment files for chapters without one, with one model call per chapter (`-u`, `-m`, `-k` or the `TL_*` variables; it asks for a model if none is set). `--realign` rebuilds existing ones too. The model only maps Chinese paragraphs to numbered English paragraphs, so it cannot change or invent text. A map that goes backwards is refused and reported, and one English paragraph covering several Chinese ones is recorded as a merge.
 - **Size limits.** combineCopy reads at most 2 MB from the pipe, and Windows caps a command line at about 32,000 characters. Larger findings are split into parts by chapter (`--max-prompt-bytes`, default 1,900,000), and the script waits for Enter between parts (`-y` does not wait). A single chapter too big for one part is cut with a note pointing to the saved file.
 - **`--dry-run`** saves the findings and prints each part's command and prompt size without running anything.
@@ -274,12 +275,16 @@ Translator's Notes never go inside the chapter text. The model lists them per ch
 
     {"afterId": 17, "kind": "pun", "zh": "奶", "correction": "", "text": "(TN: In gaming slang …)"}
 
-The software checks each note and places it on its own line directly after paragraph `afterId`. A note is removed when:
+The model is asked for `culture` notes on idioms (成语), proverbs, 歇后语, lines from poems, classics and films, historical figures, customs and references to the novel's title, and `pun` notes on wordplay. When it translates an idiom by its meaning, the note keeps the original image. `term` notes mark a changed rendering (see [Prior-Usage Lookup](#prior-usage-lookup)), and `source` notes are rare.
+
+The software checks each note and places it on its own line directly after paragraph `afterId`. Quotation marks and punctuation around `zh` are ignored. A note is removed when:
 
 - it only says the text was translated or kept as written;
-- the Chinese it names (`zh`) is not on the page, or it names none;
-- it is a `source` note (an error in the Chinese) whose `correction` does not differ from `zh` by one or two characters;
+- it is a `source` note whose `zh` is not on the page, or whose `correction` does not differ from `zh` by one or two characters;
+- it is any other note whose Chinese is not on the page and whose `afterId` is not a paragraph of the chapter;
 - its `kind` is not one of `pun`, `culture`, `term`, `source`.
+
+A `culture`, `pun` or `term` note whose Chinese is not found stays after its `afterId` paragraph and is listed dimly under the batch. The batch log counts placed notes by kind, e.g. `Notes: placed 5 notes (1 pun, 4 culture) after their paragraphs`, and adds a line when a batch of 3 or more chapters has no culture or pun note at all.
 
 Every removal is listed under the batch with the reason and the start of the note, e.g. `⚠ Removed notes: Chapter 812 after ⟦4⟧: “(TN: The raw has a typo here…” (it only says the text was kept as written)`. A note whose `zh` sits in another paragraph than `afterId` moves to the paragraph that contains it, and the batch log counts these. Notes the model still writes inside the text are left where they are and counted in a warning, unless they make a typo claim (which cannot be checked there) or only say the text was kept as written; those are removed and listed.
 

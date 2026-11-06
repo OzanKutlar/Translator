@@ -6,10 +6,13 @@ the ⟦n⟧ markers until finished() removes them.
 Translator's Notes arrive in each chapter's "notes" list and are placed by the software directly
 after their paragraph. Each note is checked first; a note that fails is removed and reported:
   - a note that only says the text was kept as written adds nothing;
-  - the Chinese a note is about ("zh") must be on the page. When it sits in another paragraph than
-    "afterId", the note moves to the paragraph that contains it;
-  - a "source" note (an error in the Chinese) must give the text and a correction that differ by
-    one or two characters.
+  - the Chinese a note is about ("zh", quotation marks and punctuation ignored) is looked for on the
+    page. When it sits in another paragraph than "afterId", the note moves to the paragraph that
+    contains it;
+  - a "source" note (an error in the Chinese) must give text that is on the page and a correction that
+    differs from it by one or two characters;
+  - any other note whose Chinese is not found stays after "afterId" and is reported, so cultural notes
+    are never lost to a slightly different quote. It is removed only when it cannot be placed.
 Notes the model still writes inside the text stay where they are, unless they make a typo claim
 (which cannot be checked there) or only say the text was kept as written.
 
@@ -44,6 +47,7 @@ MIN_ZH_CHARS = 15             # shorter Chinese paragraphs give ratios too noisy
 SHORT_FACTOR = 0.35
 LONG_FACTOR = 3.0
 MAX_LISTED_FLAGS = 5
+MAX_TEXT_RUNS = 5             # Chinese runs from a note's text tried when it cannot be placed by zh
 
 _KIND_ALIASES = {
     "pun": "pun", "joke": "pun", "wordplay": "pun",
@@ -60,6 +64,9 @@ _TYPO_CLAIM_RE = re.compile(
     re.IGNORECASE,
 )
 _SPACE_RE = re.compile(r"\s+")
+_CJK_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]{2,}")
+_ZH_QUOTES = "「」『』“”‘’《》〈〉\"'"
+_ZH_EDGES = "（）()【】，。、！？：；…—·,.!?:; \u3000"
 
 # Workers can record ratios concurrently, and on Windows a file that is open cannot be
 # replaced, so every read and write of ratios.json goes through this lock.
@@ -148,6 +155,7 @@ class NoteVerdict:
     note: Note | None          # None when the note is removed
     reason: str = ""
     moved: bool = False
+    unmatched: bool = False    # kept at afterId although its Chinese was not found on the page
 
 
 @dataclass
@@ -157,7 +165,9 @@ class NoteReport:
     placed: int = 0
     moved: int = 0
     inline: int = 0
-    removed: list = field(default_factory=list)   # 'Chapter 812 after ⟦4⟧: “(TN: …” (reason)'
+    removed: list = field(default_factory=list)     # 'Chapter 812 after ⟦4⟧: “(TN: …” (reason)'
+    kinds: dict = field(default_factory=dict)       # note kind -> notes placed
+    unmatched: list = field(default_factory=list)   # 'Chapter 812 ⟦4⟧: “(TN: …”'
 
 
 def _clean(value, limit: int) -> str:
@@ -186,6 +196,14 @@ def _note_text(value) -> str:
     return text if text.endswith(")") else text + ")"
 
 
+def clean_zh(value) -> str:
+    """Chinese quoted by a note, without quotation marks and surrounding punctuation."""
+    text = _clean(value, MAX_ZH_CHARS)
+    for char in _ZH_QUOTES:
+        text = text.replace(char, "")
+    return text.strip(_ZH_EDGES)
+
+
 def normalise_note(item) -> tuple[Note | None, str]:
     """A note from the model as a Note, or (None, reason) when it cannot be one."""
     if not isinstance(item, dict):
@@ -196,7 +214,7 @@ def normalise_note(item) -> tuple[Note | None, str]:
     text = _note_text(item.get("text") or item.get("note") or item.get("claim"))
     if not text:
         return None, "the note has no text"
-    zh = _clean(item.get("zh"), MAX_ZH_CHARS)
+    zh = clean_zh(item.get("zh"))
     correction = _clean(item.get("correction"), MAX_ZH_CHARS)
     return Note(_marker_value(item.get("afterId")), kind, zh, correction, text), ""
 
@@ -246,14 +264,56 @@ def check_note(note: Note, zh_paragraphs: list[str]) -> NoteVerdict:
             return NoteVerdict(None, problem)
     if not zh_paragraphs:
         return NoteVerdict(note)  # no raw page to check against: placed where the model asked
+    if note.kind == "source":
+        return _place_strict(note, zh_paragraphs)
+    return _place_loose(note, zh_paragraphs)
+
+
+def _valid_marker(marker, paragraphs: list[str]) -> bool:
+    return isinstance(marker, int) and not isinstance(marker, bool) and 0 <= marker < len(paragraphs)
+
+
+def _text_runs(text) -> list[str]:
+    """Chinese runs of two or more characters in a note's text, longest first."""
+    runs = list(dict.fromkeys(_CJK_RUN_RE.findall(str(text or ""))))
+    return sorted(runs, key=len, reverse=True)[:MAX_TEXT_RUNS]
+
+
+def _found_at(note: Note, paragraphs: list[str], zh: str) -> NoteVerdict | None:
+    """The note placed at the paragraph containing zh, preferring afterId; None when zh is not on the page."""
+    place = _paragraph_with(paragraphs, zh, note.after_id)
+    if place is None:
+        return None
+    return NoteVerdict(replace(note, after_id=place), moved=place != note.after_id)
+
+
+def _place_strict(note: Note, paragraphs: list[str]) -> NoteVerdict:
+    """Source notes make a claim about the page, so their Chinese must be on it."""
     if not note.zh:
         return NoteVerdict(None, "it does not name the Chinese it explains")
-    place = _paragraph_with(zh_paragraphs, note.zh, note.after_id)
-    if place is None:
+    verdict = _found_at(note, paragraphs, note.zh)
+    if verdict is None:
         return NoteVerdict(None, f"its Chinese “{note.zh}” is not on the page")
-    if place != note.after_id:
-        return NoteVerdict(replace(note, after_id=place), moved=True)
-    return NoteVerdict(note)
+    return verdict
+
+
+def _place_loose(note: Note, paragraphs: list[str]) -> NoteVerdict:
+    """Culture, pun and term notes: placed by their Chinese when found, otherwise kept at afterId."""
+    if note.zh:
+        verdict = _found_at(note, paragraphs, note.zh)
+        if verdict is not None:
+            return verdict
+    runs = _text_runs(note.text)
+    if _valid_marker(note.after_id, paragraphs):
+        matched = not note.zh and any(run in paragraphs[note.after_id] for run in runs)
+        return NoteVerdict(note, unmatched=not matched)
+    for run in runs:
+        verdict = _found_at(note, paragraphs, run)
+        if verdict is not None:
+            return verdict
+    named = f"its Chinese “{note.zh}” is not on the page" if note.zh else "it names no Chinese found on the page"
+    where = f"⟦{note.after_id}⟧ is not a paragraph of this chapter" if note.after_id is not None else "it names no paragraph"
+    return NoteVerdict(None, f"{named}, and {where}")
 
 
 def check_inline_note(text) -> str:
@@ -283,6 +343,11 @@ def _place_one(work: ChapterWork, item, report: NoteReport) -> None:
     work.text = segments.insert_after(work.text, verdict.note.after_id, verdict.note.text)
     report.placed += 1
     report.moved += int(verdict.moved)
+    kind = verdict.note.kind
+    report.kinds[kind] = report.kinds.get(kind, 0) + 1
+    if verdict.unmatched:
+        preview = _clean(verdict.note.text, NOTE_PREVIEW_CHARS)
+        report.unmatched.append(f"{work.chapter_no} ⟦{verdict.note.after_id}⟧: “{preview}”")
 
 
 def place_notes(work: ChapterWork, report: NoteReport) -> None:
