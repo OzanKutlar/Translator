@@ -42,11 +42,20 @@ python translate.py
 
 The last chapter is the highest translated chapter. Chapters missing their translation or raw page are skipped with a warning. `combineCopy`'s output appears directly in the console.
 
+After the command preview, the script asks `Add a request for the model? [y/N]:`.
+
+- **Enter or `n`** (the default) sends the files on their own.
+- **`y`** lets you type a request line by line; an empty line ends it. The request is piped to `combineCopy --prompt-pipe …`, the same way `audit.py` sends its findings.
+- `--request "text"` or `--request-file path` gives a request without the question. Use the file for requests with blank lines in them.
+- `-y` and `--dry-run` never ask; the dry run prints the `--prompt-pipe` command.
+- A request may be at most 2 MB. A combineCopy function in your PowerShell profile must forward its pipeline input (see the Audit section).
+
 `combineCopy` can be an executable, a `.bat`/`.cmd`, a `.ps1` on PATH, or a function from your PowerShell profile.
 
     python inquire.py -b "SuperBase Evolution" --end 10
     python inquire.py --range 140-175 -y
     python inquire.py --middle 10 --dry-run
+    python inquire.py --end 5 --request "Check every name against the raw page."
 
 ## Audit: Sending Problem Chapters to combineCopy
 

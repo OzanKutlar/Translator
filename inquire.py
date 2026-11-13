@@ -13,6 +13,10 @@ then the raw page for every chapter (backslashes on Windows):
 
   combineCopy './SuperBase Evolution/Chapter 10.md' './SuperBase Evolution/_raw/chapters/ch_000010.txt'
 
+Before it runs, you are asked whether to add a request for the model ([y/N], Enter means no). A request
+is piped in with --prompt-pipe, like audit.py's findings. --request TEXT or --request-file PATH give one
+without asking; -y and --dry-run skip the question.
+
 Its output appears directly in this console. The range and command code lives in booktl/combine.py,
 shared with audit.py.
 """
@@ -28,8 +32,9 @@ from rich.markup import escape
 from booktl import console as con
 from booktl import menu
 from booktl.combine import (  # noqa: F401  (re-exported for callers and tests)
-    MAX_COMMAND_CHARS, Selection, build_command, check_length, collect_files, parse_count, parse_range,
-    ps_quote, raw_parts, relative, resolve_range, run_combine, translated_chapters,
+    MAX_COMMAND_CHARS, PIPE_FLAG, PIPE_LIMIT_BYTES, Selection, build_command, build_pipe_command, check_length,
+    collect_files, parse_count, parse_range, ps_quote, raw_parts, relative, resolve_range, run_combine,
+    translated_chapters,
 )
 from booktl.library import ordered_books
 from booktl.parsing import format_chapter_ranges
@@ -37,11 +42,20 @@ from booktl.parsing import format_chapter_ranges
 DEFAULT_LIBRARY = "../TranslateBook"
 DEFAULT_COMMAND = "combineCopy"
 MAX_INPUT_ATTEMPTS = 5
+MAX_REQUEST_LINES = 2_000    # lines read for one typed request
 PREVIEW_PAIRS = 2            # chapters shown at each end of the command preview
 EXIT_OK, EXIT_USER, EXIT_COMMAND = 0, 1, 2
 MODES = ("start", "end", "middle", "range")
 MODE_LABELS = ("From the start", "From the end", "Around the middle", "Explicit range")
-_YES = ("", "y", "yes")
+REQUEST_QUESTION = "Add a request for the model? [y/N]: "
+REQUEST_LINE_PROMPT = "[dim]>[/dim] "
+PS_PIPE_NOTE = (
+    "combineCopy runs through PowerShell here. If it is a function in your profile, it must forward its "
+    "pipeline input or it receives no request, e.g.:\n"
+    "  function combineCopy { if ($MyInvocation.ExpectingInput) { $input | combineCopy.exe @args } "
+    "else { combineCopy.exe @args } }"
+)
+_YES = ("y", "yes")
 _NO = ("n", "no", "q", "quit")
 
 
@@ -52,6 +66,14 @@ _NO = ("n", "no", "q", "quit")
 def _ask(prompt: str) -> str | None:
     try:
         return con.console.input(f"[bold]{escape(prompt)}[/bold]").strip()
+    except (KeyboardInterrupt, EOFError):
+        return None
+
+
+def _read_line(prompt: str) -> str | None:
+    """One raw line (Rich markup prompt), or None on Ctrl+C / EOF."""
+    try:
+        return con.console.input(prompt)
     except (KeyboardInterrupt, EOFError):
         return None
 
@@ -118,18 +140,103 @@ def ask_span(last: int) -> tuple[int, int] | None:
     return None
 
 
-def confirm(question: str) -> bool:
-    """Yes/no question; Enter means yes, EOF and Ctrl+C mean no."""
+def confirm(question: str, default: bool = True) -> bool:
+    """Yes/no question. Enter gives default; EOF and Ctrl+C mean no."""
     for _ in range(MAX_INPUT_ATTEMPTS):
         answer = _ask(question)
         if answer is None:
             return False
-        if answer.lower() in _YES:
+        low = answer.lower()
+        if not low:
+            return bool(default)
+        if low in _YES:
             return True
-        if answer.lower() in _NO:
+        if low in _NO:
             return False
-        con.warn("Please answer y or n (Enter means yes).")
+        con.warn(f"Please answer y or n (Enter means {'yes' if default else 'no'}).")
     return False
+
+
+# ----------------------------------------------------------------------
+# Optional request for the model
+# ----------------------------------------------------------------------
+
+def _clean_request(text) -> str | None:
+    """The request without surrounding blank space; None when empty. Raises ValueError when too large."""
+    if not isinstance(text, str):
+        return None
+    clean = text.strip()
+    if not clean:
+        return None
+    size = len(clean.encode("utf-8"))
+    if size > PIPE_LIMIT_BYTES:
+        raise ValueError(f"The request is {size:,} bytes; combineCopy reads at most {PIPE_LIMIT_BYTES:,}.")
+    return clean
+
+
+def _read_request_file(path: str) -> str:
+    """Raises OSError/ValueError."""
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read(PIPE_LIMIT_BYTES + 1)
+
+
+def _given_request(args) -> str | None:
+    """Request from --request or --request-file; None when neither was given. Raises OSError/ValueError."""
+    text = getattr(args, "request", None)
+    if text is not None:
+        clean = _clean_request(text)
+        if clean is None:
+            raise ValueError("The --request text is empty.")
+        return clean
+    path = getattr(args, "request_file", None)
+    if path:
+        clean = _clean_request(_read_request_file(path))
+        if clean is None:
+            raise ValueError(f"The request file {path} is empty.")
+        return clean
+    return None
+
+
+def ask_request() -> str | None:
+    """A request typed line by line, ended by an empty line. None when blank, cancelled or too long."""
+    con.info("Type your request; an empty line ends it (Ctrl+C cancels).")
+    lines, size = [], 0
+    for _ in range(MAX_REQUEST_LINES):
+        line = _read_line(REQUEST_LINE_PROMPT)
+        if line is None:
+            con.warn("Request cancelled.")
+            return None
+        if not line.strip():
+            break
+        lines.append(line.rstrip())
+        size += len(line.encode("utf-8")) + 1
+        if size > PIPE_LIMIT_BYTES:
+            con.warn(f"The request is longer than combineCopy's {PIPE_LIMIT_BYTES:,}-byte limit; it was dropped.")
+            return None
+    else:
+        con.warn(f"Stopped reading after {MAX_REQUEST_LINES:,} lines.")
+    try:
+        return _clean_request("\n".join(lines))
+    except ValueError as e:
+        con.warn(escape(str(e)))
+        return None
+
+
+def _request(args) -> tuple[bool, str | None]:
+    """(go on, request). A bad --request/--request-file stops the run; otherwise asks [y/N] when interactive."""
+    try:
+        given = _given_request(args)
+    except (OSError, ValueError) as e:
+        con.fail(f"Could not use the request: {escape(str(e))}")
+        return False, None
+    if given is not None:
+        return True, given
+    if args.yes or args.dry_run or not confirm(REQUEST_QUESTION, default=False):
+        return True, None
+    request = ask_request()
+    if request is None:
+        con.dim("No request; the files are sent on their own.")
+    return True, request
 
 
 # ----------------------------------------------------------------------
@@ -168,9 +275,9 @@ def _print_dry_run(argv: list, library: str) -> None:
         con.console.print(f"  {escape(str(arg))}", highlight=False)
 
 
-def _run_and_report(argv: list, library: str, command: str) -> int:
+def _run_and_report(argv: list, library: str, command: str, data: bytes | None = None) -> int:
     con.rule(f"{escape(command)} output")
-    code = run_combine(argv, library)
+    code = run_combine(argv, library, data=data)
     con.rule()
     if code is None:
         return EXIT_COMMAND
@@ -181,6 +288,13 @@ def _run_and_report(argv: list, library: str, command: str) -> int:
     return EXIT_OK
 
 
+def _command(command: str, files: list, windows: bool, request) -> tuple[list[str], str]:
+    """argv and how it runs: the plain command, or the --prompt-pipe one when there is a request."""
+    if request is None:
+        return build_command(command, files, windows), "native"
+    return build_pipe_command(command, files, windows)
+
+
 def send_chapters(args, library: str, book: str, translated: dict, span: tuple[int, int]) -> int:
     selection = collect_files(library, book, translated, *span)
     _report_gaps(selection)
@@ -189,8 +303,7 @@ def send_chapters(args, library: str, book: str, translated: dict, span: tuple[i
         return EXIT_USER
     windows = os.name == "nt"
     try:
-        argv = build_command(args.command, selection.files, windows)
-        check_length(argv, windows)
+        build_command(args.command, [], windows)  # report a missing command before asking anything
     except (FileNotFoundError, ValueError) as e:
         con.fail(escape(str(e)))
         return EXIT_COMMAND
@@ -199,13 +312,28 @@ def send_chapters(args, library: str, book: str, translated: dict, span: tuple[i
         f"{escape(format_chapter_ranges(selection.chapters))} · {count} chapter(s) · {len(selection.files)} files"
     )
     con.dim(escape(preview(args.command, selection.files)))
+    go_on, request = _request(args)
+    if not go_on:
+        return EXIT_USER
+    try:
+        argv, how = _command(args.command, selection.files, windows, request)
+        check_length(argv, windows)
+    except (FileNotFoundError, ValueError) as e:
+        con.fail(escape(str(e)))
+        return EXIT_COMMAND
+    if request is not None:
+        con.info(f"Request: {len(request):,} characters, piped with {PIPE_FLAG}")
     if args.dry_run:
         _print_dry_run(argv, library)
         return EXIT_OK
-    if not args.yes and not confirm(f"Run {args.command} on {count} chapter(s)? [Y/n]: "):
+    attached = " with your request" if request is not None else ""
+    if not args.yes and not confirm(f"Run {args.command} on {count} chapter(s){attached}? [Y/n]: "):
         con.warn("Cancelled.")
         return EXIT_USER
-    return _run_and_report(argv, library, args.command)
+    if request is not None and how == "powershell":
+        con.warn(escape(PS_PIPE_NOTE))
+    data = request.encode("utf-8") if request is not None else None
+    return _run_and_report(argv, library, args.command, data)
 
 
 def add_range_args(parser: argparse.ArgumentParser):
@@ -225,9 +353,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-b", "--book", help="Book folder name (skips the book menu)")
     parser.add_argument("-l", "--library", default=DEFAULT_LIBRARY, help="Library folder (default: ../TranslateBook)")
     add_range_args(parser)
-    parser.add_argument("-y", "--yes", action="store_true", help="Run without asking for confirmation")
+    parser.add_argument("-y", "--yes", action="store_true", help="Run without asking for confirmation or a request")
     parser.add_argument("--dry-run", action="store_true", help="Print the command instead of running it")
     parser.add_argument("--command", default=DEFAULT_COMMAND, help="Command to run (default: combineCopy)")
+    requests = parser.add_mutually_exclusive_group()
+    requests.add_argument("--request", metavar="TEXT", help="Request for the model, piped with --prompt-pipe")
+    requests.add_argument("--request-file", metavar="PATH", help="File holding the request for the model")
     return parser
 
 

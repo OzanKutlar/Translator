@@ -126,5 +126,93 @@ class CommandTests(unittest.TestCase):
             self.assertIsNone(inquire.run_combine(["combineCopy"], "/lib"))
 
 
+class ConfirmTests(unittest.TestCase):
+    def _confirm(self, answers, default):
+        with mock.patch.object(inquire.con.console, "input", side_effect=answers):
+            return inquire.confirm("Go? ", default=default)
+
+    def test_default_no(self):
+        self.assertFalse(self._confirm([""], False))
+        self.assertTrue(self._confirm(["y"], False))
+        self.assertFalse(self._confirm(EOFError(), False))
+        self.assertFalse(self._confirm(["maybe", "n"], False))
+
+    def test_default_yes_is_unchanged(self):
+        self.assertTrue(self._confirm([""], True))
+        self.assertFalse(self._confirm(["n"], True))
+
+
+class AskRequestTests(unittest.TestCase):
+    def _ask(self, answers):
+        with mock.patch.object(inquire.con.console, "input", side_effect=answers):
+            return inquire.ask_request()
+
+    def test_lines_until_empty_line(self):
+        self.assertEqual(self._ask(["  Check names.", "Keep TNs.  ", ""]), "Check names.\nKeep TNs.")
+
+    def test_blank_and_cancelled(self):
+        self.assertIsNone(self._ask([""]))
+        self.assertIsNone(self._ask(["text", KeyboardInterrupt()]))
+
+    def test_size_cap(self):
+        with mock.patch.object(inquire, "PIPE_LIMIT_BYTES", 10):
+            self.assertIsNone(self._ask(["x" * 20, ""]))
+
+
+class RequestSendTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.library = self._tmp.name
+        self.book = "Test Book"
+        book_dir = os.path.join(self.library, self.book)
+        _touch(os.path.join(book_dir, "Chapter 1.md"))
+        _touch(os.path.join(book_dir, "_raw", "chapters", "ch_000001.txt"))
+        self.translated = inquire.translated_chapters(book_dir)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _send(self, argv, answers):
+        args = inquire.build_parser().parse_args(argv)
+        table = {"combineCopy": "/bin/combineCopy"}
+        with mock.patch("inquire.shutil.which", side_effect=lambda name: table.get(name)), \
+                mock.patch("inquire.subprocess.run", return_value=mock.Mock(returncode=0)) as run, \
+                mock.patch.object(inquire.con.console, "input", side_effect=answers):
+            code = inquire.send_chapters(args, self.library, self.book, self.translated, (1, 1))
+        return code, run
+
+    def test_request_flag_pipes_the_text(self):
+        code, run = self._send(["--request", "Check names", "-y"], AssertionError("should not ask"))
+        self.assertEqual(code, inquire.EXIT_OK)
+        self.assertEqual(run.call_args.args[0][:2], ["/bin/combineCopy", "--prompt-pipe"])
+        self.assertEqual(run.call_args.kwargs["input"], b"Check names")
+
+    def test_enter_means_no_request(self):
+        code, run = self._send([], ["", ""])
+        self.assertEqual(code, inquire.EXIT_OK)
+        self.assertNotIn("--prompt-pipe", run.call_args.args[0])
+        self.assertNotIn("input", run.call_args.kwargs)
+
+    def test_yes_reads_a_request(self):
+        code, run = self._send([], ["y", "Line one", "Line two", "", ""])
+        self.assertEqual(code, inquire.EXIT_OK)
+        self.assertEqual(run.call_args.kwargs["input"], "Line one\nLine two".encode("utf-8"))
+
+    def test_y_flag_never_asks(self):
+        code, run = self._send(["-y"], AssertionError("should not ask"))
+        self.assertEqual(code, inquire.EXIT_OK)
+        self.assertNotIn("input", run.call_args.kwargs)
+
+    def test_empty_request_stops(self):
+        code, run = self._send(["--request", "   "], AssertionError("should not ask"))
+        self.assertEqual(code, inquire.EXIT_USER)
+        run.assert_not_called()
+
+    def test_request_flags_conflict(self):
+        with mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit):
+                inquire.build_parser().parse_args(["--request", "a", "--request-file", "b"])
+
+
 if __name__ == "__main__":
     unittest.main()
