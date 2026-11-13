@@ -208,13 +208,14 @@ def send_chapters(args, library: str, book: str, translated: dict, span: tuple[i
     return _run_and_report(argv, library, args.command)
 
 
-def add_range_args(parser: argparse.ArgumentParser) -> None:
-    """--start/--end/--middle/--range, shared with audit.py."""
+def add_range_args(parser: argparse.ArgumentParser):
+    """--start/--end/--middle/--range, shared with audit.py. Returns the group so callers can add modes."""
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--start", metavar="N", help="Chapters 1 to N")
     group.add_argument("--end", metavar="N", help="The last N translated chapters")
     group.add_argument("--middle", metavar="N", help="N chapters around the middle chapter")
     group.add_argument("--range", metavar="A-B", help="An explicit range, e.g. 140-175")
+    return group
 
 
 def build_parser() -> argparse.ArgumentParser:

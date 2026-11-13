@@ -410,6 +410,51 @@ def remove_line(text, line) -> str:
     return text
 
 
+STAR = "*"
+
+
+def _marker_line(lines: list[str], marker: int) -> int | None:
+    """Line that starts paragraph `marker` exactly, or None."""
+    for index, line in enumerate(lines):
+        found = _split_marker(line.strip())
+        if found is not None and found[0] == marker:
+            return index
+    return None
+
+
+def _text_end(lines: list[str], start: int) -> int:
+    """Last line of the paragraph at start, without the notes that follow it."""
+    end = start
+    for index in range(start + 1, len(lines)):
+        text = lines[index].strip()
+        if not text or _is_break(text):
+            break
+        end = index
+    return end
+
+
+def ensure_star(text, marker) -> str:
+    """text with a * at the end of paragraph `marker` when that paragraph has none yet.
+
+    Culture and pun notes need a * so readers know which line they explain. The model is asked to put it
+    right after the phrase; this end-of-paragraph star is only the fallback. Declared skips are left alone.
+    """
+    if not isinstance(text, str) or isinstance(marker, bool) or not isinstance(marker, int) or marker < 0:
+        return text
+    lines = text.split("\n")
+    start = _marker_line(lines, marker)
+    if start is None:
+        return text
+    end = _text_end(lines, start)
+    body = _split_marker(lines[start].strip())[1]
+    if start == end and (not body or _SKIP_RE.match(body)):
+        return text
+    if any(STAR in line for line in lines[start:end + 1]):
+        return text
+    lines[end] = lines[end].rstrip() + STAR
+    return "\n".join(lines)
+
+
 # ----------------------------------------------------------------------
 # Descriptions for the batch log
 # ----------------------------------------------------------------------

@@ -34,6 +34,7 @@ QA_DIRNAME = "_qa"
 RATIOS_FILENAME = "ratios.json"
 RATIOS_VERSION = 1
 NOTE_KINDS = ("pun", "culture", "term", "source")
+STARRED_KINDS = ("pun", "culture")   # notes that need a * in the text so readers find their line
 MAX_NOTES_PER_CHAPTER = 30
 MAX_NOTE_CHARS = 1_500
 MAX_ZH_CHARS = 200            # longest "zh" or "correction" kept from a note
@@ -340,10 +341,12 @@ def _place_one(work: ChapterWork, item, report: NoteReport) -> None:
         text = note.text if note is not None else str(item)
         report.removed.append(_removed(work, after, text, verdict.reason))
         return
+    kind = verdict.note.kind
     work.text = segments.insert_after(work.text, verdict.note.after_id, verdict.note.text)
+    if kind in STARRED_KINDS and verdict.note.after_id is not None:
+        work.text = segments.ensure_star(work.text, verdict.note.after_id)
     report.placed += 1
     report.moved += int(verdict.moved)
-    kind = verdict.note.kind
     report.kinds[kind] = report.kinds.get(kind, 0) + 1
     if verdict.unmatched:
         preview = _clean(verdict.note.text, NOTE_PREVIEW_CHARS)

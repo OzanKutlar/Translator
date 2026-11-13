@@ -54,7 +54,7 @@ The last chapter is the highest translated chapter. Chapters missing their trans
 
     combineCopy --prompt-pipe '.\Book\Chapter 812.md' '.\Book\_raw\chapters\ch_000812.txt' …
 
-Pick the book and range as in `inquire.py`, with the menu or `--start N`, `--end N`, `--middle N` or `--range A-B`. No model is called unless you pass `--align`. For every chapter the audit looks for:
+Pick the book and range as in `inquire.py`, with the menu or `--start N`, `--end N`, `--middle N` or `--range A-B`, or continue where the last audit stopped with `--next N` (see [Audit progress](#audit-progress)). No model is called unless you pass `--align`. For every chapter the audit looks for:
 
 - **omission**: paragraphs with no English. A chapter without an alignment file is checked by paragraph count only;
 - **addition**: English paragraphs an audit alignment matched to no Chinese paragraph;
@@ -70,7 +70,8 @@ Continuity notes, declared skips and phrase counts are listed as *Information on
 
 The script prints a table of the problem chapters and saves the findings to `<Book>/_qa/audit/audit_<time>.md` (or `--findings-out`). It then asks before running combineCopy. The findings start with instructions for the receiving model; replace them with `--instructions <file>`. Each chapter's block lists numbered findings with the quoted Chinese and English lines.
 
-- **`--extra-tns`** also asks the receiving model to add the Translator's Notes a chapter is missing (poem and film sources, idioms, title references, author slips). Every chapter in the range is then sent, not only the problem chapters, so it costs far more tokens. It is off by default because the translator writes these notes itself. `--no-extra-tns` is still accepted and does nothing.
+- **Translator's Notes.** By default the receiving model is also asked to add the notes a sent chapter is missing: idioms, sayings, everyday expressions with a vivid literal image, and wordplay. The request includes worked examples (such as 鬼精鬼精, 'ghost smart', translated as *crafty* with a note) and asks for a `*` after every line a note explains. `--no-tns` leaves this out.
+- **`--extra-tns`** also sends the chapters without findings, so every chapter in the range gets the note pass, and adds poem and film sources, title references and author slips. It costs far more tokens. It cannot be combined with `--no-tns`; `--no-extra-tns` is still accepted and does nothing.
 - **`--align`** builds alignment files for chapters without one, with one model call per chapter (`-u`, `-m`, `-k` or the `TL_*` variables; it asks for a model if none is set). `--realign` rebuilds existing ones too. The model only maps Chinese paragraphs to numbered English paragraphs, so it cannot change or invent text. A map that goes backwards is refused and reported, and one English paragraph covering several Chinese ones is recorded as a merge.
 - **Size limits.** combineCopy reads at most 2 MB from the pipe, and Windows caps a command line at about 32,000 characters. Larger findings are split into parts by chapter (`--max-prompt-bytes`, default 1,900,000), and the script waits for Enter between parts (`-y` does not wait). A single chapter too big for one part is cut with a note pointing to the saved file.
 - **`--dry-run`** saves the findings and prints each part's command and prompt size without running anything.
@@ -79,6 +80,17 @@ The script prints a table of the problem chapters and saves the findings to `<Bo
       function combineCopy {
           if ($MyInvocation.ExpectingInput) { $input | combineCopy.exe @args } else { combineCopy.exe @args }
       }
+
+### Audit progress
+
+Each book remembers how far it has been audited in `<Book>/_qa/audit/progress.json`. The audit shows it before the range is chosen, e.g. `Last audit: Chapters 1200–1250 (2d ago) · audited through Chapter 1250`.
+
+- A part counts as audited once combineCopy finishes it without an error. The first part covers the range from its start and the last part up to its end, so clean chapters between problem chapters count too. A range with nothing to send counts as audited at once.
+- `--dry-run`, a cancelled confirmation and a failed part record nothing.
+- "Audited through" is the highest chapter ever audited; auditing an older range never moves it back.
+- `--next N`, or the menu's first row **Next N after the last audit**, audits the N chapters after it, up to the last translated chapter. Without an earlier audit it starts at Chapter 1.
+
+    python audit.py -b "Doomsday Online" --next 25
 
 ## Choosing or Creating a Book
 
@@ -246,7 +258,7 @@ The author's style is kept:
 - Tone, register, pacing, tense, point of view and level of description stay the same, with no added flourishes or explanations.
 - Characteristic repetition, catchphrases and every character's voice are preserved. Only the author's clumsiness is fixed, never a character's.
 - Nothing is omitted or summarized, and the author's plot or continuity mistakes are translated as written (with a TN if they would confuse readers).
-- Puns still get a `*` and a TN, and locked terms and names always take priority over fluency.
+- Puns and cultural references get a `*` and a TN, and locked terms and names always take priority over fluency.
 
 The 1:1 paragraph rule also keeps the term-drift check and the prior-usage excerpts accurate, because both rely on the English text lining up with the raw page. Edit the `TRANSLATION APPROACH` section of `SYSTEM_PROMPT` in `booktl/prompts.py` to adjust it.
 
@@ -275,7 +287,7 @@ Translator's Notes never go inside the chapter text. The model lists them per ch
 
     {"afterId": 17, "kind": "pun", "zh": "奶", "correction": "", "text": "(TN: In gaming slang …)"}
 
-The model is asked for `culture` notes on idioms (成语), proverbs, 歇后语, lines from poems, classics and films, historical figures, customs and references to the novel's title, and `pun` notes on wordplay. When it translates an idiom by its meaning, the note keeps the original image. `term` notes mark a changed rendering (see [Prior-Usage Lookup](#prior-usage-lookup)), and `source` notes are rare.
+The model is asked for `culture` notes on idioms (成语), proverbs, 歇后语, lines from poems, classics and films, historical figures, customs and references to the novel's title, and `pun` notes on wordplay. When it translates an idiom or a colloquial expression by its meaning, the note keeps the original image; the prompt's examples include 鬼精鬼精 ('ghost smart') rendered as *crafty* with a note. Every `culture` and `pun` note gets a `*` in the text right after what it explains. When the model forgets it, the software adds one at the end of the note's paragraph. `term` notes mark a changed rendering (see [Prior-Usage Lookup](#prior-usage-lookup)), and `source` notes are rare.
 
 The software checks each note and places it on its own line directly after paragraph `afterId`. Quotation marks and punctuation around `zh` are ignored. A note is removed when:
 

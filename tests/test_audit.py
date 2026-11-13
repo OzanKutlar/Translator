@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 import audit
-from booktl import auditor, combine, segments, storage
+from booktl import auditlog, auditor, combine, segments, storage
 from booktl.config import Config
 
 RAW = "某某书名\n第1章 夜\n" + "".join(f"张三走进第{n}座大殿，众人大惊。\n" for n in range(1, 7)) + "(本章完)\n"
@@ -185,6 +185,112 @@ class ScriptTests(BookCase):
         with mock.patch("booktl.combine.subprocess.run") as run:
             self.assertEqual(audit.main(["-l", self.library, "-b", "Book", "--range", "1", "-y"]), audit.EXIT_OK)
         run.assert_not_called()
+        progress, err = auditlog.load_progress(self.book)
+        self.assertIsNone(err)
+        self.assertEqual(progress.audited_through, 1)
+
+    def _which(self):
+        table = {"combineCopy": "/bin/combineCopy"}
+        return mock.patch("booktl.combine.shutil.which", side_effect=lambda name: table.get(name))
+
+    def _base(self, *extra):
+        return ["-l", self.library, "-b", "Book", *extra]
+
+    def test_dry_run_records_nothing(self):
+        self._chapter(1, SHORT_MD)
+        out = os.path.join(self.library, "findings.md")
+        with self._which():
+            self.assertEqual(audit.main(self._base("--range", "1", "--dry-run", "--findings-out", out)), audit.EXIT_OK)
+        self.assertFalse(os.path.isfile(auditlog.progress_path(self.book)))
+
+    def test_failed_part_records_nothing(self):
+        self._chapter(1, SHORT_MD)
+        out = os.path.join(self.library, "findings.md")
+        with self._which(), mock.patch("booktl.combine.subprocess.run", return_value=mock.Mock(returncode=1)):
+            code = audit.main(self._base("--range", "1", "-y", "--findings-out", out))
+        self.assertEqual(code, audit.EXIT_COMMAND)
+        self.assertFalse(os.path.isfile(auditlog.progress_path(self.book)))
+
+    def test_sent_part_is_recorded_and_next_continues(self):
+        self._chapter(1, SHORT_MD)
+        self._chapter(2, FULL_MD.replace("Chapter 1", "Chapter 2"))
+        self._chapter(3, SHORT_MD.replace("Chapter 1", "Chapter 3"))
+        first = os.path.join(self.library, "a.md")
+        with self._which(), mock.patch("booktl.combine.subprocess.run", return_value=mock.Mock(returncode=0)) as run:
+            self.assertEqual(audit.main(self._base("--range", "1-2", "-y", "--findings-out", first)), audit.EXIT_OK)
+        run.assert_called_once()
+        progress, _err = auditlog.load_progress(self.book)
+        self.assertEqual(progress.audited_through, 2)
+        self.assertEqual(progress.last_run.findings, "a.md")
+        second = os.path.join(self.library, "b.md")
+        with self._which():
+            self.assertEqual(audit.main(self._base("--next", "5", "--dry-run", "--findings-out", second)), audit.EXIT_OK)
+        text = _read(second)
+        self.assertIn("## Chapter 3", text)
+        self.assertNotIn("## Chapter 1\n", text)
+
+    def test_next_when_everything_is_audited(self):
+        self._chapter(1, FULL_MD)
+        auditlog.record_audit(self.book, 1, 1)
+        self.assertEqual(audit.main(self._base("--next", "3", "--dry-run")), audit.EXIT_USER)
+
+    def test_default_asks_for_notes_and_no_tns_leaves_them_out(self):
+        self._chapter(1, SHORT_MD)
+        for extra, present in (([], True), (["--no-tns"], False)):
+            out = os.path.join(self.library, f"findings_{int(present)}.md")
+            with self._which():
+                audit.main(self._base("--range", "1", "--dry-run", "--findings-out", out, *extra))
+            text = _read(out)
+            self.assertEqual("鬼精鬼精" in text, present)
+            self.assertEqual("Missing translator's notes" in text, present)
+
+    def test_no_tns_and_extra_tns_conflict(self):
+        with mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit):
+                audit.build_parser().parse_args(["--no-tns", "--extra-tns"])
+
+
+class ProgressTests(BookCase):
+    def test_next_span(self):
+        self.assertEqual(auditlog.next_span(None, 10, 100), (1, 10))
+        self.assertEqual(auditlog.next_span(50, 10, 100), (51, 60))
+        self.assertEqual(auditlog.next_span(95, 10, 100), (96, 100))
+        for args in ((100, 1, 100), (5, 0, 100), (5, 3, 0), (5, True, 100)):
+            with self.assertRaises(ValueError, msg=args):
+                auditlog.next_span(*args)
+
+    def test_record_keeps_highest_and_bounds_history(self):
+        auditlog.record_audit(self.book, 10, 20, "/x/audit_a.md")
+        progress = auditlog.record_audit(self.book, 1, 5)
+        self.assertEqual(progress.audited_through, 20)
+        self.assertEqual((progress.last_run.low, progress.last_run.high), (1, 5))
+        self.assertEqual(progress.history[0].findings, "audit_a.md")
+        with mock.patch.object(auditlog, "MAX_HISTORY", 3):
+            for chapter in range(30, 36):
+                auditlog.record_audit(self.book, chapter, chapter)
+        loaded, err = auditlog.load_progress(self.book)
+        self.assertIsNone(err)
+        self.assertEqual(len(loaded.history), 3)
+        self.assertEqual(loaded.audited_through, 35)
+        self.assertIn("Chapter 35", auditlog.describe(loaded))
+
+    def test_bad_span_is_rejected(self):
+        for low, high in ((5, 2), (0, 3), (True, 3)):
+            with self.assertRaises(ValueError):
+                auditlog.record_audit(self.book, low, high)
+
+    def test_corrupt_file_is_reported(self):
+        _write(auditlog.progress_path(self.book), "{broken")
+        progress, err = auditlog.load_progress(self.book)
+        self.assertIsNone(progress)
+        self.assertIn("progress.json", err)
+        with self.assertRaises(ValueError):
+            auditlog.record_audit(self.book, 1, 2)
+
+    def test_part_spans_cover_the_range(self):
+        parts = [[(3, "", []), (5, "", [])], [(9, "", [])]]
+        self.assertEqual(audit._part_spans(parts, (1, 12)), [(1, 5), (6, 12)])
+        self.assertEqual(audit._part_spans([[(4, "", [])]], (4, 4)), [(4, 4)])
 
 
 if __name__ == "__main__":

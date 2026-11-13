@@ -56,6 +56,43 @@ DEFAULT_INSTRUCTIONS = (
     "terms exactly as the translation uses them unless a finding is about them."
 )
 
+TN_EXAMPLES = """\
+Examples of good notes. The English translates the meaning naturally, the note gives the image a fluent
+rendering loses, and a * right after the line shows which line the note explains:
+
+Boss said, "Don't worry. This kid is incredibly crafty, and his strength goes without saying. If he can't do it, then no one can."*
+
+(TN: The original uses the phrase 鬼精鬼精 (gui jing gui jing), which literally means 'ghost smart', describing someone who is very cunning, crafty, or clever.)
+
+Explaining tactics to him was a complete waste of breath.*
+
+(TN: The original uses the idiom 对牛弹琴, literally 'playing the lute to a cow': wasting words on someone who cannot understand them.)"""
+
+TN_PASS_INSTRUCTIONS = """\
+## Missing translator's notes
+Translator's Notes are part of this translation: readers want to learn what a Chinese reader catches without
+help. While you check each chapter, also add a (TN: ...) wherever the English is correct but loses something
+and the chapter has no note for it yet:
+- idioms (成语), proverbs, sayings and 歇后语;
+- everyday or reduplicated expressions with a vivid literal image, such as 鬼精鬼精;
+- wordplay and jokes that only work in Chinese;
+- forms of address, customs, and historical or legendary figures a Western reader would not know.
+Skip a note only when the English keeps both the meaning and the image. A chapter with no automatic
+findings may still need notes.
+
+Rules:
+- Put each note in its own paragraph right after the paragraph it explains.
+- Put a * in the English directly after the word, phrase or sentence the note explains (after the closing
+  quotation mark when that ends a line of dialogue), so readers know which line it refers to. Every note
+  gets its own *.
+- Name the Chinese you explain, with its pinyin and literal meaning, then say what it means here.
+- Keep each note to one or two short sentences of plain English, and state only what you are sure of.
+- Change nothing else in the translation for a note, and do not repeat a note the chapter already has.
+- For each note, give the English paragraph to find exactly as it is now, and as the replacement that
+  paragraph with its *, a blank line, then the note.
+
+""" + TN_EXAMPLES
+
 ALIGN_SYSTEM = (
     "You align a Chinese novel chapter with its existing English translation. Map every Chinese paragraph ⟦n⟧ "
     "to the English paragraph or paragraphs [E#] that translate it.\n"

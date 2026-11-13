@@ -1,24 +1,25 @@
 """Audit translated chapters offline and send the problem chapters to combineCopy with the findings.
 
   python audit.py -b "My Book" --range 1200-1250
-  python audit.py --end 100 --align        first build missing paragraph alignments with a model
-  python audit.py --middle 20 --dry-run    print the commands and save the findings only
+  python audit.py --next 25                 the 25 chapters after the last audit
+  python audit.py --end 100 --align         first build missing paragraph alignments with a model
+  python audit.py --middle 20 --dry-run     print the commands and save the findings only
 
-Pick a book and a range as in inquire.py. Every chapter in the range is checked from disk (no model is
-called unless --align is given). The chapters with problems are listed, the prompt is saved to
-<Book>/_qa/audit/audit_<time>.md, and combineCopy runs with --prompt-pipe and the English file and raw
-page of every chapter in the range, with the prompt piped in:
+Pick a book and a range as in inquire.py, or continue after the last audit with --next N. Every chapter
+in the range is checked from disk (no model is called unless --align is given). The chapters with
+problems are listed, the prompt is saved to <Book>/_qa/audit/audit_<time>.md, and combineCopy runs with
+--prompt-pipe and the English file and raw page of every chapter sent, with the prompt piped in:
 
   combineCopy --prompt-pipe './Book/Chapter 812.md' './Book/_raw/chapters/ch_000812.txt' …
 
 Findings larger than combineCopy's 2 MB limit, or a command line too long for Windows, are split into
-parts by chapter; the script waits for Enter between parts.
+parts by chapter; the script waits for Enter between parts. A part counts as audited once combineCopy
+finishes it, and <Book>/_qa/audit/progress.json records how far the book has been audited.
 
-By default only problem chapters are sent. With --extra-tns, every readable chapter in the range is sent
-and the prompt also asks the model to add translator's notes the translation is missing (poem and film
-sources, idioms, title references, author slips, source typos). The translator writes these notes itself,
-so this costs many tokens and is rarely needed. Translator's Notes stay inline, so auditor's [note]
-findings are left out either way.
+By default the prompt also asks the receiving model to add the Translator's Notes a sent chapter is
+missing, with worked examples; --no-tns leaves that out. --extra-tns also sends the chapters without
+findings and asks for poem and film sources, title references and author slips. Translator's Notes stay
+inline, so auditor's [note] findings are left out either way.
 """
 
 import argparse
@@ -31,12 +32,14 @@ from collections import Counter
 from rich.markup import escape
 from rich.table import Table
 
-from booktl import auditor, combine, segments
+from booktl import auditlog, auditor, combine, segments
 from booktl import console as con
 from booktl.client import ApiClient
 from booktl.config import Config, ConfigError
 from booktl.parsing import format_chapter_ranges
-from inquire import add_range_args, ask_span, confirm, pick_book, span_from_args
+from inquire import (
+    MAX_INPUT_ATTEMPTS, MODE_LABELS, MODES, add_range_args, ask_span, choose, confirm, pick_book, span_from_args,
+)
 
 DEFAULT_LIBRARY = "../TranslateBook"
 DEFAULT_COMMAND = "combineCopy"
@@ -47,6 +50,7 @@ MAX_TABLE_ROWS = 300
 MAX_LISTED_ERRORS = 10
 MAX_INSTRUCTIONS_CHARS = 20_000
 EXIT_OK, EXIT_USER, EXIT_COMMAND = 0, 1, 2
+NEXT_LABEL = "Next N after the last audit"
 PS_NOTE = (
     "combineCopy runs through PowerShell here. If it is a function in your profile, it must forward its "
     "pipeline input or it receives no prompt, e.g.:\n"
@@ -55,29 +59,19 @@ PS_NOTE = (
     "The findings are also saved to {path}."
 )
 NOTE_KIND = "note"
-CLEAN_CHAPTER_NOTE = "No automatic findings. Check this chapter only for missing translator's notes."
+CLEAN_CHAPTER_NOTE = (
+    "No automatic findings. Check this chapter only for missing translator's notes (see the examples above)."
+)
 EXTRA_TN_INSTRUCTIONS = """\
-## Missing translator's notes
-Also read each chapter for places an English reader would miss something a Chinese reader would catch,
-where the translation has no (TN: ...) yet. Add a note for:
-- lines taken from poems, songs, classics or films (name the work and its author);
-- idioms, sayings or wordplay whose meaning does not come through in English;
+## More translator's notes
+Some chapters below have no automatic findings; they are included only for the note check above. In every
+chapter, also add notes for:
+- lines taken from poems, songs, classics or films (name the work and its author; quote at most one line);
 - references to the novel's own title, or to real people, places and events;
 - author slips the translation copies or quietly fixes, such as a count that does not match its list or a
   number that contradicts an earlier chapter;
 - typos in the source that change how a line reads.
-
-Rules:
-- Put each note in its own paragraph right after the paragraph it explains, as (TN: ...).
-  There is no separate notes list.
-- Quote the exact Chinese characters you explain, so a reviewer can find them in the raw page.
-- Keep each note to one or two short sentences of plain English.
-- State only what you can check against the raw page or a well-known source. If you are unsure where a
-  line comes from, leave the note out.
-- Skip places where the English already makes the meaning clear, and do not repeat a note the chapter has.
-- Quote at most one line of a poem or song inside a note.
-- For each note, give the English paragraph to find, and that paragraph followed by the note as the
-  replacement."""
+Follow the rules above, and leave a note out when you are unsure where a line comes from."""
 
 
 # ----------------------------------------------------------------------
@@ -88,14 +82,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Audit translated chapters and send problem chapters to combineCopy.")
     parser.add_argument("-b", "--book", help="Book folder name (skips the book menu)")
     parser.add_argument("-l", "--library", default=DEFAULT_LIBRARY, help="Library folder (default: ../TranslateBook)")
-    add_range_args(parser)
+    ranges = add_range_args(parser)
+    ranges.add_argument("--next", dest="next_count", metavar="N", help="The N chapters after the last audit")
     parser.add_argument("-y", "--yes", action="store_true", help="Do not ask for confirmation or wait between parts")
     parser.add_argument("--dry-run", action="store_true", help="Save the findings and print the commands without running them")
     parser.add_argument("--command", default=DEFAULT_COMMAND, help="Command to run (default: combineCopy)")
     parser.add_argument("--findings-out", help="Where to save the findings (default: <Book>/_qa/audit/audit_<time>.md)")
     parser.add_argument("--instructions", help="File with your own instructions to put above the findings")
-    parser.add_argument("--extra-tns", action="store_true",
-                        help="Also ask for missing translator's notes; sends every chapter in the range")
+    notes = parser.add_mutually_exclusive_group()
+    notes.add_argument("--no-tns", action="store_true",
+                       help="Do not ask the receiving model for missing translator's notes")
+    notes.add_argument("--extra-tns", action="store_true",
+                       help="Also send chapters without findings for the note check; costs far more tokens")
     parser.add_argument("--no-extra-tns", action="store_true",
                         help="The default; accepted so older commands keep working")
     parser.add_argument("--max-prompt-bytes", type=int, default=DEFAULT_PROMPT_BYTES,
@@ -119,12 +117,82 @@ def _base_instructions(path) -> str:
     return text
 
 
-def _instructions(path, extra_tns: bool) -> str:
-    """Base instructions, with the missing-TN request added unless turned off. Raises OSError/ValueError."""
-    base = _base_instructions(path)
-    if not extra_tns:
-        return base
-    return base.rstrip() + "\n\n" + EXTRA_TN_INSTRUCTIONS
+def _instructions(path, tns: bool, extra_tns: bool) -> str:
+    """Base instructions, the note check unless turned off, and the extra note topics. Raises OSError/ValueError."""
+    parts = [_base_instructions(path).rstrip()]
+    if tns or extra_tns:
+        parts.append(auditor.TN_PASS_INSTRUCTIONS)
+    if extra_tns:
+        parts.append(EXTRA_TN_INSTRUCTIONS)
+    return "\n\n".join(parts)
+
+
+# ----------------------------------------------------------------------
+# Choosing the range
+# ----------------------------------------------------------------------
+
+def _through(progress) -> int | None:
+    return progress.audited_through if progress is not None else None
+
+
+def _show_progress(book_dir: str):
+    """Print how far the book has been audited and return its Progress (None when nothing is recorded)."""
+    progress, err = auditlog.load_progress(book_dir)
+    if err:
+        con.warn(escape(err))
+    if progress is not None:
+        con.info(escape(auditlog.describe(progress)))
+    return progress
+
+
+def _ask_value(mode: str, last: int, through) -> tuple[int, int] | None:
+    """Ask for the number or range of a mode. None when cancelled."""
+    prompt = "Range, e.g. 140-175 (blank to cancel): " if mode == "range" else "Number of chapters (blank to cancel): "
+    for _ in range(MAX_INPUT_ATTEMPTS):
+        try:
+            answer = con.console.input(f"[bold]{escape(prompt)}[/bold]").strip()
+        except (KeyboardInterrupt, EOFError):
+            return None
+        if not answer:
+            return None
+        try:
+            if mode == "next":
+                return auditlog.next_span(through, combine.parse_count(answer), last)
+            return combine.resolve_range(mode, answer, last)
+        except ValueError as e:
+            con.warn(escape(str(e)))
+    con.warn("Too many invalid answers.")
+    return None
+
+
+def _ask_audit_span(last: int, progress) -> tuple[int, int] | None:
+    """The range menu, with 'Next N after the last audit' first when there is something left to audit."""
+    through = _through(progress)
+    if through is None:
+        return ask_span(last)
+    if through >= last:
+        con.info(f"Every translated chapter up to Chapter {last} is already audited.")
+        return ask_span(last)
+    middle = (1 + last) // 2
+    labels = [NEXT_LABEL, *MODE_LABELS]
+    hints = [
+        f"from Chapter {through + 1}, up to Chapter {last}", "Chapters 1 … N",
+        f"the last N, up to Chapter {last}", f"N chapters around Chapter {middle}", "e.g. 140-175",
+    ]
+    title = f"Chapter range (Chapters 1–{last} translated, audited through Chapter {through})"
+    index = choose(title, labels, hints)
+    if index is None:
+        return None
+    return _ask_value("next" if index == 0 else MODES[index - 1], last, through)
+
+
+def _span(args, last: int, progress) -> tuple[int, int] | None:
+    """(low, high) from the arguments or the menu; None when cancelled. Raises ValueError."""
+    if args.next_count is not None:
+        if progress is None:
+            con.info("No earlier audit is recorded, so --next starts at Chapter 1.")
+        return auditlog.next_span(_through(progress), combine.parse_count(args.next_count), last)
+    return span_from_args(args, last) or _ask_audit_span(last, progress)
 
 
 # ----------------------------------------------------------------------
@@ -230,7 +298,7 @@ def _blocks(library: str, book: str, translated: dict, audits: list) -> list:
 
 
 def _chapters_to_send(audits: list, problems: list, extra_tns: bool) -> list:
-    """Every readable chapter when asking for TNs, otherwise only the problem chapters."""
+    """Every readable chapter with --extra-tns, otherwise only the problem chapters."""
     if not extra_tns:
         return problems
     return [a for a in audits if not a.error]
@@ -274,6 +342,40 @@ def _findings_path(args, book_dir: str) -> str:
 
 
 # ----------------------------------------------------------------------
+# Audit progress
+# ----------------------------------------------------------------------
+
+def _record(book_dir: str, span: tuple[int, int], findings_path: str) -> None:
+    """Record chapters as audited; a failure only warns."""
+    try:
+        progress = auditlog.record_audit(book_dir, span[0], span[1], findings_path)
+    except (OSError, ValueError) as e:
+        con.warn(f"Could not save the audit progress: {escape(str(e))}")
+        return
+    con.dim(f"Audited through Chapter {progress.audited_through}.")
+
+
+def _part_spans(parts: list, span: tuple[int, int]) -> list[tuple[int, int]]:
+    """The chapters each part covers: the first from the range start, the last up to the range end."""
+    low, high = span
+    spans, start = [], low
+    for index, part in enumerate(parts):
+        top = high if index == len(parts) - 1 else max(c for c, _t, _f in part)
+        top = min(max(top, start), high)
+        spans.append((min(start, high), top))
+        start = top + 1
+    return spans
+
+
+def _recorder(book_dir: str, spans: list, findings_path: str):
+    """Callback that records part number index (0-based) once combineCopy finished it."""
+    def record(index: int) -> None:
+        if 0 <= index < len(spans):
+            _record(book_dir, spans[index], findings_path)
+    return record
+
+
+# ----------------------------------------------------------------------
 # Running combineCopy
 # ----------------------------------------------------------------------
 
@@ -311,7 +413,10 @@ def _send_part(command: str, files: list, prompt: str, windows: bool, library: s
     return True
 
 
-def send_parts(args, parts: list, prompts: list, library: str, findings_path: str) -> int:
+def send_parts(args, parts: list, prompts: list, library: str, findings_path: str, on_sent=None) -> int:
+    """Run combineCopy once per part. on_sent(index) is called after each part that finished."""
+    if on_sent is not None and not callable(on_sent):
+        raise TypeError("on_sent must be callable")
     windows = os.name == "nt"
     state = {"path": findings_path}
     for number, (part, prompt) in enumerate(zip(parts, prompts), start=1):
@@ -326,6 +431,8 @@ def send_parts(args, parts: list, prompts: list, library: str, findings_path: st
             return EXIT_COMMAND
         if not sent:
             return EXIT_COMMAND
+        if on_sent is not None:
+            on_sent(number - 1)
     con.ok(f"Sent {len(parts)} part(s) to {escape(args.command)}.")
     return EXIT_OK
 
@@ -335,21 +442,23 @@ def send_parts(args, parts: list, prompts: list, library: str, findings_path: st
 # ----------------------------------------------------------------------
 
 def _select(args, library: str):
-    """(book, translated, chapters) or None."""
+    """(book, translated, chapters, span) or None."""
     book = pick_book(library, args.book)
     if not book:
         con.warn("No book selected.")
         return None
+    book_dir = os.path.join(library, book)
     try:
-        translated = combine.translated_chapters(os.path.join(library, book))
+        translated = combine.translated_chapters(book_dir)
     except OSError as e:
         con.fail(f"Could not read {escape(book)}: {escape(str(e))}")
         return None
     if not translated:
         con.fail(f"{escape(book)} has no translated chapters yet.")
         return None
+    progress = _show_progress(book_dir)
     try:
-        span = span_from_args(args, max(translated)) or ask_span(max(translated))
+        span = _span(args, max(translated), progress)
     except ValueError as e:
         con.fail(escape(str(e)))
         return None
@@ -357,7 +466,7 @@ def _select(args, library: str):
         con.warn("No range selected.")
         return None
     chapters = [c for c in range(span[0], span[1] + 1) if c in translated]
-    return book, translated, chapters
+    return book, translated, chapters, span
 
 
 def _plan(args, book: str, library: str, translated: dict, audits: list, instructions: str):
@@ -378,16 +487,16 @@ def run(args) -> int:
     if not os.path.isdir(library):
         con.fail(f"Library folder not found: {escape(library)}")
         return EXIT_USER
-    extra_tns = bool(args.extra_tns) and not args.no_extra_tns
+    tns, extra_tns = not args.no_tns, bool(args.extra_tns)
     try:
-        instructions = _instructions(args.instructions, extra_tns)
+        instructions = _instructions(args.instructions, tns, extra_tns)
     except (OSError, ValueError) as e:
         con.fail(f"Could not use the instructions file: {escape(str(e))}")
         return EXIT_USER
     selected = _select(args, library)
     if selected is None:
         return EXIT_USER
-    book, translated, chapters = selected
+    book, translated, chapters, span = selected
     book_dir = os.path.join(library, book)
     con.ok(f"[bold green]{escape(book)}[/bold green]: auditing {escape(format_chapter_ranges(chapters))}")
     if args.align and not run_alignment(args, book_dir, book, chapters, translated):
@@ -397,6 +506,8 @@ def run(args) -> int:
     to_send = _chapters_to_send(audits, problems, extra_tns)
     if not to_send:
         con.ok("Nothing to send." if extra_tns else "No problem chapters; nothing to send.")
+        if not args.dry_run:
+            _record(book_dir, span, "")
         return EXIT_OK
     parts, prompts, command_error = _plan(args, book, library, translated, to_send, instructions)
     findings_path = _findings_path(args, book_dir)
@@ -412,7 +523,8 @@ def run(args) -> int:
     if not args.yes and not confirm(question):
         con.warn("Cancelled; the findings are saved.")
         return EXIT_USER
-    return send_parts(args, parts, prompts, library, findings_path)
+    on_sent = _recorder(book_dir, _part_spans(parts, span), findings_path)
+    return send_parts(args, parts, prompts, library, findings_path, on_sent)
 
 
 def main(argv=None) -> int:
